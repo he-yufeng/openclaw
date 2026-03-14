@@ -1903,8 +1903,9 @@ function createPluginSearchTool(
         return jsonResult({ error: "missing_query", message: "query is required" });
       }
 
-      const maxResults = readNumberParam(params, "count", { integer: true }) ??
+      const rawCount = readNumberParam(params, "count", { integer: true }) ??
         search?.maxResults ?? DEFAULT_SEARCH_COUNT;
+      const maxResults = Math.max(1, Math.min(10, Number(rawCount) || DEFAULT_SEARCH_COUNT));
       const cacheKey = normalizeCacheKey(`${pluginProvider.id}:${query}:${maxResults}`);
       const cached = readCache(SEARCH_CACHE, cacheKey, cacheTtlMs);
       if (cached) {
@@ -1959,10 +1960,16 @@ function createPluginSearchTool(
         writeCache(SEARCH_CACHE, cacheKey, payload, cacheTtlMs);
         return jsonResult(payload);
       } catch (err) {
+        // Don't leak raw error strings (may contain API keys, tokens, etc.)
+        // to the LLM. Log details server-side only.
+        const detail = err instanceof Error ? err.message : String(err);
+        logVerbose(
+          `web_search: plugin provider "${pluginProvider.id}" failed: ${detail}`,
+        );
         return jsonResult({
           error: "search_failed",
           provider: pluginProvider.id,
-          message: String(err),
+          message: "Search provider encountered an error.",
         });
       }
     },
