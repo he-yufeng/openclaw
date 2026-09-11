@@ -159,7 +159,15 @@ export const runRespawnedChild = (command, args, env) => {
               ? 143
               : undefined
           : undefined;
-      process.exit(forwardedSignalExitCode ?? 1);
+      if (forwardedSignalExitCode !== undefined) {
+        process.exit(forwardedSignalExitCode);
+      }
+      // The child died by a signal we never forwarded (e.g. an external
+      // SIGKILL): report it with the shell's 128+signum convention so the
+      // caller can still tell an interrupted run from an ordinary exit 1
+      // (#144200).
+      const signalNumber = os.constants.signals[signal];
+      process.exit(signalNumber ? 128 + signalNumber : 1);
     }
     process.exit(code ?? 1);
   });
