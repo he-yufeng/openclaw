@@ -63,6 +63,13 @@ export async function readLatestSessionUsageFromTranscriptFileAsync(
       let normalizedMessage: Record<string, unknown>;
       try {
         const record = asOptionalRecord(JSON.parse(line));
+        // Compaction/reset boundary markers carry no message payload; pass them
+        // through so the chars estimate only counts the live window after the
+        // latest boundary, not the full retained archive.
+        if (record?.type === "compaction" || record?.type === "reset") {
+          messages.push({ type: record.type });
+          continue;
+        }
         const message = asOptionalRecord(record?.message);
         if (!record || !message) {
           continue;
