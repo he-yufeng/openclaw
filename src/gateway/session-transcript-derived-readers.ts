@@ -146,7 +146,7 @@ export function createSessionTranscriptUsageAccumulator(source: TranscriptUsageS
       if (message.type === "compaction" || message.type === "reset") {
         estimatedTranscriptChars = 0;
         sawEstimateModelIdentity = false;
-        continue;
+        return;
       }
       const provider = typeof message.provider === "string" ? message.provider.trim() : undefined;
       const model = typeof message.model === "string" ? message.model.trim() : undefined;
