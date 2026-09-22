@@ -8,6 +8,7 @@ import {
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterEach, describe, expect, it } from "vitest";
 import { withCodexBindingOverflowRecovery } from "./session-binding-overflow.js";
+import { createLazyCodexAppServerBindingStore } from "./session-binding-store.js";
 import {
   bindingStoreKey,
   createCodexAppServerBindingStore,
@@ -183,6 +184,123 @@ describe("Codex app-server binding overflow recovery", () => {
 
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
       expect(state.lookup(bindingStoreKey(legacy))).toMatchObject({ state: "cleared" });
+      expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sheds only the strictly valid disposable row and preserves ambiguous existing state", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-ambiguous-test",
+        2,
+        stateDir,
+      );
+      // Pre-existing state written by an older or damaged build: a cleared
+      // row with a lease that is not even an object must never become
+      // "apparently unprotected" and get deleted.
+      state.register("conversation:ambiguous-lease", {
+        version: 1,
+        state: "cleared",
+        lease: "not-a-lease",
+      } as unknown as StoredCodexAppServerBinding);
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).resolves.toBe(true);
+
+      expect(state.lookup("session:main:abandoned")).toBeUndefined();
+      expect(state.lookup("conversation:ambiguous-lease")).toMatchObject({
+        lease: "not-a-lease",
+      });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed when every candidate's raw protection fields are ambiguous", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-rawguard-test",
+        2,
+        stateDir,
+      );
+      state.register("conversation:lease-wrong-type", {
+        version: 1,
+        state: "cleared",
+        lease: { token: 42, expiresAt: "soon" },
+      } as unknown as StoredCodexAppServerBinding);
+      state.register("conversation:retired-marker-other", {
+        version: 1,
+        state: "cleared",
+        retired: "yes",
+      } as unknown as StoredCodexAppServerBinding);
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).rejects.toThrow(/reached its 2-row limit/);
+
+      expect(state.lookup("conversation:lease-wrong-type")).toMatchObject({
+        state: "cleared",
+      });
+      expect(state.lookup("conversation:retired-marker-other")).toMatchObject({
+        state: "cleared",
+      });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers through the production lazy binding store composition", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+        namespace: "app-server-thread-bindings-overflow-lazy-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new",
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      });
+      const store = createLazyCodexAppServerBindingStore(state);
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).resolves.toBe(true);
+
+      expect(state.lookup("session:main:abandoned")).toBeUndefined();
+      expect(store.read(live)).toMatchObject({ threadId: "thread-live" });
       expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
     } finally {
       resetPluginStateStoreForTests();
