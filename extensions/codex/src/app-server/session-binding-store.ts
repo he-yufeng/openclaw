@@ -12,6 +12,7 @@ import {
   CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
   CODEX_APP_SERVER_BINDING_NAMESPACE,
 } from "./session-binding-meta.js";
+import { withCodexBindingOverflowRecovery } from "./session-binding-overflow.js";
 import {
   readCurrentCodexAppServerBinding,
   readCurrentCodexAppServerBindings,
@@ -40,7 +41,7 @@ export function createLazyCodexAppServerBindingStore(
   let resolved: Promise<CodexAppServerBindingStore> | undefined;
   const store = () =>
     (resolved ??= import("./session-binding.js").then(({ createCodexAppServerBindingStore }) =>
-      createCodexAppServerBindingStore(state),
+      createCodexAppServerBindingStore(withCodexBindingOverflowRecovery(state)),
     ));
   const managedThreads: CodexManagedThreadStore | undefined = managedThreadState
     ? createCodexManagedThreadStore(managedThreadState)
