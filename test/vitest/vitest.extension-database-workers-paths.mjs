@@ -120,6 +120,7 @@ export const databaseWorkerExtensionTestFiles = [
   "extensions/clickclack/src/sender-authority.test.ts",
   "extensions/codex/doctor-contract-api.test.ts",
   "extensions/codex/doctor-contract-api.native-assignments.test.ts",
+  "extensions/codex/doctor-contract-api.overflow.test.ts",
   "extensions/codex/index.test.ts",
   "extensions/codex/src/app-server/session-binding.test.ts",
   "extensions/codex/src/app-server/session-binding.codec.test.ts",
