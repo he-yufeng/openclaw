@@ -188,26 +188,28 @@ export default definePluginEntry({
     };
     // Capacity recovery lists and deletes through the worker-backed handle on
     // the same namespace, so an overflow never parks the Gateway thread on a
-    // full-table decode. Opened lazily like the sync handle above.
+    // full-table decode. Opened lazily like the sync handle above; a runtime
+    // without the async opener leaves recovery stood down.
     let bindingRecoveryStateStore: PluginStateKeyedStore<StoredCodexAppServerBinding> | undefined;
     const openBindingRecoveryStateStore = () =>
-      (bindingRecoveryStateStore ??= api.runtime.state.openKeyedStore<StoredCodexAppServerBinding>({
-        namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
-        maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
-        overflowPolicy: "reject-new",
-      }));
+      (bindingRecoveryStateStore ??=
+        api.runtime.state.openKeyedStore?.<StoredCodexAppServerBinding>({
+          namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
+          maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
+          overflowPolicy: "reject-new",
+        }));
     const lazyBindingRecoveryStateStore: CodexBindingOverflowRecoveryState = {
       get compareAndApply() {
         const store = openBindingRecoveryStateStore();
-        return store.compareAndApply?.bind(store);
+        return store?.compareAndApply?.bind(store);
       },
       get entriesInKeyRange() {
         const store = openBindingRecoveryStateStore();
-        return store.entriesInKeyRange?.bind(store);
+        return store?.entriesInKeyRange?.bind(store);
       },
       get observe() {
         const store = openBindingRecoveryStateStore();
-        return store.observe?.bind(store);
+        return store?.observe?.bind(store);
       },
     };
     const bindingStore = createLazyCodexAppServerBindingStore(
