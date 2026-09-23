@@ -137,7 +137,10 @@ export function withCodexBindingOverflowRecovery(
   // Persisted across calls, so spaced failures keep advancing instead of
   // re-reading the same protected prefix every time.
   let cursor: string | undefined;
-  const evictDisposableBindingRows = async (insertKey: string): Promise<number> => {
+  const evictDisposableBindingRows = async (
+    insertKey: string,
+    assertCurrent: (() => void) | undefined,
+  ): Promise<number> => {
     const now = Date.now();
     let shed = 0;
     let pages = 0;
@@ -185,6 +188,13 @@ export function withCodexBindingOverflowRecovery(
         ) {
           continue;
         }
+        // Recovery ran awaited work since the failed insert, so the caller may
+        // hold no authority anymore. Row CAS proves the row is unchanged but
+        // says nothing about the caller; fence every delete on live authority.
+        // Recovery ran awaited work since the failed insert, so the caller may
+        // hold no authority anymore. Row CAS proves the row is unchanged but
+        // says nothing about the caller; fence every delete on live authority.
+        assertCurrent?.();
         const result = await compareAndApply(entry.key, observation.comparison, {
           operation: "delete",
           action: "delete",
@@ -222,7 +232,7 @@ export function withCodexBindingOverflowRecovery(
         }
         // The failed insert owns no row yet, so the sweep skips nothing by
         // key; the skip only guards a concurrent insert claiming it mid-retry.
-        if ((await evictDisposableBindingRows(bindingStoreKey(identity))) === 0) {
+        if ((await evictDisposableBindingRows(bindingStoreKey(identity), assertCurrent)) === 0) {
           throw error;
         }
         evictions += 1;

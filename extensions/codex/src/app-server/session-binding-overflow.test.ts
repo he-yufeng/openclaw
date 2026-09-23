@@ -379,6 +379,71 @@ describe("Codex app-server binding overflow recovery", () => {
     }
   });
 
+  it("never deletes after the caller loses authority mid-recovery", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const options = {
+        namespace: "app-server-thread-bindings-overflow-authority-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new" as const,
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      };
+      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      const baseRecovery = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      // The caller is revoked while the recovery's awaited observe is in
+      // flight: exactly the window between the failed insert and the delete.
+      let revoked = false;
+      const recovery = {
+        entriesInKeyRange: baseRecovery.entriesInKeyRange?.bind(baseRecovery),
+        compareAndApply: baseRecovery.compareAndApply?.bind(baseRecovery),
+        observe: async (key: string) => {
+          const observation = await baseRecovery.observe!(key);
+          revoked = true;
+          return observation;
+        },
+      };
+      const store = withCodexBindingOverflowRecovery(
+        createCodexAppServerBindingStore(state),
+        recovery,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(
+          incoming,
+          { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
+          () => {
+            if (revoked) {
+              throw new Error("caller authority revoked");
+            }
+          },
+        ),
+      ).rejects.toThrow(/authority revoked/);
+
+      // The revoked caller triggered zero deletes: the disposable row survives.
+      expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
+      expect(store.read(live)).toMatchObject({ threadId: "thread-live" });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
   it("resumes the scan where the previous failure stopped, across inserts", async () => {
     const stateDir = createOverflowStateDir();
     try {
