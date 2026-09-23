@@ -3,11 +3,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  createPluginStateKeyedStoreForTests,
   createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { withCodexBindingOverflowRecovery } from "./session-binding-overflow.js";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  withCodexBindingOverflowRecovery,
+  type CodexBindingOverflowRecoveryBounds,
+} from "./session-binding-overflow.js";
 import { createLazyCodexAppServerBindingStore } from "./session-binding-store.js";
 import {
   bindingStoreKey,
@@ -15,15 +19,33 @@ import {
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
 
-function createRecoveringBindingStore(namespace: string, maxEntries: number, stateDir: string) {
-  const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+function createRecoveringBindingStore(
+  namespace: string,
+  maxEntries: number,
+  stateDir: string,
+  bounds?: Partial<CodexBindingOverflowRecoveryBounds>,
+) {
+  const options = {
     namespace,
     maxEntries,
-    overflowPolicy: "reject-new",
+    overflowPolicy: "reject-new" as const,
     env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-  });
-  // Same composition the production lazy binding store installs.
-  const store = createCodexAppServerBindingStore(withCodexBindingOverflowRecovery(state));
+  };
+  const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
+    "codex",
+    options,
+  );
+  // Same composition the production lazy binding store installs: sync handle
+  // for hot reads, worker-backed handle for recovery listing and deletion.
+  const recoveryState = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
+    "codex",
+    options,
+  );
+  const store = withCodexBindingOverflowRecovery(
+    createCodexAppServerBindingStore(state),
+    recoveryState,
+    bounds,
+  );
   return { state, store };
 }
 
@@ -270,16 +292,65 @@ describe("Codex app-server binding overflow recovery", () => {
     }
   });
 
-  it("recovers through the production lazy binding store composition", async () => {
+  it("fails closed when the host has no ranged listing", async () => {
     const stateDir = createOverflowStateDir();
     try {
       const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
-        namespace: "app-server-thread-bindings-overflow-lazy-test",
+        namespace: "app-server-thread-bindings-overflow-norange-test",
         maxEntries: 2,
         overflowPolicy: "reject-new",
         env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
       });
-      const store = createLazyCodexAppServerBindingStore(state);
+      // Older hosts lack entriesInKeyRange; the wrapper must stand down
+      // instead of falling back to a whole-table scan on the caller's thread.
+      const store = withCodexBindingOverflowRecovery(createCodexAppServerBindingStore(state), {
+        observe: undefined,
+        compareAndApply: undefined,
+        entriesInKeyRange: undefined,
+      });
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).rejects.toThrow(/reached its 2-row limit/);
+      expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers through the production lazy binding store composition", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const options = {
+        namespace: "app-server-thread-bindings-overflow-lazy-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new" as const,
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      };
+      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      const recoveryState = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      const store = createLazyCodexAppServerBindingStore(state, undefined, recoveryState);
       const live = { kind: "conversation" as const, bindingId: "live" };
       await store.mutate(live, {
         kind: "set",
@@ -308,34 +379,29 @@ describe("Codex app-server binding overflow recovery", () => {
     }
   });
 
-  it("continues recovery past a long protected prefix, across episode boundaries", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-13T00:00:00.000Z"));
+  it("resumes the scan where the previous failure stopped, across inserts", async () => {
     const stateDir = createOverflowStateDir();
     try {
+      // One page of four per failure and a single retry: the first insert
+      // stalls mid-prefix, and only a persisted scan position lets the second
+      // insert reach the abandoned row behind it.
       const { state, store } = createRecoveringBindingStore(
-        "app-server-thread-bindings-overflow-prefix-test",
-        519,
+        "app-server-thread-bindings-overflow-resume-test",
+        7,
         stateDir,
+        { evictionAttempts: 1, pageLimit: 4, pagesPerCall: 1 },
       );
-      // 517 live-leased rows ahead of two abandoned ones: the first slices
-      // see only the protected prefix.
-      for (let i = 0; i < 517; i++) {
+      for (let i = 0; i < 6; i++) {
         state.register(`conversation:leased-${i}`, {
           version: 1,
           state: "cleared",
           lease: { token: "owner-token", expiresAt: Date.now() + 600_000 },
         });
       }
-      state.register("session:main:abandoned-a", {
+      state.register("session:main:abandoned", {
         version: 1,
         state: "cleared",
-        sessionId: "abandoned-a",
-      });
-      state.register("session:main:abandoned-b", {
-        version: 1,
-        state: "cleared",
-        sessionId: "abandoned-b",
+        sessionId: "abandoned-session",
       });
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
@@ -344,33 +410,27 @@ describe("Codex app-server binding overflow recovery", () => {
           kind: "set",
           binding: { threadId: "thread-incoming", cwd: "/repo" },
         }),
-      ).resolves.toBe(true);
-      expect(state.lookup("session:main:abandoned-a")).toBeUndefined();
-      expect(state.lookup("conversation:leased-0")).toMatchObject({ state: "cleared" });
+      ).rejects.toThrow(/reached its 7-row limit/);
+      expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
 
-      // A second insert past the snapshot TTL resumes from the saved scan
-      // position instead of restarting at the protected prefix.
-      vi.setSystemTime(new Date("2026-06-13T00:00:06.000Z"));
-      const second = { kind: "conversation" as const, bindingId: "second" };
       await expect(
-        store.mutate(second, {
+        store.mutate(incoming, {
           kind: "set",
-          binding: { threadId: "thread-second", cwd: "/repo" },
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
         }),
       ).resolves.toBe(true);
-      expect(state.lookup("session:main:abandoned-b")).toBeUndefined();
-      expect(state.lookup("conversation:leased-516")).toMatchObject({ state: "cleared" });
-      expect(store.read(second)).toMatchObject({ threadId: "thread-second" });
+      expect(state.lookup("session:main:abandoned")).toBeUndefined();
+      for (let i = 0; i < 6; i++) {
+        expect(state.lookup(`conversation:leased-${i}`)).toMatchObject({ state: "cleared" });
+      }
+      expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
     } finally {
-      vi.useRealTimers();
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
   });
 
   it("reconsiders rows whose leases lapse after a fully protected pass", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-06-13T00:00:00.000Z"));
     const stateDir = createOverflowStateDir();
     try {
       const { state, store } = createRecoveringBindingStore(
@@ -378,19 +438,20 @@ describe("Codex app-server binding overflow recovery", () => {
         2,
         stateDir,
       );
+      const liveLease = () => ({ token: "owner-token", expiresAt: Date.now() + 60_000 });
       state.register("conversation:leased-a", {
         version: 1,
         state: "cleared",
-        lease: { token: "owner-token", expiresAt: Date.now() + 60_000 },
+        lease: liveLease(),
       });
       state.register("conversation:leased-b", {
         version: 1,
         state: "cleared",
-        lease: { token: "owner-token", expiresAt: Date.now() + 60_000 },
+        lease: liveLease(),
       });
 
-      // Every row is protected, so the first pass ends with the cursor past
-      // the last row.
+      // Every row is protected, so the first pass scans the whole namespace
+      // and the insert still fails.
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
         store.mutate(incoming, {
@@ -399,9 +460,13 @@ describe("Codex app-server binding overflow recovery", () => {
         }),
       ).rejects.toThrow(/reached its 2-row limit/);
 
-      // Once the leases lapse, a fresh pass must start over and shed them
-      // instead of staying parked past the end of the namespace.
-      vi.setSystemTime(new Date("2026-06-13T00:01:06.000Z"));
+      // Once the leases lapse, a fresh pass must reconsider those rows instead
+      // of staying parked past the end of the namespace.
+      state.register("conversation:leased-a", {
+        version: 1,
+        state: "cleared",
+        lease: { token: "owner-token", expiresAt: Date.now() - 1_000 },
+      });
       await expect(
         store.mutate(incoming, {
           kind: "set",
@@ -410,7 +475,6 @@ describe("Codex app-server binding overflow recovery", () => {
       ).resolves.toBe(true);
       expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
     } finally {
-      vi.useRealTimers();
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
