@@ -1,35 +1,44 @@
 /** Overflow recovery for Codex app-server binding state (#125910). */
-import type {
-  PluginStateEntry,
-  PluginStateSyncKeyedStore,
-} from "openclaw/plugin-sdk/plugin-state-runtime";
+import type { PluginStateKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
+  bindingStoreKey,
   readStoredCodexAppServerBinding,
   type StoredCodexAppServerBinding,
 } from "./session-binding-record.js";
+import type { CodexAppServerBindingStore } from "./session-binding.js";
 
 // Overflow retries per insert. Each retry means a just-freed row was claimed
 // by a racing insert; past a few, fail with the limit error instead of
 // evicting rows in an unbounded loop.
 const BINDING_INSERT_EVICTION_ATTEMPTS = 4;
-// The sync store can only list the namespace wholesale, so one entries()
-// snapshot serves a whole recovery episode: repeated row-limit failures
-// inside this window reuse it instead of re-decoding every row per attempt.
-const BINDING_OVERFLOW_SNAPSHOT_TTL_MS = 5_000;
-// Rows schema-parsed per slice while hunting one disposable candidate, so a
-// namespace full of protected rows does not also pay a full parse per attempt.
-const BINDING_OVERFLOW_PARSE_CHUNK = 512;
-// One capacity failure sheds up to this many disposable rows, so a snapshot
+// One recovery call scans at most this many storage-side pages, so a full
+// namespace never turns into unbounded Gateway-thread work per failure.
+const BINDING_OVERFLOW_PAGES_PER_CALL = 4;
+// Rows per page. Listing, ordering, and JSON decoding happen in the storage
+// worker; the caller's thread only sees the materialized page.
+const BINDING_OVERFLOW_PAGE_LIMIT = 512;
+// One capacity failure sheds up to this many disposable rows, so one scan
 // pays off across many inserts instead of one row per failure.
 const BINDING_OVERFLOW_SHED_PER_CALL = 8;
-// Slices scanned per failure: the per-call parse work stays bounded even
-// when the cursor sits on a long protected prefix.
-const BINDING_OVERFLOW_SCAN_SLICES_PER_CALL = 4;
 
-type BindingStateUpdate = NonNullable<
-  PluginStateSyncKeyedStore<StoredCodexAppServerBinding>["update"]
+export type CodexBindingOverflowRecoveryBounds = {
+  evictionAttempts: number;
+  pageLimit: number;
+  pagesPerCall: number;
+  shedPerCall: number;
+};
+
+const DEFAULT_RECOVERY_BOUNDS: CodexBindingOverflowRecoveryBounds = {
+  evictionAttempts: BINDING_INSERT_EVICTION_ATTEMPTS,
+  pageLimit: BINDING_OVERFLOW_PAGE_LIMIT,
+  pagesPerCall: BINDING_OVERFLOW_PAGES_PER_CALL,
+  shedPerCall: BINDING_OVERFLOW_SHED_PER_CALL,
+};
+
+export type CodexBindingOverflowRecoveryState = Pick<
+  PluginStateKeyedStore<StoredCodexAppServerBinding>,
+  "compareAndApply" | "entriesInKeyRange" | "observe"
 >;
-type BindingStateEntry = PluginStateEntry<StoredCodexAppServerBinding>;
 
 // A full namespace must not hard-fail every new session. Only row-count
 // overflows free a row on retry: the same code also covers value-size
@@ -102,131 +111,123 @@ function isDisposableBindingRow(
   return lease.kind === "none" || (lease.kind === "valid" && lease.expiresAt <= now);
 }
 
-/** Wraps binding-state updates with domain-ranked capacity recovery. */
-export function withCodexBindingOverflowRecovery<
-  TState extends Pick<
-    PluginStateSyncKeyedStore<StoredCodexAppServerBinding>,
-    "deleteIf" | "entries" | "update"
-  >,
->(state: TState): TState {
-  const update = state.update?.bind(state);
-  const deleteIf = state.deleteIf?.bind(state);
-  if (!update || !deleteIf) {
-    // The facade reports missing atomic update/delete support itself.
-    return state;
+/**
+ * Adds bounded capacity recovery to the binding store's insert path. Listing
+ * and deletion run through the async worker-backed handle, so a full namespace
+ * never parks the Gateway thread on a whole-table decode; each failure scans
+ * at most a few storage-side pages. Rows are re-validated at delete time via
+ * observe + compareAndApply, so a row that gained a lease or a fence between
+ * the page read and the delete is preserved.
+ */
+export function withCodexBindingOverflowRecovery(
+  store: CodexAppServerBindingStore,
+  recovery: CodexBindingOverflowRecoveryState,
+  overrides: Partial<CodexBindingOverflowRecoveryBounds> = {},
+): CodexAppServerBindingStore {
+  const bounds = { ...DEFAULT_RECOVERY_BOUNDS, ...overrides };
+  const entriesInKeyRange = recovery.entriesInKeyRange?.bind(recovery);
+  const observe = recovery.observe?.bind(recovery);
+  const compareAndApply = recovery.compareAndApply?.bind(recovery);
+  if (!entriesInKeyRange || !observe || !compareAndApply) {
+    // Older hosts without ranged listing or row CAS get the pre-recovery
+    // behavior: the row-limit error propagates instead of a full-table scan.
+    return store;
   }
-  let episode: { at: number; entries: BindingStateEntry[]; cursor: number } | undefined;
-  // The scan position survives a snapshot refresh, so spaced requests keep
-  // advancing through the namespace instead of re-reading the same protected
-  // prefix at every episode boundary.
-  let lastExamined: { createdAt: number; key: string } | undefined;
-  const resumeIndex = (
-    entries: BindingStateEntry[],
-    after: { createdAt: number; key: string },
-  ): number => {
-    let lo = 0;
-    let hi = entries.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      const entry = entries[mid]!;
-      if (
-        entry.createdAt > after.createdAt ||
-        (entry.createdAt === after.createdAt && entry.key > after.key)
-      ) {
-        hi = mid;
-      } else {
-        lo = mid + 1;
-      }
-    }
-    return lo;
-  };
-  const episodeEntries = (now: number) => {
-    if (!episode || now - episode.at >= BINDING_OVERFLOW_SNAPSHOT_TTL_MS) {
-      // Sort by the same (createdAt, key) order the resume cursor searches,
-      // so equal timestamps cannot scramble the continuation point.
-      const entries = state
-        .entries()
-        .toSorted(
-          (a, b) => a.createdAt - b.createdAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
-        );
-      let cursor = lastExamined ? resumeIndex(entries, lastExamined) : 0;
-      if (cursor >= entries.length) {
-        // A finished pass must not park the cursor past the end: rows already
-        // examined can turn disposable once their leases lapse, so a full
-        // pass with nothing newer than lastExamined starts over.
-        cursor = 0;
-      }
-      episode = { at: now, entries, cursor };
-    }
-    return episode;
-  };
-  const evictDisposableBindingRows = (insertKey: string): number => {
+  // Lexical position of the last examined row; undefined scans from the start.
+  // Persisted across calls, so spaced failures keep advancing instead of
+  // re-reading the same protected prefix every time.
+  let cursor: string | undefined;
+  const evictDisposableBindingRows = async (insertKey: string): Promise<number> => {
     const now = Date.now();
-    const ep = episodeEntries(now);
-    // Each call sheds up to a few disposable rows so one snapshot serves many
-    // inserts, and scans at most a few slices so the Gateway thread never
-    // pays a full parse on a protected prefix.
     let shed = 0;
-    let slices = 0;
-    while (
-      shed < BINDING_OVERFLOW_SHED_PER_CALL &&
-      slices < BINDING_OVERFLOW_SCAN_SLICES_PER_CALL &&
-      ep.cursor < ep.entries.length
-    ) {
-      let end = Math.min(ep.cursor + BINDING_OVERFLOW_PARSE_CHUNK, ep.entries.length);
-      for (let i = ep.cursor; i < end && shed < BINDING_OVERFLOW_SHED_PER_CALL;) {
-        const entry = ep.entries[i]!;
-        lastExamined = { createdAt: entry.createdAt, key: entry.key };
+    let pages = 0;
+    const startedFromBeginning = cursor === undefined;
+    while (shed < bounds.shedPerCall && pages < bounds.pagesPerCall) {
+      const page = await entriesInKeyRange({
+        keyStartInclusive: cursor ?? "",
+        keyEndExclusive: "\uffff",
+        limit: bounds.pageLimit,
+        order: "asc",
+      });
+      pages += 1;
+      if (page.length === 0) {
+        if (startedFromBeginning) {
+          break;
+        }
+        // The cursor passed the last key; restart the pass from the beginning.
+        cursor = undefined;
+        continue;
+      }
+      // Shed oldest first within the page, the store's own eviction courtesy.
+      // The cursor still tracks lexical page order, not this candidate order.
+      const candidates = page.toSorted(
+        (a, b) => a.createdAt - b.createdAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
+      );
+      for (const entry of candidates) {
+        if (shed >= bounds.shedPerCall) {
+          break;
+        }
         if (entry.key === insertKey) {
-          i += 1;
-          ep.cursor = i;
           continue;
         }
         const stored = readStoredCodexAppServerBinding(entry.value);
         if (!stored || !isDisposableBindingRow(entry.key, entry.value, stored, now)) {
-          i += 1;
-          ep.cursor = i;
           continue;
         }
-        const evicted = deleteIf(entry.key, (current) => {
-          const currentStored = readStoredCodexAppServerBinding(current);
-          return (
-            currentStored !== undefined &&
-            isDisposableBindingRow(entry.key, current, currentStored, now)
-          );
+        const observation = await observe(entry.key);
+        const current = observation.value;
+        const currentStored =
+          current === undefined ? undefined : readStoredCodexAppServerBinding(current);
+        if (
+          current === undefined ||
+          !currentStored ||
+          !isDisposableBindingRow(entry.key, current, currentStored, now)
+        ) {
+          continue;
+        }
+        const result = await compareAndApply(entry.key, observation.comparison, {
+          operation: "delete",
+          action: "delete",
         });
-        if (evicted) {
-          // The splice shrinks the slice with the array, so the loop bound
-          // walks back with it instead of reading past the shifted end.
-          ep.entries.splice(i, 1);
-          end -= 1;
-          ep.cursor = i;
+        if (result.status === "applied") {
           shed += 1;
-          continue;
         }
-        i += 1;
-        ep.cursor = i;
       }
-      slices += 1;
+      if (page.length < bounds.pageLimit) {
+        // End of the namespace: the pass is complete, so the next call scans
+        // from the start; rows examined earlier can turn disposable once their
+        // leases lapse. Keep scanning this call only if it started mid-table.
+        cursor = undefined;
+        if (startedFromBeginning) {
+          break;
+        }
+        continue;
+      }
+      cursor = page.at(-1)?.key;
     }
     return shed;
   };
-  const guardedUpdate: BindingStateUpdate = (key, updateValue, opts) => {
+  const guardedMutate: CodexAppServerBindingStore["mutate"] = async (
+    identity,
+    mutation,
+    assertCurrent,
+  ) => {
     let evictions = 0;
     while (true) {
       try {
-        return update(key, updateValue, opts);
+        return await store.mutate(identity, mutation, assertCurrent);
       } catch (error) {
-        if (
-          !isCodexBindingRowLimitError(error) ||
-          evictions >= BINDING_INSERT_EVICTION_ATTEMPTS ||
-          evictDisposableBindingRows(key) === 0
-        ) {
+        if (!isCodexBindingRowLimitError(error) || evictions >= bounds.evictionAttempts) {
+          throw error;
+        }
+        // The failed insert owns no row yet, so the sweep skips nothing by
+        // key; the skip only guards a concurrent insert claiming it mid-retry.
+        if ((await evictDisposableBindingRows(bindingStoreKey(identity))) === 0) {
           throw error;
         }
         evictions += 1;
       }
     }
   };
-  return { ...state, update: guardedUpdate };
+  return { ...store, mutate: guardedMutate };
 }
