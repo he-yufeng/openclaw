@@ -109,39 +109,46 @@ export function withCodexBindingOverflowRecovery<
     // The facade reports missing atomic update/delete support itself.
     return state;
   }
-  let snapshot: { at: number; entries: BindingStateEntry[] } | undefined;
-  const snapshotEntries = (now: number): BindingStateEntry[] => {
-    if (snapshot && now - snapshot.at < BINDING_OVERFLOW_SNAPSHOT_TTL_MS) {
-      return snapshot.entries;
+  let episode: { at: number; entries: BindingStateEntry[]; cursor: number } | undefined;
+  const episodeEntries = (now: number) => {
+    if (!episode || now - episode.at >= BINDING_OVERFLOW_SNAPSHOT_TTL_MS) {
+      episode = {
+        at: now,
+        entries: state.entries().toSorted((a, b) => a.createdAt - b.createdAt),
+        cursor: 0,
+      };
     }
-    const entries = state.entries().toSorted((a, b) => a.createdAt - b.createdAt);
-    snapshot = { at: now, entries };
-    return entries;
+    return episode;
   };
   const evictOneDisposableBindingRow = (insertKey: string): boolean => {
     const now = Date.now();
-    const entries = snapshotEntries(now);
-    for (let from = 0; from < entries.length; from += BINDING_OVERFLOW_PARSE_CHUNK) {
-      for (const entry of entries.slice(from, from + BINDING_OVERFLOW_PARSE_CHUNK)) {
-        if (entry.key === insertKey) {
-          continue;
-        }
-        const stored = readStoredCodexAppServerBinding(entry.value);
-        if (!stored || !isDisposableBindingRow(entry.key, entry.value, stored, now)) {
-          continue;
-        }
-        const evicted = deleteIf(entry.key, (current) => {
-          const currentStored = readStoredCodexAppServerBinding(current);
-          return (
-            currentStored !== undefined &&
-            isDisposableBindingRow(entry.key, current, currentStored, now)
-          );
-        });
-        if (evicted) {
-          // Retries in the same episode reuse the snapshot; keep it honest.
-          entries.splice(entries.indexOf(entry), 1);
-          return true;
-        }
+    const ep = episodeEntries(now);
+    // One slice per call, continuing from the episode cursor: a namespace
+    // full of protected rows never pays a full parse in one call, and the
+    // failed insert simply retries into the next slice.
+    const end = Math.min(ep.cursor + BINDING_OVERFLOW_PARSE_CHUNK, ep.entries.length);
+    for (let i = ep.cursor; i < end; i++) {
+      const entry = ep.entries[i]!;
+      ep.cursor = i + 1;
+      if (entry.key === insertKey) {
+        continue;
+      }
+      const stored = readStoredCodexAppServerBinding(entry.value);
+      if (!stored || !isDisposableBindingRow(entry.key, entry.value, stored, now)) {
+        continue;
+      }
+      const evicted = deleteIf(entry.key, (current) => {
+        const currentStored = readStoredCodexAppServerBinding(current);
+        return (
+          currentStored !== undefined &&
+          isDisposableBindingRow(entry.key, current, currentStored, now)
+        );
+      });
+      if (evicted) {
+        // The next row shifts into this slot after the splice.
+        ep.entries.splice(i, 1);
+        ep.cursor = i;
+        return true;
       }
     }
     return false;
