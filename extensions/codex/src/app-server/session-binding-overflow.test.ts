@@ -6,7 +6,7 @@ import {
   createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { withCodexBindingOverflowRecovery } from "./session-binding-overflow.js";
 import { createLazyCodexAppServerBindingStore } from "./session-binding-store.js";
 import {
@@ -303,6 +303,114 @@ describe("Codex app-server binding overflow recovery", () => {
       expect(store.read(live)).toMatchObject({ threadId: "thread-live" });
       expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
     } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("continues recovery past a long protected prefix, across episode boundaries", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-13T00:00:00.000Z"));
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-prefix-test",
+        519,
+        stateDir,
+      );
+      // 517 live-leased rows ahead of two abandoned ones: the first slices
+      // see only the protected prefix.
+      for (let i = 0; i < 517; i++) {
+        state.register(`conversation:leased-${i}`, {
+          version: 1,
+          state: "cleared",
+          lease: { token: "owner-token", expiresAt: Date.now() + 600_000 },
+        });
+      }
+      state.register("session:main:abandoned-a", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-a",
+      });
+      state.register("session:main:abandoned-b", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-b",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).resolves.toBe(true);
+      expect(state.lookup("session:main:abandoned-a")).toBeUndefined();
+      expect(state.lookup("conversation:leased-0")).toMatchObject({ state: "cleared" });
+
+      // A second insert past the snapshot TTL resumes from the saved scan
+      // position instead of restarting at the protected prefix.
+      vi.setSystemTime(new Date("2026-06-13T00:00:06.000Z"));
+      const second = { kind: "conversation" as const, bindingId: "second" };
+      await expect(
+        store.mutate(second, {
+          kind: "set",
+          binding: { threadId: "thread-second", cwd: "/repo" },
+        }),
+      ).resolves.toBe(true);
+      expect(state.lookup("session:main:abandoned-b")).toBeUndefined();
+      expect(state.lookup("conversation:leased-516")).toMatchObject({ state: "cleared" });
+      expect(store.read(second)).toMatchObject({ threadId: "thread-second" });
+    } finally {
+      vi.useRealTimers();
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconsiders rows whose leases lapse after a fully protected pass", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-06-13T00:00:00.000Z"));
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-lapse-test",
+        2,
+        stateDir,
+      );
+      state.register("conversation:leased-a", {
+        version: 1,
+        state: "cleared",
+        lease: { token: "owner-token", expiresAt: Date.now() + 60_000 },
+      });
+      state.register("conversation:leased-b", {
+        version: 1,
+        state: "cleared",
+        lease: { token: "owner-token", expiresAt: Date.now() + 60_000 },
+      });
+
+      // Every row is protected, so the first pass ends with the cursor past
+      // the last row.
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).rejects.toThrow(/reached its 2-row limit/);
+
+      // Once the leases lapse, a fresh pass must start over and shed them
+      // instead of staying parked past the end of the namespace.
+      vi.setSystemTime(new Date("2026-06-13T00:01:06.000Z"));
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).resolves.toBe(true);
+      expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
+    } finally {
+      vi.useRealTimers();
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });
     }

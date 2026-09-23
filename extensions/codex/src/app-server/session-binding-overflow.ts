@@ -19,6 +19,12 @@ const BINDING_OVERFLOW_SNAPSHOT_TTL_MS = 5_000;
 // Rows schema-parsed per slice while hunting one disposable candidate, so a
 // namespace full of protected rows does not also pay a full parse per attempt.
 const BINDING_OVERFLOW_PARSE_CHUNK = 512;
+// One capacity failure sheds up to this many disposable rows, so a snapshot
+// pays off across many inserts instead of one row per failure.
+const BINDING_OVERFLOW_SHED_PER_CALL = 8;
+// Slices scanned per failure: the per-call parse work stays bounded even
+// when the cursor sits on a long protected prefix.
+const BINDING_OVERFLOW_SCAN_SLICES_PER_CALL = 4;
 
 type BindingStateUpdate = NonNullable<
   PluginStateSyncKeyedStore<StoredCodexAppServerBinding>["update"]
@@ -110,48 +116,100 @@ export function withCodexBindingOverflowRecovery<
     return state;
   }
   let episode: { at: number; entries: BindingStateEntry[]; cursor: number } | undefined;
+  // The scan position survives a snapshot refresh, so spaced requests keep
+  // advancing through the namespace instead of re-reading the same protected
+  // prefix at every episode boundary.
+  let lastExamined: { createdAt: number; key: string } | undefined;
+  const resumeIndex = (
+    entries: BindingStateEntry[],
+    after: { createdAt: number; key: string },
+  ): number => {
+    let lo = 0;
+    let hi = entries.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      const entry = entries[mid]!;
+      if (
+        entry.createdAt > after.createdAt ||
+        (entry.createdAt === after.createdAt && entry.key > after.key)
+      ) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return lo;
+  };
   const episodeEntries = (now: number) => {
     if (!episode || now - episode.at >= BINDING_OVERFLOW_SNAPSHOT_TTL_MS) {
-      episode = {
-        at: now,
-        entries: state.entries().toSorted((a, b) => a.createdAt - b.createdAt),
-        cursor: 0,
-      };
+      // Sort by the same (createdAt, key) order the resume cursor searches,
+      // so equal timestamps cannot scramble the continuation point.
+      const entries = state
+        .entries()
+        .toSorted(
+          (a, b) => a.createdAt - b.createdAt || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0),
+        );
+      let cursor = lastExamined ? resumeIndex(entries, lastExamined) : 0;
+      if (cursor >= entries.length) {
+        // A finished pass must not park the cursor past the end: rows already
+        // examined can turn disposable once their leases lapse, so a full
+        // pass with nothing newer than lastExamined starts over.
+        cursor = 0;
+      }
+      episode = { at: now, entries, cursor };
     }
     return episode;
   };
-  const evictOneDisposableBindingRow = (insertKey: string): boolean => {
+  const evictDisposableBindingRows = (insertKey: string): number => {
     const now = Date.now();
     const ep = episodeEntries(now);
-    // One slice per call, continuing from the episode cursor: a namespace
-    // full of protected rows never pays a full parse in one call, and the
-    // failed insert simply retries into the next slice.
-    const end = Math.min(ep.cursor + BINDING_OVERFLOW_PARSE_CHUNK, ep.entries.length);
-    for (let i = ep.cursor; i < end; i++) {
-      const entry = ep.entries[i]!;
-      ep.cursor = i + 1;
-      if (entry.key === insertKey) {
-        continue;
-      }
-      const stored = readStoredCodexAppServerBinding(entry.value);
-      if (!stored || !isDisposableBindingRow(entry.key, entry.value, stored, now)) {
-        continue;
-      }
-      const evicted = deleteIf(entry.key, (current) => {
-        const currentStored = readStoredCodexAppServerBinding(current);
-        return (
-          currentStored !== undefined &&
-          isDisposableBindingRow(entry.key, current, currentStored, now)
-        );
-      });
-      if (evicted) {
-        // The next row shifts into this slot after the splice.
-        ep.entries.splice(i, 1);
+    // Each call sheds up to a few disposable rows so one snapshot serves many
+    // inserts, and scans at most a few slices so the Gateway thread never
+    // pays a full parse on a protected prefix.
+    let shed = 0;
+    let slices = 0;
+    while (
+      shed < BINDING_OVERFLOW_SHED_PER_CALL &&
+      slices < BINDING_OVERFLOW_SCAN_SLICES_PER_CALL &&
+      ep.cursor < ep.entries.length
+    ) {
+      let end = Math.min(ep.cursor + BINDING_OVERFLOW_PARSE_CHUNK, ep.entries.length);
+      for (let i = ep.cursor; i < end && shed < BINDING_OVERFLOW_SHED_PER_CALL;) {
+        const entry = ep.entries[i]!;
+        lastExamined = { createdAt: entry.createdAt, key: entry.key };
+        if (entry.key === insertKey) {
+          i += 1;
+          ep.cursor = i;
+          continue;
+        }
+        const stored = readStoredCodexAppServerBinding(entry.value);
+        if (!stored || !isDisposableBindingRow(entry.key, entry.value, stored, now)) {
+          i += 1;
+          ep.cursor = i;
+          continue;
+        }
+        const evicted = deleteIf(entry.key, (current) => {
+          const currentStored = readStoredCodexAppServerBinding(current);
+          return (
+            currentStored !== undefined &&
+            isDisposableBindingRow(entry.key, current, currentStored, now)
+          );
+        });
+        if (evicted) {
+          // The splice shrinks the slice with the array, so the loop bound
+          // walks back with it instead of reading past the shifted end.
+          ep.entries.splice(i, 1);
+          end -= 1;
+          ep.cursor = i;
+          shed += 1;
+          continue;
+        }
+        i += 1;
         ep.cursor = i;
-        return true;
       }
+      slices += 1;
     }
-    return false;
+    return shed;
   };
   const guardedUpdate: BindingStateUpdate = (key, updateValue, opts) => {
     let evictions = 0;
@@ -162,7 +220,7 @@ export function withCodexBindingOverflowRecovery<
         if (
           !isCodexBindingRowLimitError(error) ||
           evictions >= BINDING_INSERT_EVICTION_ATTEMPTS ||
-          !evictOneDisposableBindingRow(key)
+          evictDisposableBindingRows(key) === 0
         ) {
           throw error;
         }
