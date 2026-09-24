@@ -53,9 +53,9 @@ const CORE_PACKAGE_POLICY = JSON.parse(
 const CORE_PACKAGES = CORE_PACKAGE_POLICY.map((entry) => entry.name);
 const MAX_TARBALL_BYTES = 192 * 1024 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
-// SDK evidence embeds complete declaration diffs, which have exceeded 4 MiB.
+// SDK evidence embeds complete declaration diffs, which have exceeded 16 MiB.
 // Qualified manifests carry that evidence; raw package descriptors do not.
-const MAX_SDK_EVIDENCE_BYTES = 16 * 1024 * 1024;
+const MAX_SDK_EVIDENCE_BYTES = 32 * 1024 * 1024;
 
 function requireMatch(value, pattern, label) {
   if (typeof value !== "string" || !pattern.test(value)) {
@@ -143,7 +143,7 @@ function validateProducer(producer, { repository, toolingSha, jobName }) {
   return producer;
 }
 
-function validateCorePackages(corePackages, version) {
+export function validatePreparedCorePackages(corePackages, version) {
   if (!Array.isArray(corePackages) || corePackages.length > CORE_PACKAGES.length) {
     throw new Error("Invalid prepared core package inventory.");
   }
@@ -208,7 +208,7 @@ export function validatePreparedNpmBundleDescriptor({
   fileName(pkg.fileName);
   digest(pkg.sha256, "root tarball digest");
   digest(descriptor.manifestSha256, "package manifest digest");
-  validateCorePackages(descriptor.corePackages, pkg.version);
+  validatePreparedCorePackages(descriptor.corePackages, pkg.version);
   if (descriptor.corePackages.some((entry) => entry.tarballName === pkg.fileName)) {
     throw new Error("Prepared root and core tarball filenames overlap.");
   }
@@ -700,6 +700,18 @@ export function prepareNpmPackageBundle({
   releaseTag: requestedReleaseTag = "",
   npmDistTag,
   producer,
+  sanitizeRootDeclarations = (distRoot) => {
+    execFileSync(
+      process.execPath,
+      [
+        "--import",
+        join(sourceDir, "scripts/tsx.mjs"),
+        fileURLToPath(new URL("./lib/sanitize-bundler-helper-dts-exports.mts", import.meta.url)),
+        distRoot,
+      ],
+      { cwd: sourceDir, stdio: "inherit" },
+    );
+  },
   prepareRootShrinkwrap = ({ aiTarballPath }) => {
     execFileSync(
       process.execPath,
@@ -713,17 +725,29 @@ export function prepareNpmPackageBundle({
     );
   },
   runPack = (directory, destination) =>
-    execFileSync("pnpm", ["--dir", directory, "pack", "--pack-destination", destination], {
-      env: {
-        ...process.env,
-        OPENCLAW_PREPACK_PREPARED: "1",
-        ...(/^[a-f0-9]{40}$/u.test(releaseRef)
-          ? { OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG: "1" }
-          : {}),
+    // Bundled dependencies only pack under the hoisted linker; prepack scripts stay enabled.
+    execFileSync(
+      "pnpm",
+      [
+        "--dir",
+        directory,
+        "pack",
+        "--config.node-linker=hoisted",
+        "--pack-destination",
+        destination,
+      ],
+      {
+        env: {
+          ...process.env,
+          OPENCLAW_PREPACK_PREPARED: "1",
+          ...(/^[a-f0-9]{40}$/u.test(releaseRef)
+            ? { OPENCLAW_PREPACK_ALLOW_UNRELEASED_CHANGELOG: "1" }
+            : {}),
+        },
+        stdio: "inherit",
+        timeout: 30 * 60 * 1000,
       },
-      stdio: "inherit",
-      timeout: 30 * 60 * 1000,
-    }),
+    ),
 }) {
   const { sourceSha, root, releaseTag, baseTag } = readReleaseSourceIdentity({
     sourceDir,
@@ -745,6 +769,10 @@ export function prepareNpmPackageBundle({
   }
   // Preserve non-root installs before hashing; qualified consumers never rewrite the archive.
   normalizePackModes(sourceDir);
+  const distRoot = join(sourceDir, "dist");
+  if (existsSync(distRoot)) {
+    sanitizeRootDeclarations(distRoot);
+  }
   const pack = (directory, packageName) => {
     const before = new Set(readdirSync(outputDir));
     runPack(directory, outputDir);

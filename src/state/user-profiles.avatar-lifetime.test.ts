@@ -5,9 +5,10 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import {
   closeOpenClawStateDatabaseForTest,
+  closeOpenClawStateDatabaseAsync,
   openOpenClawStateDatabase,
 } from "./openclaw-state-db.js";
-import { listUserProfilesSync } from "./user-profile-list.js";
+import { listUserProfilesSync } from "./user-profile-identity.read.js";
 import {
   adoptTailscaleProfileAvatar,
   ensureProfileForEmail,
@@ -16,7 +17,8 @@ import {
 } from "./user-profiles.js";
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) => {
-  afterEach(() => {
+  afterEach(async () => {
+    await closeOpenClawStateDatabaseAsync();
     closeOpenClawStateDatabaseForTest();
     cleanup();
   });

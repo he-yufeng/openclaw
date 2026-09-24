@@ -132,6 +132,9 @@ describe("entry compile cache", () => {
     expect(enableCompileCache).toHaveBeenCalledOnce();
     enableOpenClawCompileCache({ env: { NODE_DISABLE_COMPILE_CACHE: "1" }, installRoot: root });
     expect(enableCompileCache).toHaveBeenCalledOnce();
+    setTestEnvValue("NODE_DISABLE_COMPILE_CACHE", "1");
+    enableOpenClawCompileCache({ installRoot: root });
+    expect(enableCompileCache).toHaveBeenCalledOnce();
   });
 
   it("scopes packaged compile cache by package install metadata", async () => {
@@ -210,6 +213,20 @@ describe("entry compile cache", () => {
       await markSourceCheckout();
       entryFile = path.join(root, "src", "entry.ts");
       argv = [process.execPath, entryFile, "webhooks", "--profile", "fixture", "gmail", "run"];
+      await withMockedPlatform(platform, async () => {
+        await expect(
+          respawnWithoutOpenClawCompileCacheIfNeeded({ currentFile: entryFile, installRoot: root }),
+        ).resolves.toBe(false);
+        expect(spawn).not.toHaveBeenCalled();
+      });
+    },
+  );
+
+  it.each(["linux", "darwin"] as const)(
+    "keeps the serving Gateway in process with inherited compile cache on %s",
+    async (platform) => {
+      await markSourceCheckout();
+      argv = [process.execPath, entryFile, "--profile=fixture", "gateway", "run"];
       await withMockedPlatform(platform, async () => {
         await expect(
           respawnWithoutOpenClawCompileCacheIfNeeded({ currentFile: entryFile, installRoot: root }),

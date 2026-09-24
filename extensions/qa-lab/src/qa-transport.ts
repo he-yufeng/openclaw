@@ -475,6 +475,8 @@ export function createQaStateBackedTransportAdapter(
     buildAgentDelivery = params.buildAgentDelivery;
     handleAction = params.handleAction;
     createReportNotes = params.createReportNotes;
+    whenUnhealthy = params.whenUnhealthy;
+    captureBeforeGatewayCleanup = params.captureBeforeGatewayCleanup;
 
     override sendInbound = params.sendInbound;
 
@@ -508,6 +510,9 @@ export function createQaStateBackedTransportAdapter(
         })),
     ...(params.createRuntimeEnvPatch
       ? { createRuntimeEnvPatch: params.createRuntimeEnvPatch }
+      : {}),
+    ...(params.createRuntimePreloads
+      ? { createRuntimePreloads: params.createRuntimePreloads }
       : {}),
     ...(params.prepareFlow ? { prepareFlow: params.prepareFlow } : {}),
     ...(params.captureArtifacts ? { captureArtifacts: params.captureArtifacts } : {}),

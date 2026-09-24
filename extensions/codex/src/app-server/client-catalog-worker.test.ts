@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createDeferred } from "openclaw/plugin-sdk/extension-shared";
 import { WorkerTaskPool } from "openclaw/plugin-sdk/process-runtime";
@@ -27,7 +29,7 @@ function requestId(harness: ReturnType<typeof createClientHarness>, index = 0): 
 async function startWorker(harness: ReturnType<typeof createClientHarness>) {
   const submitted = vi.spyOn(WorkerTaskPool.prototype, "run");
   const request = harness.client.request("thread/list", {}, { catalogPreview: true });
-  harness.send({ id: requestId(harness), result: { data: [] } });
+  harness.send({ id: requestId(harness), result: { data: [], unused: "x".repeat(64 * 1024) } });
   await request;
   const pool = submitted.mock.contexts[0];
   submitted.mockRestore();
@@ -42,66 +44,249 @@ afterEach(async () => {
     await harness.client.closeAndWait();
   }
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("Codex catalog worker transport", () => {
-  it("matches catalog projection without parsing native pages on the main thread", async () => {
+  it("retires a completed decoder while keeping the client ready for another page", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const harness = createHarness();
-    const parse = vi.spyOn(CodexAppServerMessageDecoder.prototype, "parse");
-    const thread = {
-      id: "native-thread",
-      projectId: "project-1",
-      sessionId: "session-1",
-      historyMode: "paginated",
-      name: "  Catalog worker  ",
-      cwd: "/workspace/trailing space ",
-      path: "/synthetic/sessions/native-thread.jsonl",
-      modelProvider: "openai",
-      originator: "native-cli",
-      cliVersion: "0.154.0",
-      createdAt: 10,
-      updatedAt: 20,
-      recencyAt: 21,
-      source: "cli",
-      status: { type: "active", activeFlags: ["waitingOnApproval"] },
-      preview: '\u001b[32mReview "catalog-list:99" and 猫\u001b[0m '.repeat(2_000),
-      gitInfo: { branch: "feature/catalog", sha: "unused-sha", originUrl: "unused-origin" },
-      extra: { text: "unused ".repeat(100_000) },
-      turns: [{ id: "turn-1", items: [{ id: "item-1", type: "agentMessage", text: "history" }] }],
-    };
-    const page = { data: [thread], nextCursor: "next", backwardsCursor: null };
-    const list = harness.client.request("thread/list", { limit: 64 }, { catalogPreview: true });
-    // Result-first envelopes must skip nested IDs and escaped strings while routing.
-    harness.send({ result: page, id: requestId(harness) });
-    await expect(list).resolves.toEqual(
-      projectCodexCatalogNativeResponse(page, sanitizeTerminalText),
-    );
-    expect(parse).not.toHaveBeenCalled();
-
-    const read = harness.client.request(
-      "thread/read",
-      { threadId: thread.id, includeTurns: false },
-      { catalogPreview: true },
-    );
-    harness.send({ id: requestId(harness, 1), result: { thread } });
-    await expect(read).resolves.toEqual({
-      thread: {
-        ...projectCodexCatalogNativeThread(thread, sanitizeTerminalText),
-        cwd: thread.cwd,
-        historyMode: "paginated",
-      },
+    const pool = await startWorker(harness);
+    const retired = createDeferred<void>();
+    const rotate = pool.rotate.bind(pool);
+    const rotation = vi.spyOn(pool, "rotate").mockImplementation(async () => {
+      await rotate();
+      retired.resolve();
     });
-    expect(parse).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(60_000);
+    expect(rotation).toHaveBeenCalledOnce();
+    await retired.promise;
+    expect(pool.getSnapshot().workers).toBe(0);
+    expect(harness.stdinDestroyed).toBe(false);
+    expect(harness.client.getCloseError()).toBeUndefined();
 
-    const history = harness.client.request(
-      "thread/read",
-      { threadId: thread.id, includeTurns: true },
-      { catalogPreview: true },
-    );
-    harness.send({ id: requestId(harness, 2), result: { thread } });
-    await expect(history).resolves.toEqual({ thread });
-    expect(parse).toHaveBeenCalledOnce();
+    const next = harness.client.request("thread/list", {}, { catalogPreview: true });
+    harness.send({
+      id: requestId(harness, 1),
+      result: { data: [{ id: "after-idle" }], unused: "x".repeat(64 * 1024) },
+    });
+    await expect(next).resolves.toEqual({ data: [{ id: "after-idle", projectId: null }] });
+    expect(pool.getSnapshot().workers).toBe(1);
   });
+
+  it.each([false, true])(
+    "keeps incomplete decoder state beyond idle retirement (cancelled: %s)",
+    async (cancelled) => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const harness = createHarness();
+      const pool = await startWorker(harness);
+      const rotation = vi.spyOn(pool, "rotate");
+      const abort = new AbortController();
+      const request = harness.client.request(
+        "thread/list",
+        {},
+        { catalogPreview: true, signal: abort.signal },
+      );
+      const resumed = once(harness.process.stdout, "resume");
+      harness.process.stdout.write(
+        `{"id":${requestId(harness, 1)},"result":{"data":[{"id":"fragmented","preview":"first\n`,
+      );
+      await resumed;
+      if (cancelled) {
+        const rejected = expect(request).rejects.toThrow(/aborted/u);
+        abort.abort();
+        await rejected;
+      }
+      vi.advanceTimersByTime(120_000);
+      expect(rotation).not.toHaveBeenCalled();
+      harness.process.stdout.write('second"}]}}\n');
+      if (!cancelled) {
+        await expect(request).resolves.toEqual({
+          data: [{ id: "fragmented", projectId: null, preview: "first second" }],
+        });
+      }
+      const next = harness.client.request("thread/list", {}, { catalogPreview: true });
+      harness.send({ id: requestId(harness, 2), result: { data: [{ id: "current" }] } });
+      await expect(next).resolves.toEqual({ data: [{ id: "current", projectId: null }] });
+      expect(harness.client.getCloseError()).toBeUndefined();
+    },
+  );
+
+  it.each(["page", "close"])("joins idle retirement before %s completes", async (nextAction) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const harness = createHarness();
+    const pool = await startWorker(harness);
+    const retired = createDeferred<void>();
+    const release = createDeferred<void>();
+    const rotate = pool.rotate.bind(pool);
+    const rotation = vi.spyOn(pool, "rotate").mockImplementation(async () => {
+      await rotate();
+      retired.resolve();
+      await release.promise;
+    });
+    vi.advanceTimersByTime(60_000);
+    expect(rotation).toHaveBeenCalledOnce();
+    await retired.promise;
+    const submitted = vi.spyOn(pool, "run");
+    const page = harness.client.request("thread/list", {}, { catalogPreview: true });
+    const outcome = nextAction === "close" ? expect(page).rejects.toThrow(/closed/u) : page;
+    harness.send({
+      id: requestId(harness, 1),
+      result: { data: [{ id: "queued" }], unused: "x".repeat(64 * 1024) },
+    });
+    let closed = false;
+    const closing =
+      nextAction === "close"
+        ? harness.client.closeAndWait().then(() => {
+            closed = true;
+          })
+        : undefined;
+    if (closing) {
+      harness.emitExit();
+    }
+    try {
+      await Promise.resolve();
+      expect(submitted).not.toHaveBeenCalled();
+      expect(closed).toBe(false);
+    } finally {
+      release.resolve();
+    }
+    if (closing) {
+      await closing;
+      await outcome;
+      expect(submitted).not.toHaveBeenCalled();
+    } else {
+      await expect(page).resolves.toEqual({ data: [{ id: "queued", projectId: null }] });
+      expect(submitted).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("retries failed idle retirement before terminal close releases worker custody", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const harness = createHarness();
+    const pool = await startWorker(harness);
+    const entered = createDeferred<void>();
+    const failedStop = createDeferred<number>();
+    const terminate = vi.spyOn(Worker.prototype, "terminate").mockImplementationOnce(() => {
+      entered.resolve();
+      return failedStop.promise;
+    });
+    vi.advanceTimersByTime(60_000);
+    await entered.promise;
+    const closing = harness.client.closeAndWait();
+    harness.emitExit();
+    failedStop.reject(new Error("synthetic worker stop failed"));
+    try {
+      await expect(closing).resolves.toMatchObject({ exited: true });
+    } finally {
+      await pool.close();
+    }
+    expect(terminate).toHaveBeenCalledTimes(2);
+    expect(pool.getSnapshot().workers).toBe(0);
+  });
+
+  it.each([
+    { name: "ASCII at the bound", bytes: 64 * 1024, character: "x", worker: false },
+    { name: "UTF-8 at the bound", bytes: 64 * 1024, character: "猫", worker: false },
+    { name: "UTF-8 above the bound", bytes: 64 * 1024 + 1, character: "猫", worker: true },
+  ])("projects $name with byte-bounded inline decoding", async ({ bytes, character, worker }) => {
+    const harness = createHarness();
+    const submitted = vi.spyOn(WorkerTaskPool.prototype, "run");
+    const request = harness.client.request(
+      "thread/list",
+      { limit: 64 },
+      { catalogPreview: true, catalogRows: 1 },
+    );
+    const response = {
+      result: {
+        data: [
+          { id: "selected", preview: "\u001b[32m猫\u001b[0m", unused: "discarded" },
+          { id: "discarded", path: "/".repeat(4_097) },
+        ],
+        nextCursor: "next",
+        unused: "",
+      },
+      id: requestId(harness),
+    };
+    const paddingBytes = bytes - Buffer.byteLength(JSON.stringify(response));
+    const characterBytes = Buffer.byteLength(character);
+    response.result.unused =
+      character.repeat(Math.floor(paddingBytes / characterBytes)) +
+      "x".repeat(paddingBytes % characterBytes);
+    const line = JSON.stringify(response);
+    expect(Buffer.byteLength(line)).toBe(bytes);
+    harness.process.stdout.write(`${line}\n`);
+    await expect(request).resolves.toEqual({
+      data: [{ id: "selected", projectId: null, preview: "猫" }],
+      nextCursor: "next",
+    });
+    expect(submitted).toHaveBeenCalledTimes(worker ? 1 : 0);
+  });
+
+  it.each([1, 100_000])(
+    "matches catalog projection with %i native payload repetitions",
+    async (repeats) => {
+      const harness = createHarness();
+      const parse = vi.spyOn(CodexAppServerMessageDecoder.prototype, "parse");
+      const submitted = vi.spyOn(WorkerTaskPool.prototype, "run");
+      const thread = {
+        id: "native-thread",
+        projectId: "project-1",
+        sessionId: "session-1",
+        historyMode: "paginated",
+        name: "  Catalog worker  ",
+        cwd: "/workspace/trailing space ",
+        path: "/synthetic/sessions/native-thread.jsonl",
+        modelProvider: "openai",
+        originator: "native-cli",
+        cliVersion: "0.154.0",
+        createdAt: 10,
+        updatedAt: 20,
+        recencyAt: 21,
+        source: "cli",
+        status: { type: "active", activeFlags: ["waitingOnApproval"] },
+        preview: '\u001b[32mReview "catalog-list:99" and 猫\u001b[0m '.repeat(
+          Math.min(repeats, 2_000),
+        ),
+        gitInfo: { branch: "feature/catalog", sha: "unused-sha", originUrl: "unused-origin" },
+        extra: { text: "unused ".repeat(repeats) },
+        turns: [{ id: "turn-1", items: [{ id: "item-1", type: "agentMessage", text: "history" }] }],
+      };
+      const page = { data: [thread], nextCursor: "next", backwardsCursor: null };
+      const list = harness.client.request("thread/list", { limit: 64 }, { catalogPreview: true });
+      // Result-first envelopes must skip nested IDs and escaped strings while routing.
+      harness.send({ result: page, id: requestId(harness) });
+      await expect(list).resolves.toEqual(
+        projectCodexCatalogNativeResponse(page, sanitizeTerminalText),
+      );
+      expect(parse).not.toHaveBeenCalled();
+
+      const read = harness.client.request(
+        "thread/read",
+        { threadId: thread.id, includeTurns: false },
+        { catalogPreview: true },
+      );
+      harness.send({ id: requestId(harness, 1), result: { thread } });
+      await expect(read).resolves.toEqual({
+        thread: {
+          ...projectCodexCatalogNativeThread(thread, sanitizeTerminalText),
+          cwd: thread.cwd,
+          historyMode: "paginated",
+        },
+      });
+      expect(parse).not.toHaveBeenCalled();
+
+      const history = harness.client.request(
+        "thread/read",
+        { threadId: thread.id, includeTurns: true },
+        { catalogPreview: true },
+      );
+      harness.send({ id: requestId(harness, 2), result: { thread } });
+      await expect(history).resolves.toEqual({ thread });
+      expect(parse).toHaveBeenCalledOnce();
+      expect(submitted).toHaveBeenCalledTimes(repeats === 1 ? 0 : 2);
+    },
+  );
 
   it.each([0, 1])(
     "projects result-first raw-newline pages with %i admitted rows before following notifications",
@@ -176,7 +361,10 @@ describe("Codex catalog worker transport", () => {
     );
     const frames = [
       { method: "turn/started", params: { threadId: "thread-1" } },
-      { id: requestId(harness, 1), result: { data: [{ id: "second" }] } },
+      {
+        id: requestId(harness, 1),
+        result: { data: [{ id: "second" }], unused: "x".repeat(64 * 1024) },
+      },
       {
         id: "approval-1",
         method: "item/commandExecution/requestApproval",
@@ -206,28 +394,57 @@ describe("Codex catalog worker transport", () => {
     });
   });
 
-  it("discards late cancelled catalog pages in the worker without disturbing the next request", async () => {
-    const harness = createHarness();
-    const parse = vi.spyOn(CodexAppServerMessageDecoder.prototype, "parse");
-    const abort = new AbortController();
-    const cancelled = harness.client.request(
-      "thread/list",
-      { limit: 64 },
-      { catalogPreview: true, signal: abort.signal },
-    );
-    const rejection = expect(cancelled).rejects.toThrow(/aborted/u);
-    abort.abort();
-    await rejection;
-    const next = harness.client.request("thread/list", { limit: 1 }, { catalogPreview: true });
-    harness.send({
-      id: requestId(harness),
-      result: { data: [{ id: "late", preview: "discarded ".repeat(100_000) }] },
-    });
-    harness.send({ id: requestId(harness, 1), result: { data: [{ id: "current" }] } });
-    await expect(next).resolves.toEqual({ data: [{ id: "current", projectId: null }] });
-    expect(parse).not.toHaveBeenCalled();
-    expect(harness.client.getCloseError()).toBeUndefined();
-  });
+  it.each([1, 100_000])(
+    "discards late cancelled catalog pages with %i preview repeats without disturbing the next request",
+    async (repeats) => {
+      const harness = createHarness();
+      const parse = vi.spyOn(CodexAppServerMessageDecoder.prototype, "parse");
+      const abort = new AbortController();
+      const cancelled = harness.client.request(
+        "thread/list",
+        { limit: 64 },
+        { catalogPreview: true, signal: abort.signal },
+      );
+      const rejection = expect(cancelled).rejects.toThrow(/aborted/u);
+      abort.abort();
+      await rejection;
+      const next = harness.client.request("thread/list", { limit: 1 }, { catalogPreview: true });
+      harness.send({
+        id: requestId(harness),
+        result: { data: [{ id: "late", preview: "discarded ".repeat(repeats) }] },
+      });
+      harness.send({ id: requestId(harness, 1), result: { data: [{ id: "current" }] } });
+      await expect(next).resolves.toEqual({ data: [{ id: "current", projectId: null }] });
+      expect(parse).not.toHaveBeenCalled();
+      expect(harness.client.getCloseError()).toBeUndefined();
+    },
+  );
+
+  it.each(["close", "abort"])(
+    "does not read cached previews or deliver an inline response after %s",
+    async (cancel) => {
+      const harness = createHarness();
+      const abort = new AbortController();
+      const cache = vi.fn(() => "retained");
+      const request = harness.client.request(
+        "thread/list",
+        {},
+        { catalogPreview: true, catalogPreviewCache: cache, signal: abort.signal },
+      );
+      const rejected = expect(request).rejects.toThrow();
+      harness.send({
+        id: requestId(harness),
+        result: { data: [{ id: "closed", preview: "new" }] },
+      });
+      if (cancel === "close") {
+        harness.client.close();
+      } else {
+        abort.abort();
+      }
+      await rejected;
+      expect(cache).not.toHaveBeenCalled();
+    },
+  );
 
   it("preserves native RPC rejection and keeps projection failures scoped to their request", async () => {
     const harness = createHarness();
@@ -280,8 +497,10 @@ describe("Codex catalog worker transport", () => {
   });
 
   it("pauses stdout and admits only one decode while the worker is busy", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const harness = createHarness();
     const pool = await startWorker(harness);
+    const rotation = vi.spyOn(pool, "rotate");
     const entered = createDeferred<void>();
     const release = createDeferred<void>();
     const run = pool.run.bind(pool);
@@ -309,6 +528,8 @@ describe("Codex catalog worker transport", () => {
       expect(accepted).toBe(false);
       expect(decode).toHaveBeenCalledOnce();
       expect(harness.process.stdout.readableLength).toBeGreaterThan(0);
+      vi.advanceTimersByTime(120_000);
+      expect(rotation).not.toHaveBeenCalled();
     } finally {
       release.resolve();
     }

@@ -24,6 +24,10 @@ import { createChatAttachmentHandoff } from "../../app/chat-attachment-handoff.t
 import { createChatSubmissions } from "../../app/chat-submissions.ts";
 import { createConnectionBootstrapCoordinator } from "../../app/connection-bootstrap.ts";
 import type { ApplicationContext } from "../../app/context.ts";
+import {
+  disposeQuestionPromptState,
+  handleQuestionPromptEvent,
+} from "../../app/question-prompt.ts";
 import type { ApplicationPlacementStartupStatus } from "../../app/session-placement-startup.ts";
 import { loadSettings } from "../../app/settings.ts";
 import type { MarkdownRenderOptions } from "../../components/markdown-render-options.ts";
@@ -103,7 +107,7 @@ export type TestChatPane = HTMLElement & {
   handleDocumentKeydown: (event: KeyboardEvent) => void;
   handleTaskSuggestionEvent: (event: TaskSuggestionEvent) => void;
   refreshTaskSuggestions: () => Promise<void>;
-  refreshSessionPullRequests: (options?: { refresh?: boolean }) => boolean;
+  refreshSessionPullRequests: (options?: { refresh?: boolean; automatic?: boolean }) => boolean;
   sessionPullRequests: ControlUiSessionPullRequest[];
   sessionPullRequestsBranch: ControlUiSessionBranch | undefined;
   githubRepo: MarkdownRenderOptions["githubRepo"];
@@ -126,8 +130,9 @@ export type TestChatPane = HTMLElement & {
   handleSessionSuggestionEvent: (event: SessionSuggestionEvent) => void;
   handleSessionTypingEvent: (event: SessionTypingEvent) => void;
   clearTypingActorForSessionMessage: (payload: unknown) => void;
+  pruneTypingActors: () => void;
   typingActors: Map<string, { label: string; expiresAt: number; preview?: string }>;
-  typingActorViews: () => { id: string; label: string; preview?: string }[];
+  typingActorViews: () => { id: string; label: string; preview?: string; paused?: boolean }[];
   sendTypingState: (typing: boolean, preview?: string) => void;
   refreshSessionSuggestions: () => Promise<void>;
   resolveCurrentSessionSuggestion: (
@@ -154,7 +159,6 @@ export type TestChatPane = HTMLElement & {
   transcriptScrollTop: number | null;
   syncHistoryObserver: () => void;
   loadCatalogSession: (key: CatalogSessionKey, older: boolean) => Promise<boolean>;
-  prependUniqueNativeMessages: (messages: unknown[], current: unknown[]) => unknown[];
   prependUniqueCatalogMessages: (messages: unknown[]) => unknown[];
   loadOlderMessages: () => Promise<void>;
   resetOlderMessagesViewport: () => void;
@@ -168,6 +172,7 @@ export type TestChatPane = HTMLElement & {
   headerRenameValue: string;
   beginHeaderRename: (row: GatewaySessionRow) => void;
   handleHeaderSessionAction: (action: HeaderMenuAction, row: GatewaySessionRow) => Promise<void>;
+  onboarding: boolean;
   cancelHeaderRename: () => void;
   commitHeaderRename: () => void;
   handleHeaderMenuAction: (
@@ -348,7 +353,10 @@ export function createSessionCapabilityFixture(
     createSessionRowProvenance(),
   );
   return {
+    captureConnectionScope: () => null,
+    isConnectionScopeCurrent: () => false,
     deletionState: () => undefined,
+    think: () => undefined,
     archiveVisibility: archiveState.visibility,
     beginArchive: archiveState.beginPending,
     ...overrides,
@@ -466,6 +474,7 @@ export function createTestChatPane(params: {
     chatHistoryPagination: { hasMore: false },
     chatLoading: false,
     chatMessages: [],
+    chatToolMessages: [],
     chatModelCatalog: [],
     chatModelCatalogError: null,
     chatModelsLoading: false,
@@ -588,6 +597,15 @@ export function offlineDeviceSession(): GatewaySessionRow & { placement: ActiveP
 class RenderTestChatPane extends ChatPane {
   chatProps: ChatProps | undefined;
 
+  constructor() {
+    super();
+    onTestFinished(() => disposeQuestionPromptState(this.questionPromptState));
+  }
+
+  receiveQuestionEvent(event: Pick<GatewayEventFrame, "event" | "payload">) {
+    handleQuestionPromptEvent(this.questionPromptState, event);
+  }
+
   initialize(context: ApplicationContext) {
     this.context = context;
     this.state = createPageState(
@@ -607,7 +625,7 @@ class RenderTestChatPane extends ChatPane {
     super.applySessionsState(state);
   }
 
-  override refreshSessionPullRequests(options: { refresh?: boolean } = {}) {
+  override refreshSessionPullRequests(options: { refresh?: boolean; automatic?: boolean } = {}) {
     return super.refreshSessionPullRequests(options);
   }
 }

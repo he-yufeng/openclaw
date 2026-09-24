@@ -7,6 +7,10 @@ import { createAgentRunStaleLifecycleError } from "../infra/agent-lifecycle-erro
 import { attachErrorDiagnostic, formatErrorMessageForDisplay } from "../infra/error-diagnostics.js";
 import { getFailoverErrorCode } from "./failover/error.js";
 import { AgentHarnessPreflightError } from "./harness/errors.js";
+import {
+  PreparedModelRuntimeOwnerNotPublishedError,
+  PreparedModelRuntimePublicationSupersededError,
+} from "./prepared-model-runtime.errors.js";
 
 // Classification here is message/status table behavior. Provider-attributed
 // structured signals (e.g. moonshot + 429) otherwise cross the plugin-consult
@@ -227,8 +231,11 @@ describe("failover-error", () => {
         },
       }),
     ).toBe("format");
-    for (const status of [500, 502, 503, 504, 520, 521, 522, 523, 524]) {
+    for (const status of [504, 522, 524]) {
       expect(resolveFailoverReasonFromError({ status })).toBe("timeout");
+    }
+    for (const status of [500, 502, 503, 520, 521, 523]) {
+      expect(resolveFailoverReasonFromError({ status })).toBe("server_error");
     }
     expect(resolveFailoverReasonFromError({ status: 529 })).toBe("overloaded");
   });
@@ -372,7 +379,7 @@ describe("failover-error", () => {
         status: 503,
         message: "Internal database error",
       }),
-    ).toBe("timeout");
+    ).toBe("server_error");
     expect(
       resolveFailoverReasonFromError({
         status: 503,
@@ -796,10 +803,9 @@ describe("failover-error", () => {
     expect(err?.provider).toBe("anthropic");
   });
 
-  it("preserves a selected-profile error code in the auth failover lane", () => {
+  it("keeps local profile absence in auth failover without inventing a provider response", () => {
     const err = coerceToFailoverError(
       Object.assign(new Error("selected profile missing"), {
-        status: 401,
         code: "selected_auth_profile_unavailable",
       }),
       { provider: "openai", model: "gpt-5.6-sol" },
@@ -807,9 +813,11 @@ describe("failover-error", () => {
 
     expect(err).toMatchObject({
       reason: "auth",
-      status: 401,
       code: "selected_auth_profile_unavailable",
+      message: "selected profile missing",
     });
+    expect(err?.status).toBeUndefined();
+    expect(buildFailoverRemediationHint(err)).toBeUndefined();
   });
 
   it("permission_error with organization denial stays auth_permanent", () => {
@@ -848,7 +856,7 @@ describe("failover-error", () => {
       sessionId: "session:browser-abcd",
       lane: "answer",
       status: 429,
-      code: "selected_auth_profile_unavailable",
+      code: "rate_limit_exceeded",
     });
     expect(err.sessionId).toBe("session:browser-abcd");
     expect(err.lane).toBe("answer");
@@ -861,7 +869,7 @@ describe("failover-error", () => {
     expect(description.lane).toBe("answer");
     expect(description.reason).toBe("rate_limit");
     expect(description.status).toBe(429);
-    expect(description.code).toBe("selected_auth_profile_unavailable");
+    expect(description.code).toBe("rate_limit_exceeded");
   });
 
   it("coerceToFailoverError carries sessionId/lane from context (#42713)", () => {
@@ -906,6 +914,39 @@ describe("failover-error", () => {
         expect(resolveModelFallbackError(error)).toEqual({ kind: "coordination", error });
       }
     });
+
+    it.each([
+      [
+        "publication superseded",
+        () =>
+          new PreparedModelRuntimePublicationSupersededError(
+            "prepared model runtime publication was superseded for /tmp/agent",
+          ),
+      ],
+      [
+        "owner not published",
+        () =>
+          new PreparedModelRuntimeOwnerNotPublishedError(
+            "prepared model runtime owner is not published for /tmp/agent",
+          ),
+      ],
+    ])(
+      "treats prepared model runtime %s as coordination, not a provider quota failure",
+      (_label, make) => {
+        const error = make();
+        const wrapped = new Error("lane task error", { cause: error });
+        for (const candidate of [error, wrapped]) {
+          expect(isNonProviderRuntimeCoordinationError(candidate)).toBe(true);
+          expect(resolveModelFallbackError(candidate)).toEqual({
+            kind: "coordination",
+            error: candidate,
+          });
+          expect(coerceToFailoverError(candidate)).toBeNull();
+          expect(resolveFailoverReasonFromError(candidate)).toBeNull();
+          expect(describeFailoverError(candidate).reason).toBeUndefined();
+        }
+      },
+    );
 
     it("returns true for Codex missing tool-result local execution failures", () => {
       const missingToolResultMessage =

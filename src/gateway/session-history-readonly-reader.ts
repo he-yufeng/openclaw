@@ -6,16 +6,20 @@ import {
   readSessionEntryRow,
 } from "../config/sessions/session-accessor.sqlite-entry-read.js";
 import { readSessionTranscriptRunInputVisibilityFromProjection } from "../config/sessions/session-accessor.sqlite-history-input-visibility.js";
+import { readTranscriptDisplayDeltaFromProjection } from "../config/sessions/session-accessor.sqlite-history-query.js";
 import {
   readCurrentProjectionSnapshot,
   type CurrentTranscriptProjection,
 } from "../config/sessions/session-accessor.sqlite-projection-read.js";
+import type { SessionTranscriptRawDeltaLimits } from "../config/sessions/session-accessor.types.js";
 import { readWithCanonicalSessionAdmission } from "../config/sessions/session-canonical-key.js";
-import { SessionTranscriptProjectionUnavailableError } from "../config/sessions/session-transcript-projection-error.js";
+import {
+  SessionTranscriptProjectionUnavailableError,
+  SessionTranscriptStorageUnavailableError,
+} from "../config/sessions/session-transcript-projection-error.js";
 import { withStateDatabaseCoordinatorRuntimeDirectory } from "../infra/state-database-coordinator.js";
 import { parseAgentSessionKey } from "../routing/session-key.js";
 import { buildRunUserTurnIdempotencyKey } from "../sessions/user-turn-transcript.metadata.js";
-import { readOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly-open.js";
 import { withScopedOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly-scope.js";
 import {
   isSubagentCoordinationHistoryInput,
@@ -148,9 +152,7 @@ export function createReadonlySessionHistoryReader(target: PreparedSessionHistor
           // after dispatch. A current entry may name a successor; it never selects this transcript.
           const entryValidationKey = target.entryValidationKey;
           if (entryValidationKey !== undefined) {
-            readOpenClawAgentDatabaseReadOnly(database, (db) =>
-              readSessionEntryRow(db, entryValidationKey),
-            );
+            readSessionEntryRow(database, entryValidationKey);
           }
           return readCurrentProjectionSnapshot(
             database,
@@ -165,12 +167,9 @@ export function createReadonlySessionHistoryReader(target: PreparedSessionHistor
           );
         }),
       target.database,
-      { throwOnMissingTable: true },
     );
     if (!result.found) {
-      throw new Error(
-        "Session transcript storage is unavailable; open the source gateway and retry.",
-      );
+      throw new SessionTranscriptStorageUnavailableError(result.reason);
     }
     if (result.value.kind === "unavailable") {
       throw new SessionTranscriptProjectionUnavailableError(target.transcript.sessionId);
@@ -178,6 +177,8 @@ export function createReadonlySessionHistoryReader(target: PreparedSessionHistor
     return result.value.value;
   };
   return {
+    readTranscriptDisplayDelta: (limits: SessionTranscriptRawDeltaLimits) =>
+      readSnapshot((projection) => readTranscriptDisplayDeltaFromProjection(projection, limits)),
     ...createSessionTranscriptReader({
       resolveTarget: async () => target.transcript,
       readSnapshot: async (_transcript, read) => readSnapshot(read),

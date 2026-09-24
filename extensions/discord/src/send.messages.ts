@@ -15,6 +15,7 @@ import {
   searchGuildMessages,
   unpinChannelMessage,
 } from "./internal/discord.js";
+import { withDiscordRequestAuthority } from "./internal/request-authority.js";
 import { parseDiscordRetryAfterBodySeconds } from "./retry-after.js";
 import {
   classifyDiscordDeliveryFailure,
@@ -46,6 +47,13 @@ type DiscordThreadInitialMessageDelivery = Readonly<{
   failedChunkIndex: number;
   totalChunkCount: number;
 }>;
+
+type DiscordThreadCreateResult = APIChannel & {
+  initialMessageDelivery?: Omit<
+    DiscordThreadInitialMessageDelivery,
+    "failedChunkDelivery" | "failedChunkIndex"
+  > & { status: "delivered" };
+};
 
 function resolveDiscordThreadStarterMessageId(thread: APIChannel): string {
   const starterMessage = "message" in thread ? thread.message : undefined;
@@ -171,6 +179,7 @@ export async function editMessageDiscord(
     body: {
       content: payload.content,
       ...(payload.flags !== undefined ? { flags: payload.flags } : {}),
+      ...(payload.allowedMentions ? { allowed_mentions: payload.allowedMentions } : {}),
     },
   });
 }
@@ -216,8 +225,9 @@ export async function listPinsDiscord(
 export async function createThreadDiscord(
   channelId: string,
   payload: DiscordThreadCreate,
-  opts: DiscordReactOpts,
-) {
+  opts: DiscordReactOpts & { assertCreateAllowed?: () => void },
+): Promise<DiscordThreadCreateResult> {
+  const assertCreateAllowed = opts.assertCreateAllowed;
   const { rest, request } = createDiscordClient(opts);
   const body: Record<string, unknown> = { name: payload.name };
   if (!payload.messageId && payload.type !== undefined) {
@@ -263,14 +273,17 @@ export async function createThreadDiscord(
   if (!payload.messageId && !isForumLike && body.type === undefined) {
     body.type = ChannelType.PublicThread;
   }
-  const thread = await createThread(rest, channelId, { body }, payload.messageId);
+  const thread = await withDiscordRequestAuthority(assertCreateAllowed, () => {
+    assertCreateAllowed?.();
+    return createThread(rest, channelId, { body }, payload.messageId);
+  });
 
   // Forum creation accepts exactly one starter message, so keep the first chunk in the
   // create request and deliver any remainder after Discord returns the new thread.
   const followupChunks = isForumLike ? initialMessageChunks.slice(1) : initialMessageChunks;
+  const deliveredMessageIds = isForumLike ? [resolveDiscordThreadStarterMessageId(thread)] : [];
+  let deliveredChunkCount = isForumLike ? 1 : 0;
   if (followupChunks.length && "id" in thread) {
-    const deliveredMessageIds = isForumLike ? [resolveDiscordThreadStarterMessageId(thread)] : [];
-    let deliveredChunkCount = isForumLike ? 1 : 0;
     const firstFollowupChunkIndex = isForumLike ? 1 : 0;
     for (const [followupIndex, content] of followupChunks.entries()) {
       let chunkMayHaveDelivered = false;
@@ -318,7 +331,20 @@ export async function createThreadDiscord(
     }
   }
 
-  return thread;
+  // Creation counters predate follow-up sends. Keep them unchanged and return
+  // confirmed delivery separately so callers do not retry accepted content.
+  return deliveredChunkCount > 0
+    ? {
+        ...thread,
+        initialMessageDelivery: {
+          status: "delivered",
+          starterMessageDelivered: isForumLike,
+          deliveredChunkCount,
+          deliveredMessageIds,
+          totalChunkCount: initialMessageChunks.length,
+        },
+      }
+    : thread;
 }
 
 export async function listThreadsDiscord(payload: DiscordThreadList, opts: DiscordReactOpts) {

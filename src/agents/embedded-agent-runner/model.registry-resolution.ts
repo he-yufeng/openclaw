@@ -165,6 +165,7 @@ type DynamicModelAuthProfile = {
 };
 
 export async function resolveDynamicModelAuthProfile(params: {
+  abortSignal?: AbortSignal;
   provider: string;
   modelId: string;
   cfg?: OpenClawConfig;
@@ -173,6 +174,7 @@ export async function resolveDynamicModelAuthProfile(params: {
   authProfileMode?: AuthProfileCredential["type"] | "aws-sdk";
   preferredProfile?: string;
 }): Promise<DynamicModelAuthProfile> {
+  params.abortSignal?.throwIfAborted();
   const explicitProfileId = params.authProfileId?.trim() || undefined;
   // A prepared mode is authoritative; model discovery does not reselect its credentials.
   if (params.authProfileMode) {
@@ -195,26 +197,33 @@ export async function resolveDynamicModelAuthProfile(params: {
       preferredProfile: params.preferredProfile,
     }),
   };
-  const readStore = () => loadAuthProfileStoreForRuntimeAsync(agentDir, readOptions);
-  const store = await readStore().catch((error: unknown) => {
+  const readStore = () => {
+    params.abortSignal?.throwIfAborted();
+    return loadAuthProfileStoreForRuntimeAsync(agentDir, readOptions);
+  };
+  const providers = listOpenAIAuthProfileProvidersForAgentRuntime({
+    provider: params.provider,
+    config: params.cfg,
+  });
+  const store = await readStore().catch(async (error: unknown) => {
     if (!(error instanceof AuthProfileRuntimeReadStaleError)) {
       throw error;
     }
     // OAuth publication can overlap selection. The rejected reader has joined its cleanup.
+    await error.waitForSettlement?.(params.abortSignal);
     return readStore();
   });
+  params.abortSignal?.throwIfAborted();
   const profileId =
     explicitProfileId ??
-    listOpenAIAuthProfileProvidersForAgentRuntime({
-      provider: params.provider,
-      config: params.cfg,
-    }).flatMap((provider) =>
+    providers.flatMap((provider) =>
       resolveAuthProfileOrder({
         cfg: params.cfg,
         store,
         provider,
         preferredProfile: params.preferredProfile,
         forModel: params.modelId,
+        includePendingOAuthRefresh: true,
       }),
     )[0];
   if (!profileId) {
@@ -384,6 +393,7 @@ export function normalizeProviderModelRef(params: {
 }
 
 type ResolveModelWithRegistryParams = {
+  abortSignal?: AbortSignal;
   assertCurrent?: () => void;
   provider: string;
   modelId: string;

@@ -23,19 +23,19 @@ import {
   prepareWebchatReplyMediaForDisplay,
   type WebchatReplyMediaRequesterContext,
 } from "./chat-reply-media.js";
-import { selectChatSendFinalReplyPayloads } from "./chat-send-command-replies.js";
+import {
+  readChatSendReplyPayload,
+  selectChatSendFinalReplyInputs,
+  type DeliveredChatSendReply,
+} from "./chat-send-command-replies.js";
 import { isChatSendReplyDeliveryAuthorized } from "./chat-send-delivery-authority.js";
-import { buildTranscriptReplyText } from "./chat-send-reply-dispatch.js";
+import { buildTranscriptReplyTextFromInputs } from "./chat-send-reply-dispatch.js";
 import type { PreparedChatSendSession } from "./chat-send-session.js";
 import type { GatewayInjectedTtsSupplementMarker } from "./chat-transcript-inject.js";
 import { appendAssistantTranscriptMessage } from "./chat-transcript-persistence.js";
 import { buildMediaOnlyTtsSupplementTranscriptMarker } from "./chat-tts-markers.js";
+import type { GatewayChatUserTurnPersist } from "./chat-user-turn-recorder.js";
 import type { GatewayRequestContext } from "./types.js";
-
-type DeliveredReply = {
-  payload: ReplyPayload;
-  kind: "block" | "final";
-};
 
 type TranscriptMirrorOwner = {
   agentId?: string;
@@ -118,8 +118,10 @@ function resolveTranscriptMirrorOwner(
   };
 }
 
-function buildChatSendBtwSideResult(deliveredReplies: readonly DeliveredReply[]) {
-  const replies = deliveredReplies.map((entry) => entry.payload).filter(isBtwReplyPayload);
+function buildChatSendBtwSideResult(deliveredReplies: readonly DeliveredChatSendReply[]) {
+  const replies = deliveredReplies
+    .map((entry) => readChatSendReplyPayload(entry.input))
+    .filter(isBtwReplyPayload);
   const text = combineNonStreamingReplyParts(replies.map((payload) => payload.text));
   if (replies.length === 0 || !text) {
     return undefined;
@@ -137,10 +139,10 @@ export async function finalizeChatSendDispatchedReplies(params: {
   abortSignal?: AbortSignal;
   accountId: string | undefined;
   context: GatewayRequestContext;
-  deliveredReplies: readonly DeliveredReply[];
+  deliveredReplies: readonly DeliveredChatSendReply[];
   emitFirstAssistantServerTiming: () => void;
   foldCommandBlocks: boolean;
-  persistUserTurnTranscript: () => Promise<void>;
+  persistUserTurnTranscript: GatewayChatUserTurnPersist;
   session: Pick<
     PreparedChatSendSession,
     "agentId" | "backingSessionId" | "cfg" | "clientRunId" | "sessionKey" | "sessionLoadOptions"
@@ -184,11 +186,24 @@ export async function finalizeChatSendDispatchedReplies(params: {
     return;
   }
 
-  const rawFinalPayloads = selectChatSendFinalReplyPayloads({
+  const contextFreeCommand =
+    !params.runtimeOwnsTranscript &&
+    deliveredReplies.length > 0 &&
+    deliveredReplies.every(({ input }) => {
+      const payload = readChatSendReplyPayload(input);
+      const metadata = getReplyPayloadMetadata(payload);
+      return (
+        metadata?.commandReply === true &&
+        metadata.contextFreeCommand === true &&
+        metadata.assistantTranscriptOwned !== true
+      );
+    });
+  const selectedInputs = selectChatSendFinalReplyInputs({
     deliveredReplies,
     foldCommandBlocks,
     suppressReplies,
   });
+  const rawFinalPayloads = selectedInputs.map(readChatSendReplyPayload);
   const deliveryAuthorized = () =>
     rawFinalPayloads.every((payload) =>
       isChatSendReplyDeliveryAuthorized({ agentId, payload, sessionLoadOptions }),
@@ -267,6 +282,7 @@ export async function finalizeChatSendDispatchedReplies(params: {
   let managedMediaPrepareFailed = false;
   const {
     payloads: finalPayloads,
+    inputs: finalInputs,
     mediaMessage,
     assistantContent,
     persistedAssistantContent,
@@ -274,7 +290,7 @@ export async function finalizeChatSendDispatchedReplies(params: {
     scope: mediaScope,
     storePath: sourceSession.storePath,
     transcriptTarget: { sessionKey: transcriptSessionKey, agentId: transcriptAgentId },
-    payloads: rawFinalPayloads,
+    inputs: selectedInputs,
     abortSignal: params.abortSignal,
     includeSensitiveMedia: false,
     includeSensitiveDisplay: true,
@@ -301,13 +317,14 @@ export async function finalizeChatSendDispatchedReplies(params: {
       ? mediaMessage?.content
       : assistantContent;
   const displayReply =
-    extractAssistantDisplayText(assistantContent) ?? buildTranscriptReplyText(finalPayloads);
+    extractAssistantDisplayText(assistantContent) ??
+    buildTranscriptReplyTextFromInputs(finalInputs);
   const transcriptDisplayReply = displayReply?.trim() ?? "";
   const transcriptReply =
     mediaMessage?.transcriptText ||
     (managedMediaPrepareFailed
       ? transcriptDisplayReply
-      : buildTranscriptReplyText(finalPayloads)) ||
+      : buildTranscriptReplyTextFromInputs(finalInputs)) ||
     transcriptDisplayReply;
   let message: Record<string, unknown> | undefined;
   const payloadOwnsAssistantTranscript = rawFinalPayloads.some(
@@ -319,7 +336,11 @@ export async function finalizeChatSendDispatchedReplies(params: {
     canAppendAssistantTranscript &&
     (transcriptReply || persistedContentForAppend?.length),
   );
-  await persistUserTurnTranscript();
+  if (contextFreeCommand) {
+    await persistUserTurnTranscript({ contextFreeCommand: true });
+  } else {
+    await persistUserTurnTranscript();
+  }
   if (!deliveryAuthorized()) {
     context.logGateway.warn(
       "webchat settled final reply skipped: session writer changed before transcript append",
@@ -339,6 +360,7 @@ export async function finalizeChatSendDispatchedReplies(params: {
       idempotencyKey: clientRunId,
       stopReason,
       ttsSupplement: ttsSupplementMarker,
+      ...(contextFreeCommand ? { contextFreeCommand: true } : {}),
       cfg,
     });
     if (appended.ok) {

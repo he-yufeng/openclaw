@@ -3,6 +3,7 @@ import {
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import { isCronSessionDisplayKey } from "../../../src/shared/session-list-visibility.ts";
 import type { GatewaySessionRow } from "../api/types.ts";
 import { t } from "../i18n/index.ts";
 
@@ -14,6 +15,11 @@ const CHANNEL_LABELS: Record<string, string> = {
   slack: "Slack",
   whatsapp: "WhatsApp",
   matrix: "Matrix",
+  msteams: "Microsoft Teams",
+  bluebubbles: "BlueBubbles",
+  googlechat: "Google Chat",
+  mattermost: "Mattermost",
+  irc: "IRC",
   email: "Email",
   sms: "SMS",
 };
@@ -210,8 +216,8 @@ type SessionDisplayOptions = {
   includeSubagentPrefix?: boolean;
 };
 
-function capitalize(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
+export function formatSessionChannelLabel(channel: string): string {
+  return CHANNEL_LABELS[channel] ?? channel.charAt(0).toUpperCase() + channel.slice(1);
 }
 
 /**
@@ -250,7 +256,7 @@ function parseSessionKey(key: string): SessionKeyInfo {
     if (!channel || !identifier) {
       return { prefix: "", fallbackName: key, accountId };
     }
-    const channelLabel = CHANNEL_LABELS[channel] ?? capitalize(channel);
+    const channelLabel = formatSessionChannelLabel(channel);
     return {
       prefix: "",
       fallbackName: `${channelLabel} · ${shortenPeerId(identifier)}`,
@@ -267,7 +273,7 @@ function parseSessionKey(key: string): SessionKeyInfo {
     if (!channel) {
       return { prefix: "", fallbackName: key };
     }
-    const channelLabel = CHANNEL_LABELS[channel] ?? capitalize(channel);
+    const channelLabel = formatSessionChannelLabel(channel);
     return { prefix: "", fallbackName: `${channelLabel} Group` };
   }
 
@@ -275,7 +281,7 @@ function parseSessionKey(key: string): SessionKeyInfo {
   // pre-agent-scoped builds still surface in session lists; label, don't leak keys.
   for (const ch of KNOWN_CHANNEL_KEYS) {
     if (key === ch || key.startsWith(`${ch}:`)) {
-      return { prefix: "", fallbackName: `${CHANNEL_LABELS[ch]} Session` };
+      return { prefix: "", fallbackName: `${formatSessionChannelLabel(ch)} Session` };
     }
   }
 
@@ -350,19 +356,9 @@ export function resolveSessionDisplayName(
   return withAccountDisambiguator(resolveNamedOrFallback(), accountId);
 }
 
-export function isCronSessionKey(key: string): boolean {
-  const normalized = normalizeLowercaseStringOrEmpty(key);
-  const parts = normalized.split(":").filter(Boolean);
-  // Display classification also accepts whitespace-only owners; routing rejects them.
-  return (
-    normalized.startsWith("cron:") ||
-    (normalized.startsWith("agent:") && parts.length >= 4 && parts[2] === "cron")
-  );
-}
-
 // Wire kinds exclude cron; labels, sorting and grouping share this display classification.
 export function resolveSessionDisplayKind(
   row: GatewaySessionRow,
 ): GatewaySessionRow["kind"] | "cron" {
-  return isCronSessionKey(row.key) ? "cron" : row.kind;
+  return isCronSessionDisplayKey(row.key) ? "cron" : row.kind;
 }

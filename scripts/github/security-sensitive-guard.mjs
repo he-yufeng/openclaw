@@ -1,7 +1,12 @@
 #!/usr/bin/env node
 
 import { appendFile } from "node:fs/promises";
-import { finishGuard, openGuard, withApprovalRequest } from "./guard-review.mjs";
+import {
+  SupersededReviewError,
+  finishGuard,
+  openGuard,
+  withApprovalRequest,
+} from "./guard-review.mjs";
 import { createIssueMutationHelpers, sanitizeGuardDisplayValue } from "./guard-shared.mjs";
 import { loadSecurityReviewPolicy } from "./security-review-policy.mjs";
 
@@ -14,25 +19,56 @@ function code(value) {
 }
 
 function renderComment({ changes, pullRequest, approval }) {
+  if (changes.length > 0 && approval?.kind === "comment") {
+    return [
+      marker,
+      "",
+      "### ✅ Maintainer security changes approved",
+      "",
+      "A maintainer approved this revision with an explicit security approval comment.",
+      "",
+      `- Current SHA: ${code(approval.sha)}`,
+      `- Maintainer: @${sanitizeGuardDisplayValue(approval.login)}`,
+      `- Repository role: ${code(approval.role)}`,
+      `- Approval comment: ${approval.url}`,
+      "",
+      "A later push requires a fresh approval comment for an external contributor's PR.",
+    ].join("\n");
+  }
   const heading =
     changes.length === 0
       ? "Security-sensitive guard cleared"
       : approval?.kind === "author"
-        ? "Security-sensitive changes noted"
-        : approval
-          ? "Maintainer security review complete"
-          : "Maintainer security review required";
-  const lines = [
-    marker,
-    "",
-    `### ${heading}`,
-    "",
-    `Current revision: ${code(pullRequest.head.sha)}`,
-  ];
+        ? "⚠️ Security sensitive changes"
+        : "⚠️ Maintainer security review required";
+  const lines = [marker, "", `### ${heading}`, ""];
+  if (changes.length > 0 && approval?.kind === "author") {
+    lines.push(
+      "This maintainer PR changes sensitive security components. This comment is informational because the PR author has repository Maintain or Admin access.",
+      "",
+      `- Current SHA: ${code(pullRequest.head.sha)}`,
+      `- Maintainer: @${sanitizeGuardDisplayValue(approval.login)}`,
+      `- Repository role: ${code(approval.role)}`,
+    );
+  } else if (changes.length > 0 && !approval) {
+    lines.push(
+      "This external contributor PR changes sensitive security components. A maintainer must review these changes before merging.",
+      "",
+      `Current SHA: ${code(pullRequest.head.sha)}`,
+    );
+  } else {
+    lines.push(`Current revision: ${code(pullRequest.head.sha)}`);
+  }
   if (changes.length === 0) {
     lines.push("", "This PR no longer changes files in the maintainer security-review tier.");
   } else {
-    lines.push("", "Review these security responsibilities:", "");
+    lines.push(
+      "",
+      approval?.kind === "author"
+        ? "These security sensitive changes were made:"
+        : "These sensitive security changes were made:",
+      "",
+    );
     for (const change of changes.slice(0, 25)) {
       lines.push(`- ${code(change.path)}: ${change.reason}`);
     }
@@ -41,28 +77,25 @@ function renderComment({ changes, pullRequest, approval }) {
     }
     lines.push("");
     if (approval?.kind === "author") {
-      lines.push(
-        `Informational: author @${approval.login} has repository ${code(approval.role)} access.`,
-      );
-    } else if (approval) {
-      lines.push(
-        `@${approval.login} approved this revision with ${code("/allow-security-sensitive-change")} and repository ${code(approval.role)} access.`,
-      );
+      lines.push("Carefully review these changes before merging.");
     } else {
       lines.push(
-        "A GitHub user account with repository `maintain` or `admin` access must post a new comment containing `/allow-security-sensitive-change` after this notice names the current revision. SecOps approval is not required for this tier.",
-        "Use only the command, or include `/allow-dependencies-change` on a separate line if both guards need approval. A normal GitHub Approve review does not satisfy this check.",
+        "After reviewing the changes, post a new PR comment containing only approval commands, each on its own line:",
+        "",
+        "```text",
+        "/allow-security-sensitive-change",
+        "```",
+        "",
+        "A later push requires a fresh approval comment.",
       );
     }
+  }
+  if (changes.length === 0) {
     lines.push(
       "",
-      "A later push requires a new approval comment after the notice updates. Editing an old comment does not renew approval; deleting the command removes its approval.",
+      "Separate CODEOWNERS requirements still apply to security policy and enforcement files.",
     );
   }
-  lines.push(
-    "",
-    "Separate CODEOWNERS requirements still apply to security policy and enforcement files.",
-  );
   return lines.join("\n");
 }
 
@@ -76,15 +109,13 @@ export async function reviewSecuritySensitiveChanges(prepared) {
     prepared,
   );
   if (!guard) {
-    return;
+    return true;
   }
   const { api, owner, repo, issuePath, files, pullRequest } = guard;
   const { collectSecuritySensitiveChanges } = loadSecurityReviewPolicy();
   const changes = collectSecuritySensitiveChanges(files);
-  const [comments, labels] = await Promise.all([
-    api.paginate(`${issuePath}/comments`),
-    api.paginate(`${issuePath}/labels`),
-  ]);
+  const comments = await api.paginate(`${issuePath}/comments`);
+  const labels = await api.paginate(`${issuePath}/labels`);
   const existing = comments.find(
     (comment) => comment.user?.login === "github-actions[bot]" && comment.body?.startsWith(marker),
   );
@@ -129,14 +160,16 @@ export async function reviewSecuritySensitiveChanges(prepared) {
   } else {
     console.log(summary);
   }
-  if (!allowed) {
-    throw new Error("A maintainer must approve the current revision's sensitive changes.");
-  }
+  return allowed;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   reviewSecuritySensitiveChanges().catch(
     /** @param {unknown} error */ (error) => {
+      if (error instanceof SupersededReviewError) {
+        console.log(error.message);
+        return;
+      }
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
     },

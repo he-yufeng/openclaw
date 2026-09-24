@@ -1,5 +1,6 @@
 export type SidebarSlotId =
   | "browser"
+  | "link-reader"
   | "companion"
   | "conversation"
   | "dashboard"
@@ -16,6 +17,8 @@ export type SidebarPanel = {
   slot: SidebarSlotId;
   environmentId?: string;
   portalId?: string;
+  /** Selected task within the Tasks panel; absence shows its list. */
+  taskId?: string;
 };
 export type SidebarDock = "bottom" | "left" | "right";
 export type SidebarColumn = {
@@ -25,6 +28,8 @@ export type SidebarColumn = {
   activePanelId: string;
   height: number;
   width: number;
+  /** New columns choose their browser width once the pane can be measured. */
+  browserWidthPending?: true;
 };
 export type SidebarLayout = {
   columns: SidebarColumn[];
@@ -36,4 +41,6 @@ export type SidebarLayout = {
   dashboardPresentationOverride?: "split" | "expanded" | null;
   /** Focus the active side panel without swapping its saved main/side placement. */
   expandedSide?: boolean;
+  /** Explicit panel dismissal suppresses automatic resource reveals for this session. */
+  resourceAutoOpenDismissed?: boolean;
 };
