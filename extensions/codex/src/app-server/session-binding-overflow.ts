@@ -37,7 +37,7 @@ const DEFAULT_RECOVERY_BOUNDS: CodexBindingOverflowRecoveryBounds = {
 
 export type CodexBindingOverflowRecoveryState = Pick<
   PluginStateKeyedStore<StoredCodexAppServerBinding>,
-  "compareAndApply" | "entriesInKeyRange" | "observe"
+  "compareAndApply" | "entriesInKeyRange" | "observe" | "withCurrent"
 >;
 
 // A full namespace must not hard-fail every new session. Only row-count
@@ -128,9 +128,11 @@ export function withCodexBindingOverflowRecovery(
   const entriesInKeyRange = recovery.entriesInKeyRange?.bind(recovery);
   const observe = recovery.observe?.bind(recovery);
   const compareAndApply = recovery.compareAndApply?.bind(recovery);
-  if (!entriesInKeyRange || !observe || !compareAndApply) {
-    // Older hosts without ranged listing or row CAS get the pre-recovery
-    // behavior: the row-limit error propagates instead of a full-table scan.
+  const withCurrent = recovery.withCurrent?.bind(recovery);
+  if (!entriesInKeyRange || !observe || !compareAndApply || !withCurrent) {
+    // Hosts without ranged listing, row CAS, or authority-bound writes get
+    // the pre-recovery behavior: the row-limit error propagates instead of a
+    // full-table scan or an unfenced delete.
     return store;
   }
   // Lexical position of the last examined row; undefined scans from the start.
@@ -190,15 +192,18 @@ export function withCodexBindingOverflowRecovery(
         }
         // Recovery ran awaited work since the failed insert, so the caller may
         // hold no authority anymore. Row CAS proves the row is unchanged but
-        // says nothing about the caller; fence every delete on live authority.
-        // Recovery ran awaited work since the failed insert, so the caller may
-        // hold no authority anymore. Row CAS proves the row is unchanged but
-        // says nothing about the caller; fence every delete on live authority.
+        // says nothing about the caller: fence every delete on live authority,
+        // locally before dispatch and again at the worker's write admission.
         assertCurrent?.();
-        const result = await compareAndApply(entry.key, observation.comparison, {
-          operation: "delete",
-          action: "delete",
-        });
+        const writer = assertCurrent ? withCurrent({ assertCurrent }) : undefined;
+        const result = await (writer?.compareAndApply ?? compareAndApply)(
+          entry.key,
+          observation.comparison,
+          {
+            operation: "delete",
+            action: "delete",
+          },
+        );
         if (result.status === "applied") {
           shed += 1;
         }

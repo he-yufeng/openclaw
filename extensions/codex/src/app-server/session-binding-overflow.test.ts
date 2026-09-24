@@ -407,6 +407,7 @@ describe("Codex app-server binding overflow recovery", () => {
           revoked = true;
           return observation;
         },
+        withCurrent: baseRecovery.withCurrent?.bind(baseRecovery),
       };
       const store = withCodexBindingOverflowRecovery(
         createCodexAppServerBindingStore(state),
@@ -444,6 +445,79 @@ describe("Codex app-server binding overflow recovery", () => {
       fs.rmSync(stateDir, { recursive: true, force: true });
     }
   });
+  it("never lets a queued delete land after the caller loses authority at write admission", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const options = {
+        namespace: "app-server-thread-bindings-overflow-admission-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new" as const,
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      };
+      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      const baseRecovery = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      // The caller stays authorized through the failed insert, the sweep, and
+      // the local pre-dispatch assertion; revocation lands only when the
+      // delete reaches the worker, and the worker's admission must recheck it.
+      let revoked = false;
+      const recovery = {
+        entriesInKeyRange: baseRecovery.entriesInKeyRange?.bind(baseRecovery),
+        compareAndApply: baseRecovery.compareAndApply?.bind(baseRecovery),
+        observe: baseRecovery.observe?.bind(baseRecovery),
+        withCurrent: (authority: { assertCurrent: () => void }) => {
+          const bound = baseRecovery.withCurrent!(authority);
+          return {
+            ...bound,
+            compareAndApply: (...args: Parameters<NonNullable<typeof bound.compareAndApply>>) => {
+              revoked = true;
+              return bound.compareAndApply(...args);
+            },
+          };
+        },
+      };
+      const store = withCodexBindingOverflowRecovery(
+        createCodexAppServerBindingStore(state),
+        recovery,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(
+          incoming,
+          { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
+          () => {
+            if (revoked) {
+              throw new Error("caller authority revoked");
+            }
+          },
+        ),
+      ).rejects.toThrow(/authority revoked/);
+
+      // The delete was admitted after revocation, so nothing was deleted.
+      expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
+      expect(store.read(live)).toMatchObject({ threadId: "thread-live" });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("resumes the scan where the previous failure stopped, across inserts", async () => {
     const stateDir = createOverflowStateDir();
     try {
