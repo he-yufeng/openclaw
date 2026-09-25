@@ -62,6 +62,7 @@ export async function getMemoryManagerContextWithPurpose(params: {
 export function createMemoryTool(params: {
   options: MemoryToolOptions;
   contract: MemoryToolContract;
+  prepareArguments?: (args: unknown) => Record<string, unknown>;
   execute: (
     ctx: NonNullable<ReturnType<typeof resolveMemoryToolContext>>,
   ) => AnyAgentTool["execute"];
@@ -75,6 +76,7 @@ export function createMemoryTool(params: {
     name: params.contract.name,
     description: params.contract.describe(ctx.sources),
     parameters: params.contract.parameters,
+    ...(params.prepareArguments ? { prepareArguments: params.prepareArguments } : {}),
     execute: async (toolCallId, toolParams, signal, onUpdate) => {
       const latestCtx = params.options.getConfig ? resolveMemoryToolContext(params.options) : ctx;
       // A live getter makes missing or disabled current config a revocation.

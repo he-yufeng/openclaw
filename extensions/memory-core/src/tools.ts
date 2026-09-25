@@ -25,6 +25,7 @@ import {
   type MemoryCorpusFailure,
 } from "./memory-corpus.js";
 import { executeMemoryReadResult, executeWikiMemoryReadResult } from "./memory-read-tool.js";
+import { normalizeMemorySearchArguments } from "./memory-search-arguments.js";
 import {
   buildPausedMemoryIndexUnavailableResult,
   executeMemorySearchToolQuery,
@@ -227,6 +228,7 @@ export function createMemorySearchTool(options: MemoryToolOptions) {
   return createMemoryTool({
     options,
     contract: MEMORY_SEARCH_TOOL_CONTRACT,
+    prepareArguments: normalizeMemorySearchArguments,
     execute:
       ({ cfg, agentId, settings }) =>
       async (_toolCallId, params, callerSignal) => {
