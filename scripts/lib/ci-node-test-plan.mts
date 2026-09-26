@@ -353,8 +353,16 @@ const EXCLUDED_FULL_SUITE_SHARDS = new Set([
   "test/vitest/vitest.full-extensions.config.ts",
 ]);
 
+export const SOURCE_CHANNEL_TEST_POLICY = {
+  config: "test/vitest/vitest.channels.config.ts",
+  env: {
+    NODE_OPTIONS: "--max-old-space-size=8192",
+    OPENCLAW_VITEST_MAX_WORKERS: "1",
+  },
+} as const;
+
 const EXCLUDED_PROJECT_CONFIGS = new Set([
-  "test/vitest/vitest.channels.config.ts",
+  SOURCE_CHANNEL_TEST_POLICY.config,
   // checks-ui owns the Chromium project; Node stripes retain Node-driven Playwright tests.
   "test/vitest/vitest.ui-browser.config.ts",
 ]);
@@ -2383,9 +2391,15 @@ function partitionRuntimeTestFiles(configs: string[], files: string[]) {
   };
 }
 
+const GATEWAY_CORE_NODE_TEST_CONFIGS = [
+  "test/vitest/vitest.gateway-core.config.ts",
+  "test/vitest/vitest.gateway-client.config.ts",
+];
+
 function createAgenticGatewayCoreSplitShards(): NodeTestSplitShard[] {
   const unitFastFiles = new Set(getUnitFastTestFiles());
   const excludedGatewayFiles = new Set([
+    ...databaseWorkerCoreTestFiles,
     ...gatewayDatabaseWorkerTestFiles,
     ...gatewayServerExcludedTestFiles,
     ...gatewayServerIsolatedTestFiles,
@@ -2400,10 +2414,7 @@ function createAgenticGatewayCoreSplitShards(): NodeTestSplitShard[] {
   const packageFiles = ["packages/gateway-client/src", "packages/gateway-protocol/src"]
     .flatMap((rootDir) => listTestFiles(rootDir))
     .filter((file) => isStripeEligibleTestFile(file, unitFastFiles));
-  const configs = [
-    "test/vitest/vitest.gateway-core.config.ts",
-    "test/vitest/vitest.gateway-client.config.ts",
-  ];
+  const configs = GATEWAY_CORE_NODE_TEST_CONFIGS;
   // The pretest runtime build is charged per job, so a stripe holding one of
   // these files pays it for the whole stripe. Striping spreads them, which made
   // every gateway-core job pay a 275s build to run ~120s of tests. Keep them in
@@ -2449,6 +2460,12 @@ const TUI_PTY_NODE_TEST_SHARD: NodeTestSplitShard = {
   },
   requiresDist: true,
   runner: "blacksmith-4vcpu-ubuntu-2404",
+};
+const AGENTS_EMBEDDED_NODE_TEST_SHARD: NodeTestSplitShard = {
+  shardName: "agentic-agents-embedded",
+  configs: embeddedAgentVitestProjectOwners.map((owner) => owner.config),
+  env: AGENTS_EMBEDDED_AGENT_ENV,
+  requiresDist: false,
 };
 
 const SPLIT_NODE_SHARDS = new Map<string, NodeTestSplitShard[] | (() => NodeTestSplitShard[])>([
@@ -2567,12 +2584,7 @@ const SPLIT_NODE_SHARDS = new Map<string, NodeTestSplitShard[] | (() => NodeTest
       },
       ...createAgenticCommandSplitShards(resolveTestFilesBuildMode),
       ...createAgentCoreSplitShards(),
-      {
-        shardName: "agentic-agents-embedded",
-        configs: embeddedAgentVitestProjectOwners.map((owner) => owner.config),
-        env: AGENTS_EMBEDDED_AGENT_ENV,
-        requiresDist: false,
-      },
+      AGENTS_EMBEDDED_NODE_TEST_SHARD,
       {
         shardName: "agentic-agents-support",
         configs: [agentVitestProjectOwners.support.config],
@@ -2741,10 +2753,26 @@ function resolveSplitNodeShards(name: string): NodeTestSplitShard[] | undefined 
 }
 
 export function nodeTestConfigRequiresCanonicalMetadata(config: string): boolean {
+  const toolingOwner = canonicalNodeTestOwners.some(
+    (owner) => owner.name === "core-tooling" && owner.projects.includes(config),
+  );
   if (config === TOOLING_CONFIG) {
-    return canonicalNodeTestOwners.some(
-      (owner) => owner.name === "core-tooling" && owner.projects.includes(config),
-    );
+    return toolingOwner;
+  }
+  // Gateway environment overrides belong to exclusive configs. The remaining
+  // environment owners share these descriptors with shard construction.
+  if (
+    !toolingOwner &&
+    !isExclusiveCiTestConfig(config) &&
+    !(
+      GATEWAY_CORE_NODE_TEST_CONFIGS.includes(config) &&
+      GATEWAY_CORE_NODE_TEST_CONFIGS.some(isExclusiveCiTestConfig)
+    ) &&
+    ![TUI_PTY_NODE_TEST_SHARD, AGENTS_EMBEDDED_NODE_TEST_SHARD].some((shard) =>
+      shard.configs.includes(config),
+    )
+  ) {
+    return false;
   }
   canonicalMetadataConfigs ??= new Set(
     createNodeTestShardsForOwners(canonicalNodeTestOwners, {
@@ -4504,7 +4532,11 @@ function createCompactNodeTestShardBundles(
         })
       );
     };
-    const bins = packNodeTestGroups(anchorGroups, canShareCompactJob, packsHostedTooling);
+    const bins = packNodeTestGroups(
+      anchorGroups,
+      canShareCompactJob,
+      options.runnerBackend === "github",
+    );
     if (options.runnerBackend === "github") {
       for (const bin of bins) {
         bin.sort((a, b) => runnerRank(b) - runnerRank(a));
