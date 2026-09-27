@@ -90,6 +90,8 @@ export interface AgentSessionConfig {
   contextOverflowRecoveryOwner?: "session" | "caller";
   /** Whether disposing this object ends the durable provider session. Defaults to true. */
   cleanupProviderSessionResourcesOnDispose?: boolean;
+  /** Compaction summary requests run at this level instead of the session level when set. */
+  compactionThinkingLevel?: ThinkingLevel;
 }
 
 export interface ExtensionBindings {

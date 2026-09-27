@@ -317,7 +317,7 @@ export abstract class AgentSessionCompaction extends AgentSessionInspection {
         signal: options.signal,
         // Extension-owned compaction must use the same prepared model execution
         // context as the core path below or provider wrappers and reasoning drift.
-        thinkingLevel: this.thinkingLevel,
+        thinkingLevel: this.compactionThinkingLevel ?? this.thinkingLevel,
         streamFn: this.agent.streamFn,
       });
 
@@ -359,7 +359,7 @@ export abstract class AgentSessionCompaction extends AgentSessionInspection {
           auth.headers,
           coreInstructions || undefined,
           options.signal,
-          this.thinkingLevel,
+          this.compactionThinkingLevel ?? this.thinkingLevel,
           this.agent.streamFn,
           createCompactionRuntime((usage) => recordSessionModelUsage(this.sessionManager, usage)),
         );

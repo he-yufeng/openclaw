@@ -67,6 +67,9 @@ export abstract class AgentSessionBase {
   readonly sessionManager: SessionManager;
   readonly settingsManager: SettingsManager;
 
+  /** Compaction summary level override from config; unset keeps session level. */
+  protected compactionThinkingLevel?: ThinkingLevel;
+
   protected unsubscribeAgent?: () => void;
   private eventListeners: AgentSessionEventListener[] = [];
 
@@ -144,6 +147,7 @@ export abstract class AgentSessionBase {
     this.contextOverflowRecoveryOwner = config.contextOverflowRecoveryOwner ?? "session";
     this.cleanupProviderSessionResourcesOnDispose =
       config.cleanupProviderSessionResourcesOnDispose ?? true;
+    this.compactionThinkingLevel = config.compactionThinkingLevel;
   }
 
   /** Model registry for API key resolution and model discovery */

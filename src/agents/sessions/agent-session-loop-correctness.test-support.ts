@@ -2,6 +2,7 @@ import {
   createAssistantMessageEventStream,
   type AssistantMessage,
   type Model,
+  type ThinkingLevel,
 } from "openclaw/plugin-sdk/llm";
 import { afterEach, beforeEach, vi, type Mock } from "vitest";
 import { createResourceLoader } from "./agent-session-loop-resource-loader.test-support.js";
@@ -127,6 +128,7 @@ export async function createTestSession(
     resourceLoader?: ResourceLoader;
     customTools?: ToolDefinition[];
     contextOverflowRecoveryOwner?: "session" | "caller";
+    compactionThinkingLevel?: ThinkingLevel;
     withSessionWriteSettlement?: NonNullable<
       Parameters<typeof createAgentSession>[0]
     >["withSessionWriteSettlement"];
@@ -158,11 +160,13 @@ export async function createTestSession(
     modelRegistry,
     withSessionWriteSettlement: options.withSessionWriteSettlement,
   };
-  const result = options.contextOverflowRecoveryOwner
-    ? await createAgentSessionForEmbeddedRunner(sessionOptions, {
-        contextOverflowRecoveryOwner: options.contextOverflowRecoveryOwner,
-      })
-    : await createAgentSession(sessionOptions);
+  const result =
+    options.contextOverflowRecoveryOwner || options.compactionThinkingLevel !== undefined
+      ? await createAgentSessionForEmbeddedRunner(sessionOptions, {
+          contextOverflowRecoveryOwner: options.contextOverflowRecoveryOwner,
+          compactionThinkingLevel: options.compactionThinkingLevel,
+        })
+      : await createAgentSession(sessionOptions);
   sessions.push(result.session);
   return { ...result, modelRegistry, settingsManager, sessionManager };
 }
