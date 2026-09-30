@@ -61,13 +61,14 @@ export async function readLatestSessionUsageFromTranscriptFileAsync(
         continue;
       }
       let normalizedMessage: Record<string, unknown>;
+      let entryId: string | undefined;
       try {
         const record = asOptionalRecord(JSON.parse(line));
-        // Compaction/reset boundary markers carry no message payload; pass them
-        // through so the chars estimate only counts the live window after the
-        // latest boundary, not the full retained archive.
+        // Compaction/reset boundary markers carry the retained-window contract
+        // (summary, firstKeptEntryId); pass the record through so the chars
+        // estimate keeps the live window the marker names, not the archive.
         if (record?.type === "compaction" || record?.type === "reset") {
-          usageAccumulator.add({ type: record.type });
+          usageAccumulator.add(record);
           continue;
         }
         const message = asOptionalRecord(record?.message);
@@ -85,10 +86,11 @@ export async function readLatestSessionUsageFromTranscriptFileAsync(
             : {}),
           ...(usage ? { usage } : {}),
         };
+        entryId = typeof record.id === "string" ? record.id : undefined;
       } catch {
         continue;
       }
-      usageAccumulator.add(normalizedMessage);
+      usageAccumulator.add(normalizedMessage, entryId);
     }
     return usageAccumulator.finish();
   } catch {

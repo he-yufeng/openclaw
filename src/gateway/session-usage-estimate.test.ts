@@ -118,4 +118,137 @@ describe("readLatestSessionUsageFromTranscript estimate window", () => {
     expect(snapshot?.totalTokens).toBe(1234);
     expect(snapshot?.totalTokensFresh).toBe(true);
   });
+
+  test("a compaction keeps the summary and the retained window it names (#150579)", async () => {
+    const sessionId = "usage-compaction-retained-window";
+    const archivedText = "x".repeat(4000);
+    const retainedText = "r".repeat(2000);
+    const summaryText = "s".repeat(500);
+    const tailText = "short live tail";
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "m-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      {
+        type: "message",
+        id: "m-retained",
+        message: { role: "user", content: retainedText },
+      },
+      {
+        type: "compaction",
+        id: "c-1",
+        summary: summaryText,
+        firstKeptEntryId: "m-retained",
+        tokensBefore: 1000,
+      },
+      {
+        type: "message",
+        id: "m-tail",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: tailText,
+        },
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    // The archived 4000 chars are superseded, but the model still sees the
+    // summary, the retained message, and the live tail.
+    expect(snapshot?.totalTokens).toBe(
+      estimateTokensFromChars(
+        estimateStringChars(retainedText) +
+          estimateStringChars(summaryText) +
+          estimateStringChars(tailText),
+      ),
+    );
+    expect(snapshot?.totalTokensFresh).toBe(true);
+  });
+
+  test("a reset keeps the retained tail named by firstKeptEntryId (#150579)", async () => {
+    const sessionId = "usage-reset-retained-window";
+    const archivedText = "y".repeat(4000);
+    const retainedText = "k".repeat(1500);
+    const tailText = "after reset";
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "r-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      { type: "message", id: "r-retained", message: { role: "user", content: retainedText } },
+      { type: "reset", id: "reset-1", reason: "reset", firstKeptEntryId: "r-retained" },
+      {
+        type: "message",
+        id: "r-tail",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: tailText,
+        },
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    expect(snapshot?.totalTokens).toBe(
+      estimateTokensFromChars(estimateStringChars(retainedText) + estimateStringChars(tailText)),
+    );
+  });
+
+  test("a boundary naming an unknown kept entry keeps only the summary (#150579)", async () => {
+    const sessionId = "usage-compaction-unknown-kept";
+    const archivedText = "z".repeat(4000);
+    const summaryText = "s".repeat(500);
+    const tailText = "tail";
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "u-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      {
+        type: "compaction",
+        id: "c-unknown",
+        summary: summaryText,
+        firstKeptEntryId: "not-in-transcript",
+        tokensBefore: 1000,
+      },
+      {
+        type: "message",
+        id: "u-tail",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: tailText,
+        },
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    // Same fallback as the transcript tree selector: an unresolvable kept
+    // target drops the pre-boundary window, but the summary still counts.
+    expect(snapshot?.totalTokens).toBe(
+      estimateTokensFromChars(estimateStringChars(summaryText) + estimateStringChars(tailText)),
+    );
+  });
 });
