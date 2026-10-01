@@ -734,7 +734,8 @@ vi.mock("../cache-ttl.js", () => ({
   },
 }));
 
-vi.mock("../compaction-runtime-context.js", () => ({
+vi.mock("../compaction-runtime-context.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../compaction-runtime-context.js")>()),
   buildEmbeddedCompactionRuntimeContext: () => ({}),
 }));
 

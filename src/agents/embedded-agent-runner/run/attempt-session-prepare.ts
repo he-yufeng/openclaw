@@ -34,13 +34,12 @@ import { createAgentSessionForEmbeddedRunner } from "../../sessions/sdk.js";
 import { withSessionManagerWrite } from "../../sessions/session-manager-write-admission.js";
 import { wrapToolDefinition } from "../../sessions/tools/tool-definition-wrapper.js";
 import { resolveToolSearchCatalogTool } from "../../tool-search.js";
-import { resolveEmbeddedCompactionThinkingLevel } from "../compaction-runtime-context.js";
+import { resolveEmbeddedSessionCompactionThinkingLevel } from "../compaction-runtime-context.js";
 import { runContextEngineMaintenance } from "../context-engine-maintenance.js";
 import { buildEmbeddedExtensionFactories } from "../extensions.js";
 import { log } from "../logger.js";
 import { createEmbeddedAgentResourceLoader } from "../resource-loader.js";
 import { applySystemPromptToSession } from "../system-prompt.js";
-import { mapThinkingLevel, mapThinkingLevelForProvider } from "../utils.js";
 import { prepareEmbeddedAttemptClientTools } from "./attempt-client-tools.js";
 import { resolveAttemptTranscriptPolicy } from "./attempt-history.js";
 import { normalizeMessagesForLlmBoundary } from "./attempt-llm-boundary.js";
@@ -206,17 +205,14 @@ export async function prepareEmbeddedAttemptAgentSession(input: {
     contextOverflowRecoveryOwner: attempt.contextTokenBudget === undefined ? "session" : "caller",
     // The run's session keeps the session thinking level; compaction summaries
     // run at the configured compaction level instead (#159424).
-    compactionThinkingLevel: mapThinkingLevel(
-      mapThinkingLevelForProvider(
-        resolveEmbeddedCompactionThinkingLevel({
-          config: attempt.config,
-          provider: attempt.provider,
-          modelId: attempt.modelId,
-          inheritedLevel: input.agentCoreThinkingLevel,
-        }),
-        attempt.model,
-      ),
-    ),
+    compactionThinkingLevel: resolveEmbeddedSessionCompactionThinkingLevel({
+      config: attempt.config,
+      provider: attempt.provider,
+      modelId: attempt.modelId,
+      model: attempt.model,
+      inheritedLevel: input.agentCoreThinkingLevel,
+      preparedModelRuntime: attempt.preparedModelRuntime,
+    }),
     beforeToolBatch: input.clientToolPreparation.catalogToolHookContext
       ? createToolLoopBatchAdmission(input.clientToolPreparation.catalogToolHookContext)
       : undefined,

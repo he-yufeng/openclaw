@@ -633,4 +633,31 @@ describe("prepareEmbeddedAttemptAgentSession", () => {
       "activate-tools",
     ]);
   });
+
+  it("keeps the provider-prepared compaction default when the setting is unset", async () => {
+    const fixture = createInput();
+    fixture.input.attempt = {
+      ...fixture.input.attempt,
+      model: {
+        id: "demo-model",
+        provider: "demo",
+        api: "anthropic-messages",
+        reasoning: true,
+      },
+      modelId: "demo-model",
+      provider: "demo",
+      preparedModelRuntime: {
+        findConfiguredRuntimeModel: (provider: string, modelId: string) =>
+          provider === "demo" && modelId === "demo-model"
+            ? { compactionThinkingDefault: "off" }
+            : undefined,
+      },
+    } as unknown as EmbeddedRunAttemptParams;
+
+    await prepareEmbeddedAttemptAgentSession(fixture.input);
+
+    expect(hoisted.createAgentSessionForEmbeddedRunner.mock.calls[0]?.[1]).toMatchObject({
+      compactionThinkingLevel: "off",
+    });
+  });
 });

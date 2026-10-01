@@ -2,6 +2,7 @@ import { asFiniteNumber } from "@openclaw/normalization-core/number-coercion";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import type { ThinkLevel, ThinkingCatalogEntry } from "../../auto-reply/thinking.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
+import type { Model } from "../../llm/types.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { isDefaultAgentRuntimeId, normalizeOptionalAgentRuntimeId } from "../agent-runtime-id.js";
 import {
@@ -10,6 +11,7 @@ import {
 } from "../bash-process-references.js";
 import { resolveContextWindowInfo } from "../context-window-guard.js";
 import { DEFAULT_CONTEXT_TOKENS, DEFAULT_PROVIDER } from "../defaults.js";
+import { projectModelThinkingCompat } from "../model-catalog-lookup.js";
 import { splitTrailingAuthProfile } from "../model-ref-profile.js";
 import type { ModelManifestNormalizationContext } from "../model-ref-shared.js";
 import {
@@ -18,11 +20,17 @@ import {
   listModelAliasCandidates,
 } from "../model-selection-shared.js";
 import { resolveSelectedOpenAIRuntimeProvider } from "../openai-routing.js";
+import type { PreparedModelRuntimeSnapshot } from "../prepared-model-runtime.js";
 import { agentRuntimeAuthPlanMatchesTarget } from "../runtime-plan/prepare-auth.js";
 import type { AgentRuntimePlan } from "../runtime-plan/types.js";
+import type { ThinkingLevel } from "../runtime/index.js";
 import { resolveCandidateThinkingLevel } from "../thinking-runtime.js";
 import type { CompactEmbeddedAgentSessionParams } from "./compact.types.js";
-import { normalizeContextTokenBudget } from "./utils.js";
+import {
+  mapThinkingLevel,
+  mapThinkingLevelForProvider,
+  normalizeContextTokenBudget,
+} from "./utils.js";
 
 type NullableCompactionContextKey =
   | "sessionKey"
@@ -84,6 +92,49 @@ export function resolveEmbeddedCompactionThinkingLevel(params: {
       sessionKey: params.sessionKey,
       agentRuntime: params.agentRuntime,
     }) ?? "off"
+  );
+}
+
+/**
+ * In-run sessions keep their own thinking level; compaction summaries resolve
+ * separately (#159424). The resolver must see the session model's capability
+ * entry and the provider-prepared default, or an unset setting clamps blind and
+ * forces "low" even where the provider prepared "off".
+ */
+export function resolveEmbeddedSessionCompactionThinkingLevel(params: {
+  config?: OpenClawConfig;
+  provider: string;
+  modelId: string;
+  model: Model;
+  inheritedLevel?: ThinkLevel;
+  preparedModelRuntime?: PreparedModelRuntimeSnapshot;
+}): ThinkingLevel {
+  const runtimeModel = params.preparedModelRuntime?.findConfiguredRuntimeModel(
+    params.provider,
+    params.modelId,
+  );
+  const thinkingCompat = projectModelThinkingCompat(params.model.compat);
+  const catalogEntry = {
+    provider: params.provider,
+    id: params.modelId,
+    api: params.model.api,
+    reasoning: params.model.reasoning,
+    ...(params.model.thinkingLevelMap ? { thinkingLevelMap: params.model.thinkingLevelMap } : {}),
+    params: params.model.params,
+    ...(thinkingCompat ? { compat: thinkingCompat } : {}),
+  } satisfies ThinkingCatalogEntry;
+  return mapThinkingLevel(
+    mapThinkingLevelForProvider(
+      resolveEmbeddedCompactionThinkingLevel({
+        config: params.config,
+        provider: params.provider,
+        modelId: params.modelId,
+        inheritedLevel: params.inheritedLevel,
+        compactionThinkingDefault: runtimeModel?.compactionThinkingDefault,
+        catalog: [catalogEntry],
+      }),
+      params.model,
+    ),
   );
 }
 
