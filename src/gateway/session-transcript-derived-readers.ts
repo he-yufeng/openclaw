@@ -153,13 +153,19 @@ export function createSessionTranscriptUsageAccumulator(source: TranscriptUsageS
     estimateWindow.length = 0;
     estimateWindow.push(...kept);
     estimatedTranscriptChars = kept.reduce((total, entry) => total + entry.chars, 0);
-    sawEstimateModelIdentity = kept.some((entry) => entry.modelIdentity);
     // The compaction summary stays in the model context until the next
     // boundary, so it counts even though it is not a message entry.
     const summary = typeof marker.summary === "string" ? marker.summary.trim() : "";
     if (marker.type === "compaction" && summary) {
       estimatedTranscriptChars += estimateStringChars(summary);
     }
+    // A boundary is only written by a live model session, so a window it
+    // leaves with counted text stays estimate-eligible even when no
+    // model-tagged assistant survived the cut. Without this, a read between
+    // the boundary and the next assistant reply drops the estimate for
+    // summary-only or retained-user-only windows.
+    sawEstimateModelIdentity =
+      kept.some((entry) => entry.modelIdentity) || estimatedTranscriptChars > 0;
   };
   const add = (message: unknown, entryId?: string): void => {
     if (source === "artifact" && isRecord(message)) {

@@ -251,4 +251,92 @@ describe("readLatestSessionUsageFromTranscript estimate window", () => {
       estimateTokensFromChars(estimateStringChars(summaryText) + estimateStringChars(tailText)),
     );
   });
+
+  test("a summary-only window keeps its estimate right after compaction (#150579)", async () => {
+    const sessionId = "usage-compaction-summary-only";
+    const archivedText = "x".repeat(4000);
+    const summaryText = "s".repeat(500);
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "so-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      {
+        type: "compaction",
+        id: "c-summary-only",
+        summary: summaryText,
+        firstKeptEntryId: "not-in-transcript",
+        tokensBefore: 1000,
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    // No model-tagged assistant survives the cut and none has replied yet;
+    // the summary alone is the live window and must still be estimated.
+    expect(snapshot?.totalTokens).toBe(estimateTokensFromChars(estimateStringChars(summaryText)));
+    expect(snapshot?.totalTokensFresh).toBe(true);
+  });
+
+  test("a compaction retaining only user messages keeps its estimate (#150579)", async () => {
+    const sessionId = "usage-compaction-retained-user-only";
+    const archivedText = "x".repeat(4000);
+    const retainedText = "r".repeat(2000);
+    const summaryText = "s".repeat(500);
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "uo-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      { type: "message", id: "uo-retained", message: { role: "user", content: retainedText } },
+      {
+        type: "compaction",
+        id: "c-user-only",
+        summary: summaryText,
+        firstKeptEntryId: "uo-retained",
+        tokensBefore: 1000,
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    expect(snapshot?.totalTokens).toBe(
+      estimateTokensFromChars(estimateStringChars(retainedText) + estimateStringChars(summaryText)),
+    );
+    expect(snapshot?.totalTokensFresh).toBe(true);
+  });
+
+  test("a reset retaining only user text keeps its estimate (#150579)", async () => {
+    const sessionId = "usage-reset-retained-user-only";
+    const archivedText = "y".repeat(4000);
+    const retainedText = "k".repeat(1500);
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "ro-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      { type: "message", id: "ro-retained", message: { role: "user", content: retainedText } },
+      { type: "reset", id: "reset-user-only", reason: "reset", firstKeptEntryId: "ro-retained" },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    expect(snapshot?.totalTokens).toBe(estimateTokensFromChars(estimateStringChars(retainedText)));
+    expect(snapshot?.totalTokensFresh).toBe(true);
+  });
 });
