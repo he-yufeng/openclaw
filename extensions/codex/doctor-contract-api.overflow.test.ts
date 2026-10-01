@@ -1,6 +1,5 @@
 // Codex tests cover doctor binding migration at namespace overflow.
 import fs from "node:fs/promises";
-import { createPluginStateSyncKeyedStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import type { OpenKeyedStoreOptions } from "openclaw/plugin-sdk/runtime-doctor-migrations";
 import { describe, expect, it } from "vitest";
 import {
@@ -14,8 +13,8 @@ import {
   CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
   CODEX_APP_SERVER_BINDING_NAMESPACE,
   createCodexAppServerBindingStore,
-  type StoredCodexAppServerBinding,
 } from "./src/app-server/session-binding.js";
+import { createCodexSqliteTestBindingStateStore } from "./src/app-server/session-binding.sqlite.test-helpers.js";
 import { legacyCodexConversationBindingId } from "./src/conversation-binding-data.js";
 
 describe("codex doctor binding migration overflow", () => {
@@ -70,15 +69,12 @@ describe("codex doctor binding migration overflow", () => {
       name: "capacity-recovery",
       threadId: "thread-old",
     });
-    const syncState = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
-      "codex",
-      {
-        namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
-        maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
-        overflowPolicy: "reject-new",
-        env: fixture.env,
-      },
-    );
+    const syncState = createCodexSqliteTestBindingStateStore({
+      namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
+      maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
+      overflowPolicy: "reject-new",
+      env: fixture.env,
+    });
     const facade = createCodexAppServerBindingStore(syncState);
     const legacy = {
       kind: "conversation" as const,

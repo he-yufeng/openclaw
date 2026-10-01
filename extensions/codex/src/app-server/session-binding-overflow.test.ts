@@ -4,7 +4,6 @@ import os from "node:os";
 import path from "node:path";
 import {
   createPluginStateKeyedStoreForTests,
-  createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,6 +17,7 @@ import {
   createCodexAppServerBindingStore,
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
+import { createCodexSqliteTestBindingStateStore } from "./session-binding.sqlite.test-helpers.js";
 
 function createRecoveringBindingStore(
   namespace: string,
@@ -31,10 +31,7 @@ function createRecoveringBindingStore(
     overflowPolicy: "reject-new" as const,
     env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
   };
-  const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
-    "codex",
-    options,
-  );
+  const state = createCodexSqliteTestBindingStateStore(options);
   // Same composition the production lazy binding store installs: sync handle
   // for hot reads, worker-backed handle for recovery listing and deletion.
   const recoveryState = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
@@ -295,7 +292,7 @@ describe("Codex app-server binding overflow recovery", () => {
   it("fails closed when the host has no ranged listing", async () => {
     const stateDir = createOverflowStateDir();
     try {
-      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+      const state = createCodexSqliteTestBindingStateStore({
         namespace: "app-server-thread-bindings-overflow-norange-test",
         maxEntries: 2,
         overflowPolicy: "reject-new",
@@ -342,10 +339,7 @@ describe("Codex app-server binding overflow recovery", () => {
         overflowPolicy: "reject-new" as const,
         env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
       };
-      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
-        "codex",
-        options,
-      );
+      const state = createCodexSqliteTestBindingStateStore(options);
       const recoveryState = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
         "codex",
         options,
@@ -388,10 +382,7 @@ describe("Codex app-server binding overflow recovery", () => {
         overflowPolicy: "reject-new" as const,
         env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
       };
-      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
-        "codex",
-        options,
-      );
+      const state = createCodexSqliteTestBindingStateStore(options);
       const baseRecovery = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
         "codex",
         options,
@@ -454,10 +445,7 @@ describe("Codex app-server binding overflow recovery", () => {
         overflowPolicy: "reject-new" as const,
         env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
       };
-      const state = createPluginStateSyncKeyedStoreForTests<StoredCodexAppServerBinding>(
-        "codex",
-        options,
-      );
+      const state = createCodexSqliteTestBindingStateStore(options);
       const baseRecovery = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
         "codex",
         options,
