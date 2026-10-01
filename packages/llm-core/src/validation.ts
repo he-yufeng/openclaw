@@ -33,6 +33,19 @@ function hasSchemaScope(schema: JsonSchemaObject): boolean {
   return ["$id", "id", "$defs", "definitions"].some((key) => key in schema);
 }
 
+// URI-fragment $refs percent-encode definition names (ts-json-schema-generator
+// does so by default): decode before the pointer unescape so both spellings hit
+// the same definition. Malformed escapes keep the raw segment and simply miss.
+function decodeJsonPointerSegment(segment: string): string {
+  let decoded = segment;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    decoded = segment;
+  }
+  return decoded.replaceAll("~1", "/").replaceAll("~0", "~");
+}
+
 function resolveRootSchemaRef(
   schema: JsonSchemaObject,
   root: JsonSchemaObject | undefined,
@@ -46,7 +59,7 @@ function resolveRootSchemaRef(
     return undefined;
   }
   const table = match[1] === "$defs" ? root.$defs : root.definitions;
-  const name = encodedName.replaceAll("~1", "/").replaceAll("~0", "~");
+  const name = decodeJsonPointerSegment(encodedName);
   const target = table && Object.hasOwn(table, name) ? table[name] : undefined;
   // Scoped documents stay on their existing path; never reinterpret their refs at the tool root.
   return isJsonSchemaObject(target) && !hasSchemaScope(target) ? target : undefined;

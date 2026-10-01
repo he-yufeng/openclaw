@@ -59,8 +59,17 @@ function extendSchemaDefs(
   return next;
 }
 
-function decodeJsonPointerSegment(segment: string): string {
-  return segment.replaceAll("~1", "/").replaceAll("~0", "~");
+// URI-fragment $refs percent-encode definition names (ts-json-schema-generator
+// does so by default): decode before the pointer unescape so both spellings hit
+// the same definition. Malformed escapes keep the raw segment and simply miss.
+export function decodeJsonPointerSegment(segment: string): string {
+  let decoded = segment;
+  try {
+    decoded = decodeURIComponent(segment);
+  } catch {
+    decoded = segment;
+  }
+  return decoded.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function resolveJsonPointerPath(value: unknown, segments: string[]): unknown {

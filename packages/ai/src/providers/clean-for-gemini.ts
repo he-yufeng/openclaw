@@ -1,6 +1,7 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import type { TSchema } from "typebox";
 import { evaluateSchemaWalk, type SchemaWalk } from "./schema-walk.js";
+import { decodeJsonPointerSegment } from "./tool-schema-refs.js";
 
 // Keywords that Cloud Code Assist API rejects (not compliant with their JSON Schema subset)
 export const GEMINI_UNSUPPORTED_SCHEMA_KEYWORDS = new Set([
@@ -162,10 +163,6 @@ function extendSchemaDefs(
     }
   }
   return next;
-}
-
-function decodeJsonPointerSegment(segment: string): string {
-  return segment.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function tryResolveLocalRef(ref: string, defs: SchemaDefs | undefined): unknown {

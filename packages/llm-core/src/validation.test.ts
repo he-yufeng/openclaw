@@ -244,6 +244,19 @@ describe("validateToolArguments — root references", () => {
     }
   });
 
+  it("resolves percent-encoded references to the same definition", () => {
+    const make = (ref: string) => ({
+      type: "object",
+      properties: { value: { $ref: ref } },
+      definitions: {
+        "Partial<Filter>": { type: "object", properties: { limit: { type: "number" } } },
+      },
+    });
+    for (const ref of ["#/definitions/Partial<Filter>", "#/definitions/Partial%3CFilter%3E"]) {
+      expect(validate(make(ref), { limit: "5" })).toEqual({ value: { limit: 5 } });
+    }
+  });
+
   it("preserves TypeBox refinements when choosing a coercion alternative", () => {
     const value = Type.Union([Type.Refine(Type.Number(), (number) => number >= 10), Type.String()]);
     for (const options of [{}, { $defs: { unused: { type: "string" } } }]) {

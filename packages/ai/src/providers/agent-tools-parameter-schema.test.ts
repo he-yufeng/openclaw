@@ -123,6 +123,25 @@ describe("compact OpenAI tool references", () => {
     },
   );
 
+  it("inlines percent-encoded definition references for Gemini like their plain spelling", () => {
+    const make = (ref: string) => ({
+      type: "object",
+      properties: { filter: { $ref: ref } },
+      required: ["filter"],
+      definitions: {
+        "Partial<Filter>": { type: "object", properties: { limit: { type: "number" } } },
+      },
+    });
+    const plain = normalizeToolParameterSchema(make("#/definitions/Partial<Filter>"), {
+      modelProvider: "google",
+    });
+    const encoded = normalizeToolParameterSchema(make("#/definitions/Partial%3CFilter%3E"), {
+      modelProvider: "google",
+    });
+    expect(encoded).toEqual(plain);
+    expect(JSON.stringify(encoded)).not.toContain('"$ref"');
+  });
+
   it("drops unused definitions even when they contain references", () => {
     const schema = {
       type: "object",
