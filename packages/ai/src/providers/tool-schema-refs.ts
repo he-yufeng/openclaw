@@ -60,16 +60,19 @@ function extendSchemaDefs(
 }
 
 // URI-fragment $refs percent-encode definition names (ts-json-schema-generator
-// does so by default): decode before the pointer unescape so both spellings hit
-// the same definition. Malformed escapes keep the raw segment and simply miss.
-export function decodeJsonPointerSegment(segment: string): string {
-  let decoded = segment;
+// does so by default). Decode the whole fragment once before the pointer is
+// split, so an encoded slash still separates segments like TypeBox resolves it.
+// Malformed escapes keep the raw ref and simply miss.
+export function decodeLocalRefFragment(ref: string): string {
   try {
-    decoded = decodeURIComponent(segment);
+    return decodeURIComponent(ref);
   } catch {
-    decoded = segment;
+    return ref;
   }
-  return decoded.replaceAll("~1", "/").replaceAll("~0", "~");
+}
+
+export function unescapeJsonPointerSegment(segment: string): string {
+  return segment.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function resolveJsonPointerPath(value: unknown, segments: string[]): unknown {
@@ -78,7 +81,7 @@ function resolveJsonPointerPath(value: unknown, segments: string[]): unknown {
     if (!current || typeof current !== "object") {
       return undefined;
     }
-    const key = decodeJsonPointerSegment(segment);
+    const key = unescapeJsonPointerSegment(segment);
     if (Array.isArray(current)) {
       const index = /^(?:0|[1-9]\d*)$/.test(key) ? Number(key) : -1;
       if (index < 0 || index >= current.length) {
@@ -99,7 +102,7 @@ function resolveLocalJsonPointer(rootDocument: unknown, ref: string): unknown {
   if (!ref.startsWith("#/")) {
     return undefined;
   }
-  return resolveJsonPointerPath(rootDocument, ref.slice(2).split("/"));
+  return resolveJsonPointerPath(rootDocument, decodeLocalRefFragment(ref).slice(2).split("/"));
 }
 
 export const SCHEMA_MAP_KEYS = new Set([
@@ -130,10 +133,10 @@ function tryResolveLocalRef(
   defs: SchemaDefs | undefined,
   rootDocument: unknown,
 ): unknown {
-  const match = ref.match(/^#\/(\$defs|definitions)\/([^/]+)(?:\/(.*))?$/);
+  const match = decodeLocalRefFragment(ref).match(/^#\/(\$defs|definitions)\/([^/]+)(?:\/(.*))?$/);
   if (match && defs) {
     const namespace = match[1] === "$defs" ? defs.$defs : defs.definitions;
-    const name = decodeJsonPointerSegment(match[2] ?? "");
+    const name = unescapeJsonPointerSegment(match[2] ?? "");
     const resolved = name ? namespace.get(name) : undefined;
     if (resolved !== undefined) {
       const remainingPath = match[3] ? match[3].split("/") : [];

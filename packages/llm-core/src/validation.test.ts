@@ -257,6 +257,18 @@ describe("validateToolArguments — root references", () => {
     }
   });
 
+  it("resolves an encoded slash to the nested target TypeBox validates", () => {
+    const parameters = {
+      type: "object",
+      properties: { value: { $ref: "#/definitions/a%2Fb" } },
+      definitions: {
+        a: { b: { type: "string", pattern: "^0" } },
+        "a/b": { type: "number" },
+      },
+    };
+    expect(validate(parameters, "05")).toEqual({ value: "05" });
+  });
+
   it("preserves TypeBox refinements when choosing a coercion alternative", () => {
     const value = Type.Union([Type.Refine(Type.Number(), (number) => number >= 10), Type.String()]);
     for (const options of [{}, { $defs: { unused: { type: "string" } } }]) {

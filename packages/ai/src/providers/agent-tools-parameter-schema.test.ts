@@ -142,6 +142,24 @@ describe("compact OpenAI tool references", () => {
     expect(JSON.stringify(encoded)).not.toContain('"$ref"');
   });
 
+  it("inlines an encoded slash as a nested path, not a literal-slash definition", () => {
+    const normalized = normalizeToolParameterSchema(
+      {
+        type: "object",
+        properties: { value: { $ref: "#/definitions/a%2Fb" } },
+        definitions: {
+          a: { b: { type: "string" } },
+          "a/b": { type: "number" },
+        },
+      },
+      { modelProvider: "google" },
+    );
+    expect(normalized).toEqual({
+      type: "object",
+      properties: { value: { type: "string" } },
+    });
+  });
+
   it("drops unused definitions even when they contain references", () => {
     const schema = {
       type: "object",

@@ -34,16 +34,15 @@ function hasSchemaScope(schema: JsonSchemaObject): boolean {
 }
 
 // URI-fragment $refs percent-encode definition names (ts-json-schema-generator
-// does so by default): decode before the pointer unescape so both spellings hit
-// the same definition. Malformed escapes keep the raw segment and simply miss.
-function decodeJsonPointerSegment(segment: string): string {
-  let decoded = segment;
+// does so by default). Decode the whole fragment once before the pointer is
+// split, so an encoded slash still separates segments like TypeBox resolves it.
+// Malformed escapes keep the raw ref and simply miss.
+function decodeLocalRefFragment(ref: string): string {
   try {
-    decoded = decodeURIComponent(segment);
+    return decodeURIComponent(ref);
   } catch {
-    decoded = segment;
+    return ref;
   }
-  return decoded.replaceAll("~1", "/").replaceAll("~0", "~");
 }
 
 function resolveRootSchemaRef(
@@ -52,14 +51,14 @@ function resolveRootSchemaRef(
 ): JsonSchemaObject | undefined {
   const match =
     typeof schema.$ref === "string"
-      ? schema.$ref.match(/^#\/(\$defs|definitions)\/([^/]+)$/)
+      ? decodeLocalRefFragment(schema.$ref).match(/^#\/(\$defs|definitions)\/([^/]+)$/)
       : null;
-  const encodedName = match?.[2];
-  if (!root || !match || encodedName === undefined || hasSchemaScope(schema)) {
+  const nameToken = match?.[2];
+  if (!root || !match || nameToken === undefined || hasSchemaScope(schema)) {
     return undefined;
   }
   const table = match[1] === "$defs" ? root.$defs : root.definitions;
-  const name = decodeJsonPointerSegment(encodedName);
+  const name = nameToken.replaceAll("~1", "/").replaceAll("~0", "~");
   const target = table && Object.hasOwn(table, name) ? table[name] : undefined;
   // Scoped documents stay on their existing path; never reinterpret their refs at the tool root.
   return isJsonSchemaObject(target) && !hasSchemaScope(target) ? target : undefined;
