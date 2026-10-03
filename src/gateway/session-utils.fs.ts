@@ -73,6 +73,16 @@ export async function readLatestSessionUsageFromTranscriptFileAsync(
         }
         const message = asOptionalRecord(record?.message);
         if (!record || !message) {
+          // Entries without a message payload (custom carriers, model
+          // snapshots, navigation) add no countable text, but a boundary can
+          // name one as firstKeptEntryId. Keep the id addressable as a
+          // zero-char anchor so the cut resolves and the retained tail behind
+          // it survives. Forward only the type: structural provider/model
+          // fields must stay out of usage extraction.
+          const anchorId = record && typeof record.id === "string" ? record.id : undefined;
+          if (anchorId !== undefined) {
+            usageAccumulator.add({ type: record?.type }, anchorId);
+          }
           continue;
         }
         const usage = asOptionalRecord(message.usage) ?? asOptionalRecord(record.usage);

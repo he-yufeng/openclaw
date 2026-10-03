@@ -339,4 +339,57 @@ describe("readLatestSessionUsageFromTranscript estimate window", () => {
     expect(snapshot?.totalTokens).toBe(estimateTokensFromChars(estimateStringChars(retainedText)));
     expect(snapshot?.totalTokensFresh).toBe(true);
   });
+
+  test("a compaction naming a structural entry keeps the retained tail behind it (#150579)", async () => {
+    const sessionId = "usage-compaction-structural-anchor";
+    const archivedText = "x".repeat(4000);
+    const retainedText = "u".repeat(2000);
+    const summaryText = "s".repeat(500);
+    const tailText = "short live tail";
+    writeTranscript(tmpDir, sessionId, [
+      {
+        type: "message",
+        id: "m-archived",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: archivedText,
+        },
+      },
+      // A real overflow compaction names the bootstrap custom event ahead of
+      // the retained user message; the entry has no message payload at all.
+      { type: "custom", id: "bootstrap-1", customType: "bootstrap", content: "session init" },
+      { type: "message", id: "m-retained", message: { role: "user", content: retainedText } },
+      {
+        type: "compaction",
+        id: "c-1",
+        summary: summaryText,
+        firstKeptEntryId: "bootstrap-1",
+        tokensBefore: 1000,
+      },
+      {
+        type: "message",
+        id: "m-tail",
+        message: {
+          role: "assistant",
+          provider: "anthropic",
+          model: "claude-sonnet-4-6",
+          content: tailText,
+        },
+      },
+    ]);
+
+    const snapshot = await readLatestSessionUsageFromTranscriptFileAsync(sessionId, storePath);
+    // The anchor carries no countable text, but the cut resolves at it, so
+    // the retained user message survives along with the summary and tail.
+    expect(snapshot?.totalTokens).toBe(
+      estimateTokensFromChars(
+        estimateStringChars(retainedText) +
+          estimateStringChars(summaryText) +
+          estimateStringChars(tailText),
+      ),
+    );
+    expect(snapshot?.totalTokensFresh).toBe(true);
+  });
 });
