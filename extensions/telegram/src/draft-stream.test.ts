@@ -370,6 +370,65 @@ describe("createTelegramDraftStream", () => {
     },
   );
 
+  it("rotateToNewMessageDeferringDelete retains the superseded preview until a replacement lands", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = createMockDraftApi();
+      api.sendMessage
+        .mockResolvedValueOnce({ message_id: 17 })
+        .mockResolvedValueOnce({ message_id: 42 });
+      const stream = createDraftStream(api);
+
+      stream.update("Old preview");
+      await stream.flush();
+      stream.rotateToNewMessageDeferringDelete();
+
+      // No replacement was ever sent: the superseded preview is the chat's
+      // last copy of the text and must survive every timer.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.deleteMessage).not.toHaveBeenCalled();
+
+      // Once the replacement is confirmed visible the superseded preview is
+      // cleaned up deferred, so the viewport stays anchored.
+      stream.update("Replacement preview");
+      await stream.flush();
+      expect(api.deleteMessage).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(api.deleteMessage).toHaveBeenCalledWith(123, 17);
+      expect(api.deleteMessage).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rotateToNewMessageDeferringDelete retains the superseded preview when the replacement send fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const api = createMockDraftApi();
+      api.sendMessage
+        .mockResolvedValueOnce({ message_id: 17 })
+        .mockRejectedValueOnce(new Error("send failed"));
+      const stream = createDraftStream(api);
+
+      stream.update("Old preview");
+      await stream.flush();
+      stream.rotateToNewMessageDeferringDelete();
+
+      stream.update("Replacement preview");
+      // The send failure is absorbed inside the stream loop; the point is
+      // that no replacement ever became visible.
+      await stream.flush();
+      expect(stream.messageId()).toBeUndefined();
+
+      // The replacement never became visible, so the old preview stays as the
+      // fallback instead of leaving the chat with nothing.
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(api.deleteMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["first", "batched"] as const)(
     "keeps a %s reply target on a reposition-superseded in-flight send until deletion",
     async (replyToMode) => {

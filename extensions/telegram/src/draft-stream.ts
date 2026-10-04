@@ -211,6 +211,11 @@ export function createTelegramDraftStream(params: {
   // ephemeral preview to delete, NOT a durable content chunk to retain — that
   // distinguishes a reposition from forceNewMessage's continuation-chunk race.
   const repositionedSendGenerations = new Set<number>();
+  // A superseded preview awaiting its replacement. Deleting on a blind timer
+  // leaves the chat with nothing when the replacement send fails or never
+  // happens, so the delete is held until a newer message is confirmed visible;
+  // until then the old preview stays as the visible fallback.
+  let pendingSupersededPreview: { messageId: number; visibleSince: number | undefined } | undefined;
   // Unfinished previews are superseded by the next update: under flood pressure the
   // account limiter skips them so final replies keep Telegram's budget. Only the
   // Bot API calls are marked; cleanup and observation keep normal priority.
@@ -389,8 +394,14 @@ export function createTelegramDraftStream(params: {
       const visibleSinceMs = Date.now();
       if (repositionedSendGenerations.delete(sendGeneration)) {
         // Repositioned late sends are stale previews; delete instead of retaining
-        // them as durable continuation pages.
-        scheduleDetachedDelete(normalizedMessageId, visibleSinceMs, REPOSITION_DELETE_DELAY_MS);
+        // them as durable continuation pages. They are still a visible message,
+        // so any older superseded preview can go now, while this one is held
+        // until its own replacement lands.
+        flushSupersededPreviewDelete();
+        pendingSupersededPreview = {
+          messageId: normalizedMessageId,
+          visibleSince: visibleSinceMs,
+        };
         return true;
       }
       params.onRetainedPage?.({
@@ -398,6 +409,7 @@ export function createTelegramDraftStream(params: {
         textSnapshot: sent.snapshot.text,
         visibleSinceMs,
       });
+      flushSupersededPreviewDelete();
       scheduleProviderMessageObservation(sent.message);
       return true;
     }
@@ -406,6 +418,7 @@ export function createTelegramDraftStream(params: {
     streamMessageSnapshot = sent.snapshot;
     streamProviderMessage = sent.message;
     streamVisibleSinceMs = visibleSinceMs;
+    flushSupersededPreviewDelete();
     return true;
   };
   const sendOrEditPlannedPage = async (
@@ -815,6 +828,16 @@ export function createTelegramDraftStream(params: {
   };
 
   const REPOSITION_DELETE_DELAY_MS = 1_500;
+  // Release the held superseded preview once a newer message is confirmed
+  // visible. The delay floor still applies so the viewport stays anchored.
+  const flushSupersededPreviewDelete = (): void => {
+    const pending = pendingSupersededPreview;
+    if (!pending) {
+      return;
+    }
+    pendingSupersededPreview = undefined;
+    scheduleDetachedDelete(pending.messageId, pending.visibleSince, REPOSITION_DELETE_DELAY_MS);
+  };
   const rotateToNewMessageDeferringDelete = (): void => {
     const supersededMessageId = streamMessageId;
     const supersededVisibleSince = streamVisibleSinceMs;
@@ -828,11 +851,13 @@ export function createTelegramDraftStream(params: {
     // Rewind WITHOUT deleting; the old id is captured above.
     resetStreamToNewMessage();
     if (typeof supersededMessageId === "number" && Number.isFinite(supersededMessageId)) {
-      scheduleDetachedDelete(
-        supersededMessageId,
-        supersededVisibleSince,
-        REPOSITION_DELETE_DELAY_MS,
-      );
+      // Hold the delete until the replacement is confirmed visible. A blind
+      // timer can fire after a failed or never-attempted resend, deleting the
+      // chat's last copy of the text.
+      pendingSupersededPreview = {
+        messageId: supersededMessageId,
+        visibleSince: supersededVisibleSince,
+      };
     }
   };
 
