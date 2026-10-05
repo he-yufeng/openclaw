@@ -1,12 +1,9 @@
 import path from "node:path";
 import { expect, it, vi } from "vitest";
 import { tempDir } from "./run-attempt-test-harness.js";
-import {
-  buildThreadResumeParams,
-  startOrResumeThread as startOrResumeThreadImpl,
-} from "./thread-lifecycle.js";
-
-type LifecycleInput = Omit<Parameters<typeof startOrResumeThreadImpl>[0], "bindingStore">;
+import type { startOrResumeThread as startOrResumeThreadImpl } from "./thread-lifecycle-run.js";
+import type { CodexAttemptThreadInput as LifecycleInput } from "./thread-lifecycle.test-fixtures.js";
+import { buildThreadResumeParams } from "./thread-requests.js";
 
 export function registerRequiredRootThreadPolicyTests({
   createParams,

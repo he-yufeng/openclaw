@@ -18,7 +18,6 @@ import { CodexAppServerClient, CodexAppServerRpcError } from "./client.js";
 import { createFakeCodexAppServerClient } from "./codex-app-server.test-fixtures.js";
 import { acquireCodexNativeConfigFence } from "./native-config-fence.js";
 import { resolveCodexNativeSkillIsolation } from "./native-skill-isolation.js";
-import type { PluginAppPolicyContext } from "./plugin-thread-config.js";
 import type {
   CodexDynamicToolFunctionSpec,
   JsonObject,
@@ -32,6 +31,7 @@ import {
   tempDir,
   threadStartResult,
 } from "./run-attempt-test-harness.js";
+import type { PluginAppPolicyContext } from "./session-binding-record-codec.js";
 import {
   createCodexTestBindingStore,
   readCodexAppServerBinding,
@@ -51,16 +51,19 @@ import { createClientHarness } from "./test-support.js";
 import { fingerprintEnvironmentSelection } from "./thread-fingerprints.js";
 import { registerThreadPolicyRefreshTests } from "./thread-lifecycle-policy-refresh.test-support.js";
 import { registerRequiredRootThreadPolicyTests } from "./thread-lifecycle-rooted.test-support.js";
+import { startOrResumeThread as startOrResumeThreadImpl } from "./thread-lifecycle-run.js";
 import {
-  buildThreadResumeParams,
-  startOrResumeThread as startOrResumeThreadImpl,
-} from "./thread-lifecycle.js";
-import { createLeasedCodexLifecycleHarness } from "./thread-lifecycle.test-fixtures.js";
+  createLeasedCodexLifecycleHarness,
+  startOrResumeAttemptThread,
+  twoStartsThenResumeMethods,
+  type CodexAttemptThreadInput as LifecycleInput,
+} from "./thread-lifecycle.test-fixtures.js";
 import {
   releaseCodexAppServerBindingSubscription,
   withCodexAppServerThreadMutation,
 } from "./thread-ownership.js";
 import { CodexIncognitoPolicyChangeError } from "./thread-policy.js";
+import { buildThreadResumeParams } from "./thread-requests.js";
 
 function createLifecycleRequest(
   respond: (method: string, requestParams?: unknown) => Promise<unknown>,
@@ -108,21 +111,6 @@ const START_THEN_RESUME_METHODS = [
   ...COLD_RESUME_METHODS,
 ];
 
-function twoStartsThenResumeMethods(): string[] {
-  return [
-    ...PREFLIGHT_METHODS,
-    "thread/start",
-    "thread/unsubscribe",
-    ...PREFLIGHT_METHODS,
-    "thread/start",
-    "thread/unsubscribe",
-    ...PREFLIGHT_METHODS,
-    "thread/read",
-    "thread/resume",
-    "thread/inject_items",
-  ];
-}
-
 function createSequentialLifecycleHarness(
   resume: (requestParams?: unknown) => ReturnType<typeof threadStartResult>,
   effectiveConfig: JsonObject = {},
@@ -150,20 +138,16 @@ function createSequentialLifecycleHarness(
   });
 }
 
-type LifecycleInput = Omit<Parameters<typeof startOrResumeThreadImpl>[0], "bindingStore">;
-
 function startOrResumeThread(input: Pick<LifecycleInput, "client"> & Partial<LifecycleInput>) {
   const cwd = input.cwd ?? input.params?.workspaceDir ?? path.join(tempDir, "workspace");
   const params = input.params ?? createParams(path.join(tempDir, "session.jsonl"), cwd);
-  registerCodexTestSessionIdentity(params.sessionFile, params.sessionId, params.sessionKey);
-  return startOrResumeThreadImpl({
+  return startOrResumeAttemptThread({
     signal: new AbortController().signal,
     dynamicTools: [],
     appServer: createThreadLifecycleAppServerOptions(),
     ...input,
     params,
     cwd,
-    bindingStore: testCodexAppServerBindingStore,
   });
 }
 
@@ -205,7 +189,6 @@ function createThreadLifecycleAppServerOptions(): LifecycleInput["appServer"] {
     codeModeOnly: false,
     loopDetectionPreToolUseRelay: true,
     connectionClass: "local-loopback",
-    remoteAppsSubstrate: "preconfigured",
   };
 }
 
@@ -1679,13 +1662,7 @@ describe("Codex app-server thread lifecycle bindings", () => {
       }
       throw new Error(`unexpected method: ${method}`);
     });
-    const client = {
-      getInstanceId: () => "client-warm-conflict",
-      request,
-      addNotificationHandler: () => () => undefined,
-      addRequestHandler: () => () => undefined,
-      addCloseHandler: () => () => undefined,
-    } as never;
+    const { client } = createFakeCodexAppServerClient(request);
     ensureCodexAppServerClientRuntime(client, { agentDir: workspaceDir });
     const common = {
       client,
@@ -1715,6 +1692,10 @@ describe("Codex app-server thread lifecycle bindings", () => {
       expect.anything(),
       expect.objectContaining({ kind: "patch", threadId: "thread-warm-conflict" }),
       expect.any(Function),
+      expect.objectContaining({
+        assertCurrent: expect.any(Function),
+        withCurrent: expect.any(Function),
+      }),
     );
     expect(request.mock.calls.map(([method]) => method)).toEqual([
       ...PREFLIGHT_METHODS,
@@ -2869,12 +2850,10 @@ describe("Codex app-server thread lifecycle bindings", () => {
           return await mutate(...args);
         });
       }
-      let resolveStart: ((value: ReturnType<typeof threadStartResult>) => void) | undefined;
+      const startResponse = createDeferred<ReturnType<typeof threadStartResult>>();
       const request = createLifecycleRequest(async (method: string, _requestParams?: unknown) => {
         if (method === "thread/start") {
-          return await new Promise<ReturnType<typeof threadStartResult>>((resolve) => {
-            resolveStart = resolve;
-          });
+          return await startResponse.promise;
         }
         if (method === "thread/delete") {
           return {};
@@ -2890,12 +2869,13 @@ describe("Codex app-server thread lifecycle bindings", () => {
         expect(request).toHaveBeenCalledWith("thread/start", expect.any(Object), {
           signal: abortController.signal,
           assertCurrent: expect.any(Function),
+          withCurrent: expect.any(Function),
         }),
       );
       if (phase === "thread-start") {
         abortController.abort("test_abort");
       }
-      resolveStart?.(threadStartResult("thread-after-abort"));
+      startResponse.resolve(threadStartResult("thread-after-abort"));
 
       await expect(run).rejects.toThrow("test_abort");
       await expect(readCodexAppServerBinding(sessionFile)).resolves.toBeUndefined();
@@ -3507,7 +3487,9 @@ describe("Codex app-server thread lifecycle bindings", () => {
     expect(restrictedBinding).not.toHaveProperty("liveThreadConfigFingerprint");
     expect(savedAfterRestriction?.threadId).toBe("thread-1");
     expect(resumedBinding.threadId).toBe("thread-1");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(twoStartsThenResumeMethods());
+    expect(request.mock.calls.map(([method]) => method)).toEqual(
+      twoStartsThenResumeMethods(PREFLIGHT_METHODS),
+    );
     expect(request.mock.calls.find(([method]) => method === "thread/start")?.[1]).toMatchObject({
       config: { web_search: "cached" },
     });
@@ -3616,7 +3598,9 @@ describe("Codex app-server thread lifecycle bindings", () => {
     expect(transientBinding).not.toHaveProperty("liveThreadConfigFingerprint");
     expect(savedAfterUnknownSupport?.threadId).toBe("thread-1");
     expect(resumedBinding.threadId).toBe("thread-1");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(twoStartsThenResumeMethods());
+    expect(request.mock.calls.map(([method]) => method)).toEqual(
+      twoStartsThenResumeMethods(PREFLIGHT_METHODS),
+    );
     expect(request.mock.calls.find(([method]) => method === "thread/start")?.[1]).toMatchObject({
       config: { web_search: "cached" },
     });
@@ -3682,7 +3666,9 @@ describe("Codex app-server thread lifecycle bindings", () => {
     expect(restrictedBinding.threadId).toBe("thread-2");
     expect(resumedRestrictedBinding.threadId).toBe("thread-2");
     expect((await readCodexAppServerBinding(sessionFile))?.threadId).toBe("thread-2");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(twoStartsThenResumeMethods());
+    expect(request.mock.calls.map(([method]) => method)).toEqual(
+      twoStartsThenResumeMethods(PREFLIGHT_METHODS),
+    );
   });
 
   it("persists config-denied search when runtime toolsAllow also excludes web_search", async () => {
@@ -3847,7 +3833,9 @@ describe("Codex app-server thread lifecycle bindings", () => {
     expect(restrictedBinding.threadId).toBe("thread-2");
     expect(savedAfterRestriction?.threadId).toBe("thread-1");
     expect(resumedBinding.threadId).toBe("thread-1");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(twoStartsThenResumeMethods());
+    expect(request.mock.calls.map(([method]) => method)).toEqual(
+      twoStartsThenResumeMethods(PREFLIGHT_METHODS),
+    );
     expect(
       request.mock.calls.filter(
         ([method]) => method === "thread/start" || method === "thread/resume",
@@ -3990,7 +3978,9 @@ describe("Codex app-server thread lifecycle bindings", () => {
     expect(binding?.dynamicToolsFingerprint).toBe(fingerprint);
     expect(binding?.dynamicToolsContainDeferred).toBe(true);
     expect(binding?.threadId).toBe("thread-1");
-    expect(request.mock.calls.map(([method]) => method)).toEqual(twoStartsThenResumeMethods());
+    expect(request.mock.calls.map(([method]) => method)).toEqual(
+      twoStartsThenResumeMethods(PREFLIGHT_METHODS),
+    );
   });
 
   it("keeps the native binding isolated from a restricted replacement-tool turn", async () => {
@@ -4595,7 +4585,6 @@ describe("Codex app-server thread lifecycle bindings", () => {
         approvalsReviewer: "user",
         sandbox: "workspace-write",
         connectionClass: "local-loopback",
-        remoteAppsSubstrate: "preconfigured",
       },
     });
 

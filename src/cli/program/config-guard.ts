@@ -1,6 +1,9 @@
 // CLI config readiness guard and invalid-config recovery.
 import { withSuppressedNotes } from "../../../packages/terminal-core/src/note.js";
-import type { StartupConfigPreflightResult } from "../../commands/startup-config-preflight.js";
+import type {
+  StartupConfigPreflightOptions,
+  StartupConfigPreflightResult,
+} from "../../commands/startup-config-preflight.js";
 import { readConfigFileSnapshot, setRuntimeConfigSnapshot } from "../../config/config.js";
 import {
   configFailureHeading,
@@ -94,7 +97,7 @@ export async function ensureConfigReady(
     commandPath?: string[];
     suppressDoctorStdout?: boolean;
     allowInvalid?: boolean;
-    beforeStatePreparation?: (snapshot?: ConfigFileSnapshot) => Promise<boolean>;
+    beforeStatePreparation?: StartupConfigPreflightOptions["beforeStatePreparation"];
     measure?: ConfigSnapshotReadMeasure;
     validateConfigOnly?: boolean;
   },
@@ -320,13 +323,10 @@ export async function ensureConfigReady(
           : await getConfigSnapshot(configSnapshotOptions, params.measure);
         if (retrySnapshot.exists && !retrySnapshot.valid) {
           const retryIssues = renderConfigValidationIssueLines(retrySnapshot);
-          const createError = isConfigReadFailure(retrySnapshot)
-            ? createConfigReadError
-            : createInvalidConfigError;
-          throw createError(
-            retrySnapshot.path,
-            retryIssues.join("\n") || "Unknown validation issue.",
-          );
+          const details = retryIssues.join("\n") || "Unknown validation issue.";
+          throw isConfigReadFailure(retrySnapshot)
+            ? createConfigReadError(retrySnapshot, details)
+            : createInvalidConfigError(retrySnapshot.path, details);
         }
         setRuntimeConfigSnapshot(
           retrySnapshot.runtimeConfig ?? retrySnapshot.config,

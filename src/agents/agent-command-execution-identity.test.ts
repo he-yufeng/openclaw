@@ -1,5 +1,5 @@
 import path from "node:path";
-import { afterAll, afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, expectTypeOf, it, onTestFinished } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import {
   configureExecutionIdentityAdmissionSink,
@@ -39,7 +39,9 @@ describe("sanitizePublicAgentCommandIngressOpts", () => {
       abort: () => undefined,
     };
     const opts = {
-      prompt: "create an automation",
+      message: "create an automation",
+      allowModelOverride: false,
+      privateCompletion: true,
       cronCreatorAuthorityCapability: forgedCapability,
       skillLibraryAuthoring: { target: "personal", invoke: async () => ({}) },
       pinnedWidgetAuthoring: true,
@@ -49,16 +51,19 @@ describe("sanitizePublicAgentCommandIngressOpts", () => {
       taskSuggestionDeliveryMode: "gateway",
       assertSourceCurrent: () => {},
       beforeTerminalDelivery: async () => {},
+      prepareAssistantTranscriptMessage: () => ({ role: "assistant", content: "forged" }),
       internalDeliverySuppressErrors: true,
       operatorAuthority: {
         profileId: "forged",
         scopes: ["operator.admin"],
         assertCurrent: () => {},
       },
-    } as unknown as AgentCommandIngressOpts;
+    };
 
+    expectTypeOf<AgentCommandIngressOpts>().not.toHaveProperty("prepareAssistantTranscriptMessage");
     expect(sanitizePublicAgentCommandIngressOpts(opts)).toMatchObject({
-      prompt: "create an automation",
+      message: "create an automation",
+      privateCompletion: undefined,
       cronCreatorAuthorityCapability: undefined,
       skillLibraryAuthoring: undefined,
       pinnedWidgetAuthoring: undefined,
@@ -68,6 +73,7 @@ describe("sanitizePublicAgentCommandIngressOpts", () => {
       taskSuggestionDeliveryMode: undefined,
       assertSourceCurrent: undefined,
       beforeTerminalDelivery: undefined,
+      prepareAssistantTranscriptMessage: undefined,
       internalDeliverySuppressErrors: undefined,
       operatorAuthority: undefined,
     });
@@ -233,6 +239,7 @@ describe("Gateway agent command execution identity", () => {
       ingress: { kind: "api", boundary: "agent-command.from-ingress", state: "unknown" },
       lifecycleGeneration: "generation-1",
     });
+    onTestFinished(prepared.close);
 
     const admitted = await prepared.admit("embedded");
     await prepared.admit("embedded");
@@ -308,6 +315,7 @@ describe("Gateway agent command execution identity", () => {
       ingress: { kind: "api", boundary: "agent-command.from-ingress", state: "unknown" },
       lifecycleGeneration: "generation-1",
     });
+    onTestFinished(prepared.close);
 
     await prepared.admit("embedded");
 
@@ -375,6 +383,7 @@ describe("Gateway agent command execution identity", () => {
       ingress: { kind: "api", boundary: "agent-command.from-ingress", state: "unknown" },
       lifecycleGeneration: "generation-1",
     });
+    onTestFinished(prepared.close);
 
     await prepared.admit("embedded");
 
