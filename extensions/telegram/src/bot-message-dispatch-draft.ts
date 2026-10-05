@@ -142,9 +142,10 @@ export function createDraftState(params: TurnConfig): TelegramDraftStateSlice {
           retireTelegramStreamPreviewAcrossAccounts
         )({
           cfg: params.cfg,
+          originAccountId: params.context.route.accountId,
           chatId: params.context.chatId,
           messageId,
-        }).catch((error) => {
+        }).catch((error: unknown) => {
           draftLogger.warn(
             `telegram stream preview history retirement failed: ${String(error)}`,
             {

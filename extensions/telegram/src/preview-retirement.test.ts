@@ -88,7 +88,12 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       });
     }
 
-    await retireTelegramStreamPreviewAcrossAccounts({ cfg, chatId: groupChatId, messageId: 17 });
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 17,
+    });
 
     for (const accountId of ["default", "secondary"]) {
       const cache = cacheFor(accountId);
@@ -101,7 +106,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
     }
   });
 
-  it("retires one preview from every account's private-chat cache", async () => {
+  it("retires only in the originating account for private chats, whose message ids are account-local", async () => {
     const dmChat = { id: 7, type: "private" as const, first_name: "Ada" };
     for (const accountId of ["default", "secondary"]) {
       const cache = cacheFor(accountId);
@@ -109,13 +114,56 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       await cache.record({ accountId, chatId: 7, msg: message(22, "final", dmChat) });
     }
 
-    await retireTelegramStreamPreviewAcrossAccounts({ cfg, chatId: 7, messageId: 21 });
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: 7,
+      messageId: 21,
+    });
 
+    const origin = cacheFor("default");
+    expect(await origin.get({ accountId: "default", chatId: 7, messageId: "21" })).toBeNull();
+    expect(
+      (await origin.get({ accountId: "default", chatId: 7, messageId: "22" }))?.messageId,
+    ).toBe("22");
+    // Bot B's message 21 is its own account-local record, not bot A's deleted
+    // preview; numeric coordinates must not cross private-chat boundaries.
+    const sibling = cacheFor("secondary");
+    expect(
+      (await sibling.get({ accountId: "secondary", chatId: 7, messageId: "21" }))?.messageId,
+    ).toBe("21");
+    expect(
+      (await sibling.get({ accountId: "secondary", chatId: 7, messageId: "22" }))?.messageId,
+    ).toBe("22");
+  });
+
+  it("keeps basic-group retirement account-local for the same identity reason", async () => {
+    // Basic-group ids are negative without the shared `-100…` supergroup space.
+    const basicGroupChat = { id: -445566, type: "group" as const, title: "Basic" };
     for (const accountId of ["default", "secondary"]) {
       const cache = cacheFor(accountId);
-      expect(await cache.get({ accountId, chatId: 7, messageId: "21" })).toBeNull();
-      expect((await cache.get({ accountId, chatId: 7, messageId: "22" }))?.messageId).toBe("22");
+      await cache.record({
+        accountId,
+        chatId: -445566,
+        msg: message(9, "draft", basicGroupChat),
+        historyEligible: true,
+      });
     }
+
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "secondary",
+      chatId: -445566,
+      messageId: 9,
+    });
+
+    expect(
+      await cacheFor("secondary").get({ accountId: "secondary", chatId: -445566, messageId: "9" }),
+    ).toBeNull();
+    expect(
+      (await cacheFor("default").get({ accountId: "default", chatId: -445566, messageId: "9" }))
+        ?.messageId,
+    ).toBe("9");
   });
 
   it("covers the implicit default account of a single-account config", async () => {
@@ -127,10 +175,101 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       msg: message(31, "🧠 thinking..."),
     });
 
-    await retireTelegramStreamPreviewAcrossAccounts({ cfg, chatId: groupChatId, messageId: 31 });
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 31,
+    });
 
     expect(
       await cache.get({ accountId: "default", chatId: groupChatId, messageId: "31" }),
     ).toBeNull();
+  });
+
+  it("fences a sibling's late observation of an already-retired preview", async () => {
+    const sibling = cacheFor("secondary");
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 41,
+    });
+
+    // The sibling's ingress delivers the preview only after retirement ran.
+    await sibling.record({
+      accountId: "secondary",
+      chatId: groupChatId,
+      msg: message(41, "🧠 thinking..."),
+      historyEligible: true,
+    });
+
+    expect(
+      await sibling.get({ accountId: "secondary", chatId: groupChatId, messageId: "41" }),
+    ).toBeNull();
+    const history = await sibling.readHistory({
+      accountId: "secondary",
+      chatId: groupChatId,
+      limit: 10,
+    });
+    expect(history.messages.map((node) => node.messageId)).toEqual([]);
+  });
+
+  it("fences a replayed observation after the bucket is reopened", async () => {
+    await cacheFor("secondary").record({
+      accountId: "secondary",
+      chatId: groupChatId,
+      msg: message(42, "🧠 thinking..."),
+      historyEligible: true,
+    });
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 42,
+    });
+
+    // Reopen the in-memory bucket over the same state dir; the retirement
+    // marker must survive so a durable-ingress replay cannot reinsert 42.
+    resetTelegramMessageCacheForTest();
+    const reopened = cacheFor("secondary");
+    await reopened.record({
+      accountId: "secondary",
+      chatId: groupChatId,
+      msg: message(42, "🧠 thinking..."),
+      historyEligible: true,
+    });
+
+    expect(
+      await reopened.get({ accountId: "secondary", chatId: groupChatId, messageId: "42" }),
+    ).toBeNull();
+  });
+
+  it("still records the final message that shares the chat but not the preview id", async () => {
+    await cacheFor("secondary").record({
+      accountId: "secondary",
+      chatId: groupChatId,
+      msg: message(51, "🧠 thinking..."),
+      historyEligible: true,
+    });
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 51,
+    });
+
+    const reopened = cacheFor("secondary");
+    await reopened.record({
+      accountId: "secondary",
+      chatId: groupChatId,
+      msg: message(52, "final answer"),
+      historyEligible: true,
+    });
+
+    expect(
+      (await reopened.get({ accountId: "secondary", chatId: groupChatId, messageId: "52" }))
+        ?.messageId,
+    ).toBe("52");
   });
 });
