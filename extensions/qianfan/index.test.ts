@@ -5,8 +5,8 @@ import {
 import { resolveAgentModelPrimaryValue } from "openclaw/plugin-sdk/provider-onboard";
 import { describe, expect, it } from "vitest";
 import qianfanPlugin from "./index.js";
-import manifest from "./openclaw.plugin.json" with { type: "json" };
 import { applyQianfanConfig, QIANFAN_DEFAULT_MODEL_REF } from "./onboard.js";
+import manifest from "./openclaw.plugin.json" with { type: "json" };
 
 function expectRecord<T>(value: T | null | undefined, label: string): NonNullable<T> {
   if (!value) {
