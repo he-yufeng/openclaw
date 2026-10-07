@@ -146,14 +146,11 @@ export function createDraftState(params: TurnConfig): TelegramDraftStateSlice {
           chatId: params.context.chatId,
           messageId,
         }).catch((error: unknown) => {
-          draftLogger.warn(
-            `telegram stream preview history retirement failed: ${String(error)}`,
-            {
-              lane: laneName,
-              chatId: params.context.chatId,
-              threadId: params.context.threadSpec.id,
-            },
-          );
+          draftLogger.warn(`telegram stream preview history retirement failed: ${String(error)}`, {
+            lane: laneName,
+            chatId: params.context.chatId,
+            threadId: params.context.threadSpec.id,
+          });
         });
       },
       log: logVerbose,
