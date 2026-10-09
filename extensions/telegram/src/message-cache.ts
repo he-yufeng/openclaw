@@ -447,10 +447,33 @@ export function createTelegramMessageCache(params?: {
 
   const retiredTombstones = (bucket.retiredTombstones ??= new Map<string, number>());
 
+  // Retirement and recording contend per key: a record that already passed
+  // the fence must not land after a retire observed it, and a late record
+  // must not reinsert what retirement deleted. Chain every writer per key so
+  // the fence check and the write it authorizes run as one step.
+  const keyWriteChains = new Map<string, Promise<void>>();
+  const withKeyWriter = <T>(key: string, write: () => Promise<T>): Promise<T> => {
+    const queued = (keyWriteChains.get(key) ?? Promise.resolve()).then(write, write);
+    const settled = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    keyWriteChains.set(key, settled);
+    void settled.then(() => {
+      if (keyWriteChains.get(key) === settled) {
+        keyWriteChains.delete(key);
+      }
+    });
+    return queued;
+  };
+
   // Fence one cache key against late observations. Runs even when the row is
   // already gone: the sibling may not have recorded the preview yet, and the
   // absent-row case is exactly where the retirement would otherwise be lost.
-  const markRetired = (key: string): void => {
+  // The memory tombstone is visible immediately; the returned promise (when
+  // any) settles once the persisted marker lands, so retirement reported as
+  // done survives a process restart.
+  const markRetired = (key: string): Promise<unknown> | undefined => {
     retiredTombstones.delete(key);
     retiredTombstones.set(key, Date.now());
     while (retiredTombstones.size > RETIRED_TOMBSTONE_MEMORY_MAX) {
@@ -461,11 +484,12 @@ export function createTelegramMessageCache(params?: {
       retiredTombstones.delete(oldest);
     }
     const store = openRetirementStore();
-    if (store) {
-      void store.register(key, { retiredAt: Date.now() }).catch((error: unknown) => {
-        logVerbose(`telegram: failed to persist message retirement marker: ${String(error)}`);
-      });
+    if (!store) {
+      return undefined;
     }
+    return store.register(key, { retiredAt: Date.now() }).catch((error: unknown) => {
+      logVerbose(`telegram: failed to persist message retirement marker: ${String(error)}`);
+    });
   };
 
   const wasRetired = async (key: string): Promise<boolean> => {
@@ -531,25 +555,27 @@ export function createTelegramMessageCache(params?: {
       }
       const store = await openRetainedStore();
       const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId: id });
-      markRetired(key);
-      let observation = await store.observe(key);
-      if (observation.value === undefined) {
-        return false;
-      }
-      for (;;) {
-        const result = await store.compareAndApply(key, observation.comparison, {
-          operation: "delete",
-          action: "delete",
-        });
-        if (result.status !== "conflict") {
-          return true;
-        }
-        observation = result.current;
+      return withKeyWriter(key, async () => {
+        await markRetired(key);
+        let observation = await store.observe(key);
         if (observation.value === undefined) {
-          // A concurrent retire won the race; the message is gone either way.
           return false;
         }
-      }
+        for (;;) {
+          const result = await store.compareAndApply(key, observation.comparison, {
+            operation: "delete",
+            action: "delete",
+          });
+          if (result.status !== "conflict") {
+            return true;
+          }
+          observation = result.current;
+          if (observation.value === undefined) {
+            // A concurrent retire won the race; the message is gone either way.
+            return false;
+          }
+        }
+      });
     }
     const key = telegramMessageCacheKey({
       scopeKey,
@@ -557,16 +583,18 @@ export function createTelegramMessageCache(params?: {
       chatId,
       messageId: String(messageId),
     });
-    markRetired(key);
-    const removed = messages.delete(key);
-    if (removed && bucket.persistentStore?.delete) {
-      try {
-        await bucket.persistentStore.delete(key);
-      } catch (error) {
-        logVerbose(`telegram: failed to retire persisted message cache entry: ${String(error)}`);
+    return withKeyWriter(key, async () => {
+      await markRetired(key);
+      const removed = messages.delete(key);
+      if (removed && bucket.persistentStore?.delete) {
+        try {
+          await bucket.persistentStore.delete(key);
+        } catch (error) {
+          logVerbose(`telegram: failed to retire persisted message cache entry: ${String(error)}`);
+        }
       }
-    }
-    return removed;
+      return removed;
+    });
   };
 
   const readNodes = async (options: {
@@ -690,40 +718,48 @@ export function createTelegramMessageCache(params?: {
         const key = `${keyPrefix}${id}`;
         let cachedNode: TelegramCachedMessageNode | null;
         if (store) {
-          if (await wasRetired(key)) {
-            // Late observation of a retired preview; keep it out of history.
-            if (messageId === currentObservation.node.messageId) {
-              recordedEntry = node;
-            }
-            continue;
-          }
-          cachedNode = await updateRetainedCacheNode({
-            store,
-            key,
-            botUserId,
-            update: (existing, sawExisting) => {
-              // Embedded snapshots must not resurrect a deleted message.
-              if (mode === "partial" && sawExisting && !existing) {
-                return null;
+          // The fence check and the write run as one per-key step: a
+          // retirement that lands mid-record cannot be undone by this write.
+          cachedNode = await withKeyWriter(key, async () => {
+            if (await wasRetired(key)) {
+              // Late observation of a retired preview; keep it out of history.
+              if (messageId === currentObservation.node.messageId) {
+                recordedEntry = node;
               }
-              return existing ? mergeCachedMessageNode(existing, node, mode) : node;
-            },
-          });
-          chatRetention.set(keyPrefix, "retained");
-        } else {
-          if (await wasRetired(key)) {
-            if (messageId === currentObservation.node.messageId) {
-              recordedEntry = node;
+              return null;
             }
-            continue;
-          }
-          chatRetention.set(keyPrefix, "bounded");
-          cachedNode = upsertCachedMessageNode({ messages, key, node, mode });
-          pruneMapToMaxSize(messages, maxMessages);
-          await persistCachedNode({
-            key,
-            node: cachedNode,
-            botUserId,
+            const updated = await updateRetainedCacheNode({
+              store,
+              key,
+              botUserId,
+              update: (existing, sawExisting) => {
+                // Embedded snapshots must not resurrect a deleted message.
+                if (mode === "partial" && sawExisting && !existing) {
+                  return null;
+                }
+                return existing ? mergeCachedMessageNode(existing, node, mode) : node;
+              },
+            });
+            chatRetention.set(keyPrefix, "retained");
+            return updated;
+          });
+        } else {
+          cachedNode = await withKeyWriter(key, async () => {
+            if (await wasRetired(key)) {
+              if (messageId === currentObservation.node.messageId) {
+                recordedEntry = node;
+              }
+              return null;
+            }
+            chatRetention.set(keyPrefix, "bounded");
+            const updated = upsertCachedMessageNode({ messages, key, node, mode });
+            pruneMapToMaxSize(messages, maxMessages);
+            await persistCachedNode({
+              key,
+              node: updated,
+              botUserId,
+            });
+            return updated;
           });
         }
         if (cachedNode && messageId === currentObservation.node.messageId) {

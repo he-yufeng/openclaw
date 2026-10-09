@@ -77,6 +77,7 @@ function get(cache: TelegramMessageCache, messageId: number) {
 describe("Telegram retained message history", () => {
   let state: OpenClawTestState;
   let beforeCompare: ((key: string) => Promise<void>) | undefined;
+  let beforeRegister: ((key: string) => Promise<void>) | undefined;
   let beforeMove: (() => Promise<void>) | undefined;
   let afterMove: (() => Promise<void>) | undefined;
 
@@ -101,6 +102,7 @@ describe("Telegram retained message history", () => {
   beforeEach(async () => {
     state = await createOpenClawTestState({ prefix: "telegram-history-", layout: "state-only" });
     beforeCompare = undefined;
+    beforeRegister = undefined;
     beforeMove = undefined;
     afterMove = undefined;
     const openKeyedStore: TelegramRuntime["state"]["openKeyedStore"] = <T>(
@@ -111,7 +113,15 @@ describe("Telegram retained message history", () => {
         env: state.env,
       });
       if (options.retention !== "retained") {
-        return store;
+        return {
+          ...store,
+          async register(key, value) {
+            const interrupt = beforeRegister;
+            beforeRegister = undefined;
+            await interrupt?.(key);
+            return store.register(key, value);
+          },
+        };
       }
       return {
         ...store,
@@ -553,5 +563,33 @@ describe("Telegram retained message history", () => {
     await record(cache, message(23, { reply_to_message: message(22) }));
     expect(await get(cache, 22)).toBeNull();
     expect((await history(cache)).messages.map((node) => node.messageId)).toEqual(["23"]);
+  });
+
+  it("keeps a preview retired while its own observation was still in flight", async () => {
+    const cache = createTelegramMessageCache({ scope });
+    let retirePromise: Promise<boolean> | undefined;
+    beforeCompare = async () => {
+      // The record already passed the fence and is about to commit; the
+      // retirement queues on the same per-key writer and settles the order.
+      retirePromise = cache.retireMessage({ accountId, chatId, messageId: 60 });
+    };
+    await record(cache, message(60));
+    await retirePromise;
+    expect(await get(cache, 60)).toBeNull();
+    expect((await history(cache)).messages.map((node) => node.messageId)).toEqual([]);
+  });
+
+  it("keeps a bounded-cache preview retired while its observation was in flight", async () => {
+    const cache = createTelegramMessageCache({ scope });
+    const dmChat = { id: 7, type: "private" as const, first_name: "Ada" };
+    const dmMessage = (messageId: number): Message => message(messageId, { chat: dmChat });
+    let retirePromise: Promise<boolean> | undefined;
+    beforeRegister = async () => {
+      retirePromise = cache.retireMessage({ accountId, chatId: 7, messageId: 70 });
+    };
+    // Positive chat id: the bounded map path, no retained CAS involved.
+    await cache.record({ accountId, chatId: 7, msg: dmMessage(70) });
+    await retirePromise;
+    expect(await cache.get({ accountId, chatId: 7, messageId: "70" })).toBeNull();
   });
 });

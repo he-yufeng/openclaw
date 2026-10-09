@@ -93,6 +93,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: groupChatId,
       messageId: 17,
+      chatType: "supergroup",
     });
 
     for (const accountId of ["default", "secondary"]) {
@@ -119,6 +120,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: 7,
       messageId: 21,
+      chatType: "private",
     });
 
     const origin = cacheFor("default");
@@ -155,6 +157,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "secondary",
       chatId: -445566,
       messageId: 9,
+      chatType: "group",
     });
 
     expect(
@@ -164,6 +167,96 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       (await cacheFor("default").get({ accountId: "default", chatId: -445566, messageId: "9" }))
         ?.messageId,
     ).toBe("9");
+  });
+
+  it("keeps basic-group retirement account-local even when the id sits in the -100 space", async () => {
+    // Telegram recycles basic-group ids into the -100… space over time, so
+    // the id prefix cannot prove shared identity; only the chat type can.
+    const basicGroupChat = { id: -100123, type: "group" as const, title: "Recycled" };
+    for (const accountId of ["default", "secondary"]) {
+      const cache = cacheFor(accountId);
+      await cache.record({
+        accountId,
+        chatId: -100123,
+        msg: message(11, "draft", basicGroupChat),
+        historyEligible: true,
+      });
+    }
+
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "secondary",
+      chatId: -100123,
+      messageId: 11,
+      chatType: "group",
+    });
+
+    expect(
+      await cacheFor("secondary").get({ accountId: "secondary", chatId: -100123, messageId: "11" }),
+    ).toBeNull();
+    expect(
+      (await cacheFor("default").get({ accountId: "default", chatId: -100123, messageId: "11" }))
+        ?.messageId,
+    ).toBe("11");
+  });
+
+  it("fans out for a channel post, whose message ids are the channel sequence", async () => {
+    const channelChat = { id: -100998, type: "channel" as const, title: "News" };
+    for (const accountId of ["default", "secondary"]) {
+      const cache = cacheFor(accountId);
+      await cache.record({
+        accountId,
+        chatId: -100998,
+        msg: message(13, "draft", channelChat),
+        historyEligible: true,
+      });
+    }
+
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: -100998,
+      messageId: 13,
+      chatType: "channel",
+    });
+
+    for (const accountId of ["default", "secondary"]) {
+      expect(
+        await cacheFor(accountId).get({ accountId, chatId: -100998, messageId: "13" }),
+      ).toBeNull();
+    }
+  });
+
+  it("stays account-local when the chat type is unknown", async () => {
+    for (const accountId of ["default", "secondary"]) {
+      const cache = cacheFor(accountId);
+      await cache.record({
+        accountId,
+        chatId: groupChatId,
+        msg: message(15, "draft"),
+        historyEligible: true,
+      });
+    }
+
+    await retireTelegramStreamPreviewAcrossAccounts({
+      cfg,
+      originAccountId: "default",
+      chatId: groupChatId,
+      messageId: 15,
+    });
+
+    expect(
+      await cacheFor("default").get({ accountId: "default", chatId: groupChatId, messageId: "15" }),
+    ).toBeNull();
+    expect(
+      (
+        await cacheFor("secondary").get({
+          accountId: "secondary",
+          chatId: groupChatId,
+          messageId: "15",
+        })
+      )?.messageId,
+    ).toBe("15");
   });
 
   it("covers the implicit default account of a single-account config", async () => {
@@ -180,6 +273,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: groupChatId,
       messageId: 31,
+      chatType: "supergroup",
     });
 
     expect(
@@ -194,6 +288,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: groupChatId,
       messageId: 41,
+      chatType: "supergroup",
     });
 
     // The sibling's ingress delivers the preview only after retirement ran.
@@ -227,6 +322,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: groupChatId,
       messageId: 42,
+      chatType: "supergroup",
     });
 
     // Reopen the in-memory bucket over the same state dir; the retirement
@@ -257,6 +353,7 @@ describe("retireTelegramStreamPreviewAcrossAccounts", () => {
       originAccountId: "default",
       chatId: groupChatId,
       messageId: 51,
+      chatType: "supergroup",
     });
 
     const reopened = cacheFor("secondary");

@@ -7,15 +7,16 @@ import { resolveTelegramMessageCacheScope } from "./message-cache-persistence.js
 import { createTelegramMessageCache } from "./message-cache.js";
 
 /**
- * Message ids are only meaningful across accounts in supergroups and channels
- * (`-100…` chat ids), where they come from the channel's own sequence.
- * Private and basic-group ids are account-local: the same numeric coordinates
- * in a sibling's cache can belong to an unrelated conversation, so fan-out
- * there would delete messages Telegram never asked us to touch.
+ * Message ids are only meaningful across accounts in supergroups and
+ * channels, where they come from the channel's own sequence. Private chats
+ * and basic groups use account-local ids: the same numeric coordinates in a
+ * sibling's cache can belong to an unrelated conversation, so fan-out there
+ * would delete messages Telegram never asked us to touch. The Bot API chat
+ * type is the authority for that call; a basic group can carry an id in the
+ * `-100…` supergroup space, so the id prefix alone cannot decide.
  */
-function chatSharesMessageIdentityAcrossAccounts(chatId: string | number): boolean {
-  const id = String(chatId);
-  return id.startsWith("-100") || id.startsWith("@");
+function chatSharesMessageIdentityAcrossAccounts(chatType: string | undefined): boolean {
+  return chatType === "supergroup" || chatType === "channel";
 }
 
 /**
@@ -31,8 +32,9 @@ export async function retireTelegramStreamPreviewAcrossAccounts(params: {
   originAccountId: string;
   chatId: string | number;
   messageId: string | number;
+  chatType?: string;
 }): Promise<void> {
-  const accountIds = chatSharesMessageIdentityAcrossAccounts(params.chatId)
+  const accountIds = chatSharesMessageIdentityAcrossAccounts(params.chatType)
     ? [...new Set([params.originAccountId, ...listTelegramAccountIds(params.cfg)])]
     : [params.originAccountId];
   await Promise.all(

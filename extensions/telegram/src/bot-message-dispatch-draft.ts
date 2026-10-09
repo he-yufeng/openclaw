@@ -145,6 +145,7 @@ export function createDraftState(params: TurnConfig): TelegramDraftStateSlice {
           originAccountId: params.context.route.accountId,
           chatId: params.context.chatId,
           messageId,
+          chatType: params.context.msg.chat.type,
         }).catch((error: unknown) => {
           draftLogger.warn(`telegram stream preview history retirement failed: ${String(error)}`, {
             lane: laneName,
