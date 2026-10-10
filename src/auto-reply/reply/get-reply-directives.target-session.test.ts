@@ -170,6 +170,7 @@ vi.mock("../../agents/thinking-runtime.js", () => ({
 }));
 
 vi.mock("../../routing/session-key.js", () => ({
+  LEGACY_IMPLICIT_AGENT_ID: "main",
   normalizeAgentId: vi.fn((value: string) => value),
 }));
 
