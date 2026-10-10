@@ -441,6 +441,38 @@ describe("reply directive resolution", () => {
     expect(sessionEntry).toEqual(createSessionEntry());
   });
 
+  it("routes an agent-local alias shorthand at the full reply boundary", async () => {
+    const cfg = {
+      commands: { text: true },
+      agents: {
+        entries: {
+          main: {
+            models: {
+              "anthropic/claude-opus-4-6": { alias: "fable" },
+            },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+    const { result, sessionEntry, sessionCtx } = await resolveModelDirective({
+      body: "/fable -s",
+      cfg,
+    });
+
+    expect(result.kind).toBe("continue");
+    if (result.kind !== "continue") {
+      throw new Error(`expected continue result, got ${result.kind}`);
+    }
+    expect(result.result.directives).toMatchObject({
+      hasModelDirective: true,
+      rawModelDirective: "fable",
+      modelScope: "session",
+    });
+    expect(result.result.cleanedBody).toBe("");
+    expect(sessionCtx.Body).toBe("");
+    expect(sessionEntry).toEqual(createSessionEntry());
+  });
+
   it("preserves unauthorized mixed input exactly without exposing model state", async () => {
     const body = "please /model anthropic/claude-opus-4-6@work --runtime codex -s now";
     const agentText = "[wrapped]\nplease /model anthropic/claude-opus-4-6 now";
