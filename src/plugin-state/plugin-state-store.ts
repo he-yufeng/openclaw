@@ -8,6 +8,7 @@ import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js
 import { captureOpenClawStateWorkerContext } from "../state/openclaw-state-worker-context.js";
 import { validatePluginStateComparison } from "./plugin-state-observation.js";
 import { createPluginStateOperation } from "./plugin-state-operation.js";
+import { assertPluginStatePublicationSettled } from "./plugin-state-publication.js";
 import {
   preparePluginStateJournalValue,
   type PluginStateSequencedJournalParams,
@@ -106,6 +107,19 @@ export {
   pluginStateDoctorEntriesInKeyRange,
 } from "./plugin-state-store.sqlite.js";
 
+function createReadAvailabilityAssertion(
+  options: PreparedKeyedStoreOptions,
+  assertCurrent?: () => void,
+) {
+  let context: ReturnType<typeof captureOpenClawStateWorkerContext> | undefined;
+  return () => {
+    assertCurrent?.();
+    context ??= captureOpenClawStateWorkerContext({ env: options.env });
+    (context.assertPublicationCurrent ?? context.admission.assertCurrent)();
+    assertPluginStatePublicationSettled(context.admission.identity.key);
+  };
+}
+
 function createKeyedStoreForPluginId<T>(
   pluginId: string,
   options: OpenAsyncKeyedStoreOptions,
@@ -148,12 +162,15 @@ function createKeyedStoreForPluginId<T>(
         moduleSource,
       );
     },
+    /** @deprecated Use observe and compareAndApply; removal follows a stable deprecation period. */
     update: async (...args) => getLegacyStore().update(...args),
+    /** @deprecated Use observe and compareAndApply; removal follows a stable deprecation period. */
     deleteIf: async (...args) => getLegacyStore().deleteIf(...args),
   };
   return bindPluginStateNativeBindingStore(
     asyncStore,
     prepared,
+    createReadAvailabilityAssertion(prepared, assertActive),
     assertActive,
     undefined,
     moduleSource,
@@ -380,6 +397,7 @@ function createAsyncKeyedStore<T>(
   return bindPluginStateNativeBindingStore(
     store,
     prepared,
+    createReadAvailabilityAssertion(prepared, assertRangeActive),
     assertRangeActive,
     sessionEntryCurrent,
     moduleSource,

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { serialize } from "node:v8";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { sqlPublicationAnchor } from "../../infra/sql-connection.js";
 import {
   readSqliteDatabasePendingScopedWriteToken,
   readSqliteDatabaseScopedWriteToken,
@@ -24,6 +25,7 @@ import type { AgentWorkerOperationContext } from "../../state/openclaw-agent-ope
 import type { SessionEntryReplacementPublication } from "./session-accessor.sqlite-entry-cache.types.js";
 import { captureSessionEntrySnapshot } from "./session-accessor.sqlite-entry-snapshot.js";
 import { projectSessionActorAuthority } from "./session-actor-command.js";
+import { rewriteSessionActorContextMetadata } from "./session-actor-context-metadata.js";
 import type {
   SessionActorOperations,
   SessionActorOutcome,
@@ -40,6 +42,7 @@ import {
   hydrateSessionActorState,
   projectSessionActorHotState,
 } from "./session-actor-hydration.worker.js";
+import { replaceSessionActorParticipants } from "./session-actor-participants.js";
 import {
   applySessionActorPhase,
   SessionActorStaleStateError,
@@ -50,12 +53,11 @@ import {
   readSessionActorTransactionState,
   replaceSessionActorStoredEntry,
   withSessionActorTransactionState,
-  writableSessionActorMap,
 } from "./session-actor-transaction.js";
 import { registerSessionActorTranscriptRewriteOwner } from "./session-actor-transcript-publication.worker.js";
+import { readSessionEntryPatchPredicate } from "./session-entry-patch-guard.js";
 import type { SessionEntryWritePostimages } from "./session-entry-write-postimage.js";
 import type { SessionParticipantRecord } from "./session-membership-facts.types.js";
-import { participantIdentityNamespace } from "./session-participant-identity.js";
 import { readStagedSessionTranscriptAuthority } from "./session-transcript-authority.js";
 import { prepareSessionTurnPredicates } from "./session-turn-predicate.js";
 import { prepareVoiceTranscriptCommit } from "./session-turn.worker.js";
@@ -64,6 +66,36 @@ import { collectSessionEntryLookupKeys } from "./store-entry.js";
 type Command = SqliteWorkerCommand<SessionActorOperations>;
 const MAX_RESIDENT_SESSIONS = 128;
 const MAX_RESIDENT_BYTES = 8 * 1024 * 1024;
+
+function transcriptPayloadBytes(command: Command): number | undefined {
+  if (
+    command.type !== "session.actor.appendTranscriptEvent" &&
+    command.type !== "session.actor.appendToolResult"
+  ) {
+    return undefined;
+  }
+  const input = command.input;
+  if (input.append) {
+    const append = input.append;
+    if (append.kind === "message") {
+      return Buffer.byteLength(append.input.messageJson);
+    }
+    return (
+      Buffer.byteLength(
+        typeof append.input.event === "string"
+          ? append.input.event
+          : JSON.stringify(append.input.event),
+      ) + Buffer.byteLength(append.input.message?.messageJson ?? "")
+    );
+  }
+  if ("eventJson" in input) {
+    return Buffer.byteLength(input.eventJson);
+  }
+  return input.turn.options.messages.reduce(
+    (bytes, row) => bytes + Buffer.byteLength(JSON.stringify(row.message)),
+    0,
+  );
+}
 
 function errorFacts(error: unknown) {
   return error instanceof Error
@@ -87,6 +119,9 @@ export function createSessionActorWorker(
   const remember = (state: SessionActorStoredState) => {
     const key = state.hot.target.sessionKey;
     drop(key);
+    // Receipts own appended bodies; residency keeps navigation and exact byte accounting.
+    state.transcript.contextMetadata = state.hot.transcript.projection?.contextMetadata;
+    state.transcript.payloads = new Map();
     const bytes = serialize(state).byteLength;
     residents.set(key, { state, bytes });
     residentBytes += bytes;
@@ -141,7 +176,7 @@ export function createSessionActorWorker(
   ) => {
     const sessionKey = working.hot.target.sessionKey;
     const previousPending = pendingStates.get(sessionKey);
-    return stageSqliteTransactionState(database.db, {
+    return stageSqliteTransactionState(sqlPublicationAnchor(database.db), {
       stage: () => pendingStates.set(sessionKey, working),
       rollback() {
         if (previousPending) {
@@ -160,69 +195,61 @@ export function createSessionActorWorker(
       },
     });
   };
-  const replaceParticipants = (
-    working: SessionActorStoredState,
-    participants: SessionParticipantRecord[],
-  ) => {
-    working.hot.participants = structuredClone(participants).toSorted(
-      (left, right) =>
-        (left.firstPromptedAt === right.firstPromptedAt
-          ? 0
-          : left.firstPromptedAt === null
-            ? -1
-            : right.firstPromptedAt === null
-              ? 1
-              : left.firstPromptedAt - right.firstPromptedAt) ||
-        Buffer.compare(Buffer.from(left.identity.id), Buffer.from(right.identity.id)) ||
-        Buffer.compare(
-          Buffer.from(participantIdentityNamespace(left.identity)),
-          Buffer.from(participantIdentityNamespace(right.identity)),
-        ),
-    );
-    const sessionKey = working.hot.target.sessionKey;
-    const selected = working.entryRows.get(sessionKey);
-    if (working.hot.entry && selected) {
-      const entry = { ...working.hot.entry };
-      delete entry.participants;
-      delete entry.participantCount;
-      if (working.hot.participants.length) {
-        entry.participants = working.hot.participants.map(({ identity }) => ({
-          identity: { ...identity },
-        }));
-        entry.participantCount = working.hot.participants.length;
-      }
-      working.entryRows = writableSessionActorMap(working.entryRows);
-      working.entryRows.set(sessionKey, { ...selected, entry: structuredClone(entry) });
-      working.hot.entry = entry;
-    }
-  };
   const prepareParticipantUpdate = (
     database: Pick<OpenClawAgentDatabase, "db">,
     sessionKey: string,
+    singleStatement = false,
   ) => {
     const transaction = readSessionActorTransactionState(database, { sessionKey });
     if (transaction?.hot.target.sessionKey === sessionKey) {
-      return (participants: SessionParticipantRecord[]) => {
-        replaceParticipants(transaction, participants);
+      return {
+        version: transaction.hot.version,
+        publish: (participants: SessionParticipantRecord[]) => {
+          replaceSessionActorParticipants(transaction, participants);
+        },
       };
     }
     const before = retainedState(database, sessionKey);
     if (!before) {
       return undefined;
     }
-    return (participants: SessionParticipantRecord[]) => {
-      const working = forkSessionActorStoredState(before);
-      replaceParticipants(working, participants);
-      working.hot.version = { ...before.hot.version, sequence: before.hot.version.sequence + 1 };
-      const pendingToken = readSqliteDatabasePendingScopedWriteToken(
-        database.db,
-        scopes(working.hot.target, working.hot.dependencySessionIds),
-      );
-      if (pendingToken === undefined) {
-        return;
-      }
-      working.hot.writeToken = pendingToken;
-      stageResidentState(database, working);
+    const version = { ...before.hot.version, sequence: before.hot.version.sequence + 1 };
+    return {
+      version,
+      publish: (participants: SessionParticipantRecord[]) => {
+        const working = forkSessionActorStoredState(before);
+        replaceSessionActorParticipants(working, participants);
+        working.hot.version = version;
+        if (singleStatement) {
+          stageSqliteTransactionState(sqlPublicationAnchor(database.db), {
+            stage() {},
+            rollback() {},
+            commit() {
+              const committedToken = token(
+                database,
+                working.hot.target,
+                working.hot.dependencySessionIds,
+              );
+              if (committedToken === undefined) {
+                throw new Error("Session actor lost its committed participant revision");
+              }
+              working.hot.writeToken = committedToken;
+              remember(working);
+            },
+            invalidate: () => drop(sessionKey),
+          });
+          return;
+        }
+        const pendingToken = readSqliteDatabasePendingScopedWriteToken(
+          database.db,
+          scopes(working.hot.target, working.hot.dependencySessionIds),
+        );
+        if (pendingToken === undefined) {
+          return;
+        }
+        working.hot.writeToken = pendingToken;
+        stageResidentState(database, working);
+      },
     };
   };
   const registerParticipantOwner = (database: OpenClawAgentDatabase) =>
@@ -286,75 +313,100 @@ export function createSessionActorWorker(
             board_present: before.hasBoard ? 1 : 0,
           },
         }),
-      transcript: {
-        sessionId: previousEntry.sessionId,
-        watermark: { ...before.hot.transcript.watermark },
-      },
+      readPredicate: (predicate: Parameters<typeof readSessionEntryPatchPredicate>[2]) =>
+        withSessionActorTransactionState(database, before, () =>
+          readSessionEntryPatchPredicate(database, sessionKey, predicate, {
+            sessionId: previousEntry.sessionId,
+            watermark: before.hot.transcript.watermark,
+          }),
+        ),
       publish,
     };
   };
   const registerTranscriptRewriteOwner = (database: OpenClawAgentDatabase) =>
-    registerSessionActorTranscriptRewriteOwner(database, (opened, rewrite, run) => {
-      const before = residents.get(rewrite.sessionKey)?.state;
-      if (
-        closed ||
-        readSessionActorTransactionState(opened) ||
-        before?.hot.entry?.sessionId !== rewrite.sessionId ||
-        before.hot.writeToken !==
-          readSqliteDatabasePendingScopedWriteToken(
-            opened.db,
-            scopes(before.hot.target, before.hot.dependencySessionIds),
-          )
-      ) {
-        return run();
-      }
-      const working = forkSessionActorStoredState(before);
-      for (const { rawSeq, event, serializedBytes } of rewrite.rows) {
-        if (working.transcript.payloads.has(rawSeq)) {
-          working.transcript.payloads = writableSessionActorMap(working.transcript.payloads);
-          working.transcript.payloads.set(rawSeq, { event, serializedBytes });
+    registerSessionActorTranscriptRewriteOwner(database, {
+      read(opened, scope, entryId) {
+        // Active actor mutations consume their working facts through the transaction kernels.
+        if (readSessionActorTransactionState(opened)) {
+          return undefined;
         }
-      }
-      working.hot.version = { ...before.hot.version, sequence: before.hot.version.sequence + 1 };
-      return withSessionActorTransactionState(opened, working, run, (authority) => {
-        working.hot = projectSessionActorHotState(working);
-        const pendingToken = readSqliteDatabasePendingScopedWriteToken(
-          opened.db,
-          scopes(working.hot.target, working.hot.dependencySessionIds),
-        );
-        if (pendingToken === undefined) {
-          return authority;
-        }
-        working.hot.writeToken = pendingToken;
-        const mutationRevision = readSqliteNativeMutationRevision(opened.db);
+        const current = retainedState(opened, scope.sessionKey)?.hot;
         if (
-          !stageSqliteTransactionState(opened.db, {
-            stage() {},
-            rollback() {},
-            commit() {
-              // A later nested writer must not install this intermediate transcript.
-              if (readSqliteNativeMutationRevision(opened.db) === mutationRevision) {
-                remember(working);
-              } else {
-                drop(rewrite.sessionKey);
-              }
-            },
-            invalidate: () => drop(rewrite.sessionKey),
-          })
+          current?.entry?.sessionId !== scope.sessionId ||
+          current.transcript.anchorsState !== "resident"
         ) {
-          return authority;
+          return undefined;
         }
+        const anchor = current.transcript.anchors.find(
+          (candidate) => candidate.entryId === entryId,
+        );
         return {
-          ...authority,
-          actorRewrite: freezeJsonSnapshot(
-            structuredClone({
-              before: before.hot.transcript.version,
-              postimage: working.hot,
-              rows: rewrite.rows,
-            }),
-          ),
+          entry: {
+            sessionId: current.entry.sessionId,
+            lifecycleRevision: current.entry.lifecycleRevision,
+            activeWriterRunId: current.entry.activeWriterRunId,
+          },
+          generation: current.transcript.version.generation ?? undefined,
+          anchor: anchor && { ...anchor },
         };
-      });
+      },
+      rewrite(opened, rewrite, run) {
+        const before = residents.get(rewrite.sessionKey)?.state;
+        if (
+          closed ||
+          readSessionActorTransactionState(opened) ||
+          before?.hot.entry?.sessionId !== rewrite.sessionId ||
+          before.hot.writeToken !==
+            readSqliteDatabasePendingScopedWriteToken(
+              opened.db,
+              scopes(before.hot.target, before.hot.dependencySessionIds),
+            )
+        ) {
+          return run();
+        }
+        const working = forkSessionActorStoredState(before);
+        rewriteSessionActorContextMetadata(working, rewrite.rows);
+        working.hot.version = { ...before.hot.version, sequence: before.hot.version.sequence + 1 };
+        return withSessionActorTransactionState(opened, working, run, (authority) => {
+          working.hot = projectSessionActorHotState(working);
+          const pendingToken = readSqliteDatabasePendingScopedWriteToken(
+            opened.db,
+            scopes(working.hot.target, working.hot.dependencySessionIds),
+          );
+          if (pendingToken === undefined) {
+            return authority;
+          }
+          working.hot.writeToken = pendingToken;
+          const mutationRevision = readSqliteNativeMutationRevision(opened.db);
+          if (
+            !stageSqliteTransactionState(sqlPublicationAnchor(opened.db), {
+              stage() {},
+              rollback() {},
+              commit() {
+                // A later nested writer must not install this intermediate transcript.
+                if (readSqliteNativeMutationRevision(opened.db) === mutationRevision) {
+                  remember(working);
+                } else {
+                  drop(rewrite.sessionKey);
+                }
+              },
+              invalidate: () => drop(rewrite.sessionKey),
+            })
+          ) {
+            return authority;
+          }
+          return {
+            ...authority,
+            actorRewrite: freezeJsonSnapshot(
+              structuredClone({
+                before: before.hot.transcript.version,
+                postimage: working.hot,
+                rows: rewrite.rows,
+              }),
+            ),
+          };
+        });
+      },
     });
   const requireTarget = (target: SessionActorTarget) => {
     const current = physicalIdentity();
@@ -436,8 +488,8 @@ export function createSessionActorWorker(
           observed.settled("read");
           return structuredClone(before.hot);
         }
-        const operationLabel = `session.actor.${phase}`;
-        const outcome = context.writeTransaction(operationLabel, "Session actor", (opened) => {
+        const payloadBytes = transcriptPayloadBytes(command);
+        const apply = (opened: OpenClawAgentDatabase) => {
           database = opened;
           registerSessionActorEntryPatchOwner(opened, prepareEntryPatch);
           registerParticipantOwner(opened);
@@ -524,7 +576,7 @@ export function createSessionActorWorker(
               applied,
             });
             if (
-              !stageSqliteTransactionState(opened.db, {
+              !stageSqliteTransactionState(sqlPublicationAnchor(opened.db), {
                 stage() {},
                 rollback() {},
                 commit() {
@@ -573,7 +625,7 @@ export function createSessionActorWorker(
                   kind: "session-actor-committed-transfer" as const,
                   transferId: handle.id,
                 };
-                deferSqliteWorkerCommitReceipt(opened.db, receipt);
+                deferSqliteWorkerCommitReceipt(sqlPublicationAnchor(opened.db), receipt);
                 admit("commit", {
                   kind: "session-actor-admission",
                   snapshot: projectSessionActorAuthority(working.hot),
@@ -589,7 +641,7 @@ export function createSessionActorWorker(
                 transfer.cancel();
               }
             }
-            deferSqliteWorkerCommitReceipt(opened.db, accepted);
+            deferSqliteWorkerCommitReceipt(sqlPublicationAnchor(opened.db), accepted);
             admit("commit", {
               kind: "session-actor-admission",
               snapshot: projectSessionActorAuthority(working.hot),
@@ -598,7 +650,13 @@ export function createSessionActorWorker(
             });
             return accepted;
           });
-        });
+        };
+        const outcome = context.writeTransaction(
+          `session.actor.${phase}`,
+          "Session actor",
+          apply,
+          payloadBytes === undefined ? undefined : { payloadBytes },
+        );
         observed.settled(outcome.kind);
         return outcome;
       } catch (error) {
