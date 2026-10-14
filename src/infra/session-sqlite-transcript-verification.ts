@@ -25,11 +25,7 @@ export function verifyTranscriptEvents(
       false,
       readTranscriptFingerprint(source.path),
       source.originalPath,
-    )((event) =>
-      // Compare the same bytes the store owner commits: append canonicalizes
-      // legacy message media, so verification must stage canonical events too.
-      stage.append(0, seq++, JSON.stringify(canonicalizeTranscriptEventMedia(event))),
-    );
+    )((event) => stage.append(0, seq++, JSON.stringify(canonicalizeTranscriptEventMedia(event))));
     if (mode === "ordered") {
       const repair = stage.repairLegacyTranscript(0);
       // Receipt adoption retains its original order and branch-repair contract.
