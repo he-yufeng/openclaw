@@ -13,11 +13,11 @@ import {
   normalizeCompatibilityConfig,
   stateMigrations,
 } from "./doctor-contract-api.js";
-import { createDoctorContext } from "./doctor-contract-api.test-support.js";
 import {
   createBindingMigrationFixture,
   removeCodexDoctorFixture,
 } from "./doctor-contract-api.test-helpers.js";
+import { createDoctorContext } from "./doctor-contract-api.test-support.js";
 import {
   bindingStoreKey,
   CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
