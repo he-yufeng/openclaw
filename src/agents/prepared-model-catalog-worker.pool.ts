@@ -1,5 +1,9 @@
 /** Builds model-catalog worker pools that report their first close to the pool owner. */
 import { resolveStateDir } from "../config/state-dir.js";
+import {
+  getDatabaseEngineSelection,
+  type DatabaseEngineSelection,
+} from "../infra/database-engine/context.js";
 import { runtimeProcessEntrypoints } from "../infra/runtime-process-entrypoints.js";
 import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import { resolveWorkerPoolSize } from "../infra/worker-pool-sizing.js";
@@ -7,6 +11,7 @@ import { WorkerTaskPool } from "../infra/worker-task-pool.js";
 import { createPluginSourceCaptureRoot } from "../plugins/plugin-source-capture-directory.js";
 
 export type PreparedModelCatalogWorkerData = {
+  databaseEngineSelection?: DatabaseEngineSelection;
   sourceCaptureDirectory: string;
   sourceCaptureManagedRoot?: string;
 };
@@ -20,13 +25,11 @@ const CATALOG_WORKER_HEAP_LIMIT_MB = 512;
  * while no task is waiting. It reports its first close so the owner can tell that from its own.
  */
 export class CatalogWorkerTaskPool<Input, Output> extends WorkerTaskPool<Input, Output> {
-  private readonly onClose: ((error?: Error) => void) | undefined;
-
   constructor(
     env: NodeJS.ProcessEnv,
     validateResult: (result: Output) => void,
     assertCurrent?: () => void,
-    onClose?: (error?: Error) => void,
+    private readonly onClose?: (error?: Error) => void,
   ) {
     super({
       workerUrl: resolveRuntimeWorkerUrl(runtimeProcessEntrypoints.preparedModelCatalog),
@@ -46,6 +49,7 @@ export class CatalogWorkerTaskPool<Input, Output> extends WorkerTaskPool<Input, 
           releaseResources: capture.release,
           options: {
             workerData: {
+              databaseEngineSelection: getDatabaseEngineSelection(),
               sourceCaptureDirectory: capture.directory,
               sourceCaptureManagedRoot: capture.managedRoot,
             } satisfies PreparedModelCatalogWorkerData,
@@ -56,7 +60,6 @@ export class CatalogWorkerTaskPool<Input, Output> extends WorkerTaskPool<Input, 
       },
       validateResult,
     });
-    this.onClose = onClose;
   }
 
   override close(error?: Error): Promise<void> {

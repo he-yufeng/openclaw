@@ -4,6 +4,7 @@ import {
   trackSqliteStatementExecutions,
 } from "../../../test/helpers/sqlite-statement-execution-counter.js";
 import { upsertAcpSessionMeta } from "../../acp/runtime/session-meta.js";
+import { captureRuntimeConfigAsyncReader } from "../../config/io.runtime.js";
 import {
   appendTranscriptMessage,
   loadSessionEntry,
@@ -17,11 +18,13 @@ import {
 } from "../../config/sessions/session-transcript-worker-resources.js";
 import type { CronJob } from "../../cron/types.js";
 import * as admission from "../../infra/sqlite-worker-operation-admission.js";
+import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import {
   closeOpenClawAgentDatabasesAsync,
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { sessionMutationHandlers } from "./sessions-mutations.js";
 import type { GatewayClient, GatewayRequestContext } from "./types.js";
@@ -83,6 +86,7 @@ test.each([{ pinned: true }, { label: "Renamed" }, { label: " Taken " }])(
   "sessions.patch %j avoids transcript-worker startup, unrelated hydration, and host ACP reads",
   async (patch) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      await captureRuntimeConfigAsyncReader()();
       const targetKey = "agent:main:single-patch-target";
       const snapshots = {
         skillsSnapshot: { prompt: "synthetic skill instructions ".repeat(1_000), skills: [] },
@@ -128,7 +132,7 @@ test.each([{ pinned: true }, { label: "Renamed" }, { label: " Taken " }])(
       expect(historySequence).toBe(historyLane.retiredSequence);
       const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
       const statements = trackSqliteStatementExecutions(
-        database.db,
+        requireNativeSqliteDatabase(database.db),
         ["whole-store-projection"] as const,
         (sql) => {
           const normalized = sql.toLowerCase().replaceAll(/\s+/g, " ").trim();
@@ -188,6 +192,7 @@ test.each([{ pinned: true }, { label: "Renamed" }, { label: " Taken " }])(
 
 test("sessions.patchMany archives 30 human sessions without transcript hydration", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+    await captureRuntimeConfigAsyncReader()();
     const targets = Array.from({ length: 30 }, (_, index) => ({
       key: `agent:main:archive-perf-${index}`,
       expectedSessionId: `session-archive-perf-${index}`,
@@ -225,7 +230,7 @@ test("sessions.patchMany archives 30 human sessions without transcript hydration
 
     const database = openOpenClawAgentDatabase({ agentId: "main", env: state.env });
     const statements = trackSqliteStatementExecutions(
-      database.db,
+      requireNativeSqliteDatabase(database.db),
       ["whole-store-projection", "transcript-full-hydration"] as const,
       (sql) => {
         const normalized = sql.toLowerCase().replaceAll(/\s+/g, " ").trim();
@@ -257,20 +262,15 @@ test("sessions.patchMany archives 30 human sessions without transcript hydration
     const originalExec = database.db.exec.bind(database.db);
     const transactionCounts = { begin: 0, commit: 0 };
     const workerGrants: string[] = [];
-    const createAdmission = admission.createSqliteWorkerOperationAdmission;
-    const admissionSpy = vi
-      .spyOn(admission, "createSqliteWorkerOperationAdmission")
-      .mockImplementation((callback, attachment) =>
-        createAdmission((request, grant) => {
-          callback(request, () => {
-            const granted = grant();
-            if (granted && (request.stage === "transaction" || request.stage === "commit")) {
-              workerGrants.push(request.stage);
-            }
-            return granted;
-          });
-        }, attachment),
-      );
+    const admissionSpy = probe.admission(admission, (request, grant, callback) => {
+      callback(request, () => {
+        const granted = grant();
+        if (granted && (request.stage === "transaction" || request.stage === "commit")) {
+          workerGrants.push(request.stage);
+        }
+        return granted;
+      });
+    });
     const execSpy = vi.spyOn(database.db, "exec").mockImplementation((sql) => {
       const normalized = sql.trim().toUpperCase();
       if (normalized === "BEGIN IMMEDIATE") {

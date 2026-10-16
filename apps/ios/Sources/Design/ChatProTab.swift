@@ -35,9 +35,15 @@ struct ChatProTab: View {
     }
 
     @Environment(NodeAppModel.self) private var appModel
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(GatewayConnectionController.self) private var gatewayController
     @AppStorage("openclaw.webchat.showAssistantTrace")
     private var showsAssistantTrace = true
+    private var chatTraceDisplayOptions: OpenClawChatDisplayOptions {
+        guard self.showsAssistantTrace else { return [] }
+        return self.viewModel?.currentSessionReasoningVisible == true ? .assistantTrace : .toolActivity
+    }
+
     private var viewModel: OpenClawChatViewModel? {
         self.appModel.chatPresentation.viewModel
     }
@@ -144,10 +150,12 @@ struct ChatProTab: View {
                 drawsBackground: true,
                 showsSessionSwitcher: false,
                 userAccent: self.chatUserAccent,
-                showsAssistantTrace: self.showsAssistantTrace,
+                displayOptions: self.chatTraceDisplayOptions,
                 assistantName: self.agentDisplayName,
                 assistantAvatarText: self.agentBadge,
                 assistantAvatarTint: OpenClawBrand.accent,
+                // Narrow layouts drop the avatar column, as the web chat does at phone widths.
+                showsAssistantAvatars: self.horizontalSizeClass != .compact,
                 composerChrome: .clean,
                 isComposerEnabled: self.gatewayConnected || self.canQueueOffline,
                 isAttachmentInputEnabled: self.gatewayConnected || self.canQueueOffline,
@@ -557,7 +565,7 @@ struct ChatProTab: View {
 
     private var gatewayDisplayState: GatewayDisplayState {
         Self.presentationGatewayState(
-            current: GatewayStatusBuilder.build(appModel: self.appModel),
+            current: GatewayStatusBuilder.buildChat(appModel: self.appModel),
             isAttachmentOwnerPinned: self.isAttachmentOwnerPinned,
             capturedOwnerID: self.appModel.chatPresentation.ownerID,
             currentOwnerID: self.appModel.chatViewModelOwnerID)

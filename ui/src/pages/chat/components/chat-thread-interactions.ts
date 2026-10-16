@@ -1,6 +1,3 @@
-// Pane-local search, context menus, selection actions, and presentation resets.
-import { html, nothing, type TemplateResult } from "lit";
-import { ref } from "lit/directives/ref.js";
 import type { MessageReactionSummary } from "../../../../../packages/gateway-protocol/src/index.js";
 import type { ChatPendingInputsPage } from "../../../../../packages/gateway-protocol/src/schema/logs-chat.js";
 import type { ThemeBranding } from "../../../../../packages/gateway-protocol/src/theme.ts";
@@ -10,10 +7,10 @@ import type {
   GatewaySessionRow,
   SessionsListResult,
 } from "../../../api/types.ts";
+import type { ApplicationContext } from "../../../app/context.ts";
 import type { QuestionPrompt } from "../../../app/question-prompt.ts";
 import type { BrowserTabSelection } from "../../../components/browser/browser-target.ts";
-import { copyMarkdownLabel, handleCopyButton } from "../../../components/copy-button.ts";
-import { icons } from "../../../components/icons.ts";
+import { copyMarkdownLabel, handleCopyButton } from "../../../components/copy-button-state.ts";
 import type { ImageLightboxItem } from "../../../components/image-lightbox.types.ts";
 import type { MarkdownFileLinkTarget } from "../../../components/markdown-file-links.ts";
 import type { MarkdownRenderOptions } from "../../../components/markdown-render-options.ts";
@@ -22,7 +19,6 @@ import { releaseMarkdownTables } from "../../../components/markdown-tables.ts";
 import type { PersonActivityRouting } from "../../../components/person-activity-link.ts";
 import { t } from "../../../i18n/index.ts";
 import { registerChatMessageMetadataEnglish } from "../../../i18n/locales/en-chat-message-metadata.ts";
-import "../../../components/tooltip.ts";
 import type { BoardProvider } from "../../../lib/board/provider.ts";
 import type {
   ChatAttachment,
@@ -32,27 +28,29 @@ import type {
   ChatStreamSegment,
 } from "../../../lib/chat/chat-types.ts";
 import type { EmbedSandboxMode } from "../../../lib/chat/tool-display.ts";
+import type { PresentationValue } from "../../../lib/presentation.ts";
 import type { UiSessionDefaultsHost } from "../../../lib/sessions/session-key.ts";
-import type { PresentationValue } from "../../../lit/presentation-binding.ts";
+// Pane-local search, context menus, selection actions, and presentation resets.
 import type { TurnRecapWatch } from "../chat-progress.ts";
 import type { SubagentRoster } from "../chat-spawned-subagent.ts";
 import { resetChatThreadState } from "../chat-thread.ts";
 import type { PluginToolIcons } from "../chat-tool-icon-controller.ts";
 import type { ChatTypingActorView, ChatTypingOverflow } from "../chat-typing-presence.ts";
 import type { LinkFaviconFetcher } from "../link-favicon-cache.ts";
+import type { ChatTranscriptMetadata } from "../session-message-cache.ts";
 import type { RealtimeTalkConversationEntry } from "../talk/conversation.ts";
 import type { CompactionStatus, RunOutputUsage } from "../tool-stream-contract.ts";
 import type { AsyncQuestionDraft, AsyncQuestionPresentation } from "./chat-async-question.types.ts";
 import { resolveChatContextCopy, usesNativeContextMenu } from "./chat-context-copy.ts";
-import type { ChatHistoryBoundaryProps } from "./chat-history-boundary.ts";
+import type { ChatHistoryBoundaryProps } from "./chat-history-boundary.tsx";
 import {
   dismissConfirmedActionPopovers,
   isConfirmedActionPopoverFocused,
   openChatRewindConfirmation,
 } from "./chat-message-confirmation.ts";
-import type { MessageActionDetails, MessageReplyTarget } from "./chat-message-markdown.ts";
+import type { MessageActionDetails, MessageReplyTarget } from "./chat-message-markdown.types.ts";
 import type { ArtifactDownloadResolver } from "./chat-message-media.ts";
-import type { ChatSendStatusActions } from "./chat-message-send-status.ts";
+import type { ChatSendStatusActions } from "./chat-message-send-status-view.tsx";
 import type { ReplyMessageStatus } from "./chat-reply-preview.ts";
 import {
   handleChatSelectionPointerUp,
@@ -108,6 +106,7 @@ type ReplyMessageAccess = {
 
 export type ChatThreadProps = ChatSendStatusActions &
   SubagentRoster & {
+    applicationContext?: ApplicationContext;
     messageReactions?: ReadonlyMap<string, MessageReactionSummary[]>;
     onReact?: (messageId: string, emoji: string, remove: boolean) => void;
     branding?: ThemeBranding;
@@ -121,7 +120,9 @@ export type ChatThreadProps = ChatSendStatusActions &
     transcriptVisible?: PresentationValue;
     gatewayClient?: GatewayBrowserClient | null;
     selectedSession: GatewaySessionRow | undefined;
+    transcriptMetadata?: ChatTranscriptMetadata;
     boardProvider?: BoardProvider;
+    widgetLayout?: import("../session-message-cache.ts").ChatWidgetLayout;
     announceTranscript?: boolean;
     loading: boolean;
     routeLoadingSkeleton?: boolean;
@@ -132,6 +133,7 @@ export type ChatThreadProps = ChatSendStatusActions &
     latestBrowserTabs?: ReadonlyMap<string, BrowserTabSelection>;
     guardianNotices?: ChatGuardianNotice[];
     streamSegments: ChatStreamSegment[];
+    reasoning?: import("../tool-stream-contract.ts").ChatReasoning | null;
     stream: string | null;
     streamStartedAt: number | null;
     /** Browser-local active run identity, retained across transient disconnects. */
@@ -140,12 +142,17 @@ export type ChatThreadProps = ChatSendStatusActions &
     queue: ChatQueueItem[];
     initialTurnId?: string;
     pendingInputs?: ChatPendingInputsPage["items"];
+    chatBubbleMode?: boolean;
     showThinking: boolean;
     showToolCalls: boolean;
     persistCommentary?: boolean;
     runActive?: boolean;
     runWorking?: boolean;
+    runFinalizing?: boolean;
     startupLabel?: string;
+    retryAt?: number;
+    onRetryRun?: (runId: string) => void;
+    failureActionsRunId?: string;
     waitingApproval?: boolean;
     questionPrompts?: readonly QuestionPrompt[];
     asyncQuestions?: AsyncQuestionPresentation;
@@ -163,6 +170,7 @@ export type ChatThreadProps = ChatSendStatusActions &
     userId?: string | null;
     userName?: string | null;
     userAvatar?: string | null;
+    channelAvatar?: import("../../../lib/chat/channel-sender-avatar.ts").ChannelSenderAvatarSource;
     basePath?: string;
     sessionPublicOrigin?: string;
     resourceBasePath?: string;
@@ -195,6 +203,7 @@ export type ChatThreadProps = ChatSendStatusActions &
     onHistoryIntent?: (event: Event) => void;
     onDraftChange: (next: string) => void;
     onSend: () => void;
+    onPermissionRetry?: (message: string) => void;
     onSetReply?: (target: MessageReplyTarget) => void;
     replyMessageAccess?: ReplyMessageAccess;
     onRewindMessage?: (entryId: string) => Promise<boolean> | boolean;
@@ -208,7 +217,7 @@ export type ChatThreadProps = ChatSendStatusActions &
     /** Shows one of the session's subagents. */
     onOpenSubagent?: (sessionKey: string) => void;
     /** Shows the session's subagents; absent where the pane has no list of them to show. */
-    onOpenSubagents?: () => void;
+    onOpenSubagents?: (focus?: boolean) => void;
     modelSetupRequired?: boolean;
     onModelSetup?: () => void;
   };
@@ -227,6 +236,13 @@ type TranscriptInteractionProps = Pick<
 >;
 
 const transcriptStates = new Map<string, ChatThreadState>();
+const transcriptSearchDefaults = {
+  searchOpen: false,
+  searchQuery: "",
+  searchFocusPending: false,
+  searchReturnFocusTarget: null,
+  searchReturnFocusOwner: null,
+};
 
 export function getTranscriptState(paneId: string): ChatThreadState {
   const existing = transcriptStates.get(paneId);
@@ -237,11 +253,7 @@ export function getTranscriptState(paneId: string): ChatThreadState {
     asyncQuestionDrafts: new Map(),
     asyncQuestionRevision: 0,
     turnRecapWatch: null,
-    searchOpen: false,
-    searchQuery: "",
-    searchFocusPending: false,
-    searchReturnFocusTarget: null,
-    searchReturnFocusOwner: null,
+    ...transcriptSearchDefaults,
     transcriptRenderDependencies: [],
     transcriptRenderContext: {},
   };
@@ -281,11 +293,7 @@ export function resetTranscriptSession(paneId: string, owner?: ParentNode): void
     // Parked rows must commit fresh bindings on return even when visible props match.
     state.transcriptRenderDependencies = [];
     // Search input belongs to the outgoing transcript; pane preferences survive.
-    state.searchOpen = false;
-    state.searchQuery = "";
-    state.searchFocusPending = false;
-    state.searchReturnFocusTarget = null;
-    state.searchReturnFocusOwner = null;
+    Object.assign(state, transcriptSearchDefaults);
   }
 }
 
@@ -302,84 +310,16 @@ export function resetThreadPresentation(paneId?: string, owner?: ParentNode) {
   }
   if (paneId) {
     transcriptStates.delete(paneId);
-    resetChatThreadState(paneId);
   } else {
     transcriptStates.clear();
-    resetChatThreadState();
   }
-}
-
-export function renderTranscriptSearch(
-  paneId: string,
-  requestUpdate: () => void,
-): TemplateResult | typeof nothing {
-  const state = getTranscriptState(paneId);
-  if (!state.searchOpen) {
-    return nothing;
-  }
-  return html`
-    <div
-      class="agent-chat__search-bar"
-      @keydown=${(event: KeyboardEvent) => {
-        if (
-          event.key !== "Escape" ||
-          event.defaultPrevented ||
-          event.isComposing ||
-          event.keyCode === 229
-        ) {
-          return;
-        }
-        event.preventDefault();
-        event.stopPropagation();
-        closeTranscriptSearch(state, requestUpdate);
-      }}
-    >
-      ${icons.search}
-      <input
-        type="text"
-        placeholder=${t("chat.thread.searchPlaceholder")}
-        aria-label=${t("chat.thread.search")}
-        .value=${state.searchQuery}
-        ${
-          state.searchFocusPending
-            ? ref((element) => {
-                if (element instanceof HTMLInputElement) {
-                  state.searchFocusPending = false;
-                  queueMicrotask(() => {
-                    if (element.isConnected) {
-                      element.focus({ preventScroll: true });
-                    }
-                  });
-                }
-              })
-            : nothing
-        }
-        @input=${(event: Event) => {
-          state.searchQuery = (event.target as HTMLInputElement).value;
-          requestUpdate();
-        }}
-      />
-      <openclaw-tooltip .content=${t("chat.thread.closeSearch")}>
-        <button
-          class="btn btn--ghost"
-          aria-label=${t("chat.thread.closeSearch")}
-          @click=${() => closeTranscriptSearch(state, requestUpdate)}
-        >
-          ${icons.x}
-        </button>
-      </openclaw-tooltip>
-    </div>
-  `;
+  resetChatThreadState(paneId);
 }
 
 export function closeTranscriptSearch(state: ChatThreadState, requestUpdate: () => void): void {
   const returnFocusTarget = state.searchReturnFocusTarget;
   const returnFocusOwner = state.searchReturnFocusOwner;
-  state.searchOpen = false;
-  state.searchQuery = "";
-  state.searchFocusPending = false;
-  state.searchReturnFocusTarget = null;
-  state.searchReturnFocusOwner = null;
+  Object.assign(state, transcriptSearchDefaults);
   requestUpdate();
   queueMicrotask(() => {
     const target = returnFocusTarget?.isConnected
@@ -407,14 +347,10 @@ export function toggleTranscriptSearch(
   state.searchFocusPending = true;
   const returnFocusTarget = triggerEvent?.target;
   const returnFocusOwner = triggerEvent?.currentTarget;
-  state.searchReturnFocusTarget =
-    returnFocusTarget instanceof HTMLElement && returnFocusTarget.isConnected
-      ? returnFocusTarget
-      : null;
-  state.searchReturnFocusOwner =
-    returnFocusOwner instanceof HTMLElement && returnFocusOwner.isConnected
-      ? returnFocusOwner
-      : null;
+  const connectedElement = (target: EventTarget | null | undefined) =>
+    target instanceof HTMLElement && target.isConnected ? target : null;
+  state.searchReturnFocusTarget = connectedElement(returnFocusTarget);
+  state.searchReturnFocusOwner = connectedElement(returnFocusOwner);
   requestUpdate();
 }
 
@@ -544,6 +480,7 @@ export function handleTranscriptContextMenu(event: MouseEvent, props: Transcript
     ...(group?.querySelectorAll<HTMLElement>("[data-message-actions-for]") ?? []),
   ].find((element) => element.dataset.messageActionsFor === messageId);
   const copyButton = actionOwner?.querySelector<HTMLButtonElement>(".chat-copy-btn");
+  const readAloudButton = actionOwner?.querySelector<HTMLButtonElement>(".chat-read-aloud-btn");
   const ownsRunFrame = group?.dataset.chatRowKey?.startsWith("agent-run:") === true;
   const canReply = Boolean(replyTarget && props.onSetReply && (!ownsRunFrame || actionOwner));
   const canRewind = isUserMessage && typeof props.onRewindMessage === "function";
@@ -654,6 +591,17 @@ export function handleTranscriptContextMenu(event: MouseEvent, props: Transcript
       onClick: () => {
         removeReplyContextMenu();
         copyButton?.click();
+      },
+    });
+  }
+  if (readAloudButton) {
+    const label = readAloudButton.getAttribute("aria-label") ?? t("chat.messages.readAloud");
+    appendAction({
+      label,
+      tooltip: label,
+      onClick: () => {
+        removeReplyContextMenu();
+        readAloudButton.click();
       },
     });
   }

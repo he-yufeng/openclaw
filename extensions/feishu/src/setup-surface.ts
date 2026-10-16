@@ -167,25 +167,17 @@ async function runScanToCreate(
     tp: SCAN_TO_CREATE_TP,
   });
 
-  let message: string;
-  switch (outcome.status) {
-    case "success":
-      message = t("wizard.feishu.scanCompleted");
-      break;
-    case "access_denied":
-      message = t("wizard.feishu.scanDenied");
-      break;
-    case "expired":
-      message = t("wizard.feishu.scanExpired");
-      break;
-    case "timeout":
-      message = t("wizard.feishu.scanTimedOut");
-      break;
-    case "error":
-      message = t("wizard.feishu.scanError", { error: outcome.message });
-      break;
-  }
-  progress.stop(message);
+  const statusMessages = {
+    success: "wizard.feishu.scanCompleted",
+    access_denied: "wizard.feishu.scanDenied",
+    expired: "wizard.feishu.scanExpired",
+    timeout: "wizard.feishu.scanTimedOut",
+  };
+  progress.stop(
+    outcome.status === "error"
+      ? t("wizard.feishu.scanError", { error: outcome.message })
+      : t(statusMessages[outcome.status]),
+  );
   return outcome.status === "success" ? outcome.result : null;
 }
 
@@ -367,9 +359,7 @@ export async function runFeishuLogin(params: {
 export const feishuSetupWizard: ChannelSetupWizard = {
   channel,
   resolveAccountIdForConfigure: ({ accountOverride, defaultAccountId, cfg }) =>
-    (typeof accountOverride === "string" && accountOverride.trim()
-      ? accountOverride.trim()
-      : undefined) ??
+    (accountOverride?.trim() || undefined) ??
     resolveDefaultFeishuAccountId(cfg) ??
     defaultAccountId,
   resolveShouldPromptAccountIds: () => false,
@@ -388,7 +378,9 @@ export const feishuSetupWizard: ChannelSetupWizard = {
         try {
           const { probeFeishu } = await import("./probe.js");
           probeResult = await probeFeishu(account);
-        } catch {}
+        } catch {
+          // The optional connection probe must not prevent configuring credentials offline.
+        }
       }
       if (!configured) {
         return [`Feishu: ${t("wizard.channels.statusNeedsAppCredentials")}`];

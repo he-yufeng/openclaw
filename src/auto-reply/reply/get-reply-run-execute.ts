@@ -22,11 +22,10 @@ import {
 import { readChannelContextAdmissionEvidence } from "../../channels/message-access/admission-evidence.js";
 import { copyChildSessionPublication } from "../../channels/message-access/child-session-publication.js";
 import { getRuntimeConfig } from "../../config/config.js";
-import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity.js";
+import { conversationIdentityFromMsgContext } from "../../config/sessions/conversation-identity-inbound.js";
 import { resolveGroupSessionKey } from "../../config/sessions/group.js";
 import { sessionPersonalProfileId } from "../../config/sessions/session-entry-provenance.js";
 import { getGatewayLocalUserIngress } from "../../gateway/local-user-ingress.js";
-import { normalizeMediaFacts } from "../../media/media-facts.js";
 import { normalizeAccountId } from "../../routing/account-id.js";
 import { isSessionPersonalBootstrapTurn } from "../../sessions/session-participant-input.js";
 import { MEDIA_ONLY_USER_TEXT } from "../../sessions/user-turn-media.js";
@@ -124,7 +123,6 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     typingMode,
     terminalReplyExpectation,
   } = context;
-  const runParams = { ...params };
   const {
     ctx,
     sessionCtx,
@@ -238,7 +236,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     (replyRoute.chatType === "direct" &&
       ctx.InboundAccessAuthorized === true &&
       ctx.SenderIsSelf !== true);
-  const ctxMediaForPersistence = normalizeMediaFacts(ctx.media);
+  const ctxMediaForPersistence = ctx.media ?? [];
   const unresolvedSourceIndexes = new Set(currentTurnImages.unresolvedSourceIndexes ?? []);
   const persistedCtxMedia = ctxMediaForPersistence.map((fact, index) =>
     unresolvedSourceIndexes.has(index) ? { ...fact, hydrationSuppressed: true } : fact,
@@ -291,20 +289,13 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     normalizeOptionalString(conversationIdentity?.channel) ??
     normalizeOptionalString(sessionCtx.OriginatingChannel) ??
     normalizeOptionalString(sessionCtx.Provider);
-  const transport =
-    conversationRef ||
-    sourceMessageId ||
-    transportReplyToId ||
-    transportThreadId ||
-    transportChannel
-      ? {
-          ...(transportChannel ? { channel: transportChannel } : {}),
-          ...(conversationRef ? { conversationRef } : {}),
-          ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
-          ...(transportReplyToId ? { replyToId: transportReplyToId } : {}),
-          ...(transportThreadId ? { threadId: transportThreadId } : {}),
-        }
-      : undefined;
+  const transport = {
+    ...(transportChannel ? { channel: transportChannel } : {}),
+    ...(conversationRef ? { conversationRef } : {}),
+    ...(sourceMessageId ? { messageId: sourceMessageId } : {}),
+    ...(transportReplyToId ? { replyToId: transportReplyToId } : {}),
+    ...(transportThreadId ? { threadId: transportThreadId } : {}),
+  };
   const userTurnInput =
     userTurnTranscriptText !== undefined || userTurnMediaForPersistence.length > 0
       ? {
@@ -320,7 +311,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
                 }).provenance,
               }
             : {}),
-          ...(transport ? { transport } : {}),
+          ...(Object.keys(transport).length > 0 ? { transport } : {}),
           ...(userTurnMediaForPersistence.length > 0 ? { media: userTurnMediaForPersistence } : {}),
           ...(mediaImageLayout ? { mediaImageLayout } : {}),
           // Persist the message's own arrival timestamp so the single
@@ -401,11 +392,14 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     deliveryCorrelations: opts?.queuedDeliveryCorrelations,
     turnAdoptionLifecycle: opts?.turnAdoptionLifecycle,
     runObservers: {
+      awaitSessionDiffBaseline: opts?.awaitSessionDiffBaseline,
       onAgentRunStart: opts?.onAgentRunStart,
+      onPreparedAgentRunStart: opts?.onPreparedAgentRunStart,
       onAgentRunTerminalOutcome: opts?.onAgentRunTerminalOutcome,
       onModelSelected: opts?.onModelSelected,
       prepareAssistantTranscriptMessage: opts?.prepareAssistantTranscriptMessage,
       resolveReplyDelivery: opts?.resolveReplyDelivery,
+      resolveReplyDeliveryFacts: opts?.resolveReplyDeliveryFacts,
       onDeliberateSilentTerminalReply: opts?.onDeliberateSilentTerminalReply,
     },
     ...(opts?.onFollowupQueueDisposition
@@ -425,6 +419,12 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     summaryLine: baseBodyTrimmedRaw,
     ...(queuedToolsAllow !== undefined ? { toolsAllow: queuedToolsAllow } : {}),
     ...(opts?.disableTools !== undefined ? { disableTools: opts.disableTools } : {}),
+    ...(opts?.forceRestartSafeTools !== undefined
+      ? { forceRestartSafeTools: opts.forceRestartSafeTools }
+      : {}),
+    ...(opts?.forceCodeModeTools !== undefined
+      ? { forceCodeModeTools: opts.forceCodeModeTools }
+      : {}),
     enqueuedAt: Date.now(),
     currentTurnImagesPrepared: true as const,
     images: currentTurnImages.images,
@@ -463,7 +463,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       agentAccountId: replyRoute.accountId,
       conversationRoutePeerId: sessionCtx.ConversationRoutePeerId,
       conversationToolPolicy: sessionCtx.ConversationToolPolicy,
-      groupId: resolveGroupSessionKey(sessionCtx)?.id ?? undefined,
+      groupId: resolveGroupSessionKey(sessionCtx)?.id,
       groupChannel:
         normalizeOptionalString(sessionCtx.GroupChannel) ??
         normalizeOptionalString(sessionCtx.GroupSubject),
@@ -509,6 +509,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       authProfileIdSource,
       thinkingCatalog,
       thinkLevel: resolvedThinkLevel,
+      thinkingExplicit: params.thinkingExplicit,
       thinkLevelOverride,
       ...(() => {
         if (useFastReplyRuntime) {
@@ -522,7 +523,9 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
           sessionEntry: preparedSessionState.sessionEntry,
         });
         return {
-          fastMode: params.resolvedFastMode ?? fastModeState.mode,
+          fastMode: params.resolvedFastModeOverride
+            ? params.resolvedFastMode
+            : fastModeState.requestMode,
           fastModeAutoOnSeconds:
             params.resolvedFastModeAutoOnSeconds ?? fastModeState.fastAutoOnSeconds,
           ...(params.resolvedFastModeOverride ? { fastModeOverride: true } : {}),
@@ -637,7 +640,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
     inheritedCronCreatorAuthorityCapability ?? createdCronCreatorAuthorityCapability;
   const execute = () =>
     runReplyAgent({
-      ...runParams,
+      ...params,
       commandBody: prefixedCommandBody,
       transcriptCommandBody,
       followupRun,
@@ -647,7 +650,7 @@ export async function executePreparedReplyRun(state: PreparedReplyRunAdmission) 
       shouldFollowup,
       hasQueuedFollowups,
       isActive,
-      isRunActive: () => {
+      isRunActive: async () => {
         const latestSessionState = resolvePreparedSessionState();
         const latestActiveSessionId =
           resolveActiveEmbeddedSessionId(latestSessionState.sessionFile) ??

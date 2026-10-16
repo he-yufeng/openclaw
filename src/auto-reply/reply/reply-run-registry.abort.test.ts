@@ -134,12 +134,6 @@ describe("reply run registry cancellation", () => {
 
   it.each([
     {
-      reason: undefined,
-      code: "aborted_by_user",
-      cancelReason: "user_abort",
-      direct: false,
-    },
-    {
       reason: new Error("caller cancelled"),
       code: "aborted_by_user",
       cancelReason: "user_abort",
@@ -384,12 +378,14 @@ describe("reply run control ownership", () => {
       const owner = resolveActiveReplyRunOwnerForSignal(controller.signal);
       const persistence = createDeferred();
       const delivery = createDeferred();
+      const producerError = new Error("Producer rejected its partial reply");
       const started = vi.fn();
       let handoff: Promise<void> | undefined;
       try {
         expect(
           owner?.handoff((producerCompleted) => {
-            handoff = producerCompleted.then(async () => {
+            handoff = producerCompleted.then(async (error) => {
+              expect(error).toBe(producerError);
               started();
               await persistence.promise;
             });
@@ -401,6 +397,8 @@ describe("reply run control ownership", () => {
         if (forcedClear) {
           expect(forceClearReplyOperation(operation)).toBe(true);
         }
+        operation.fail("run_failed", producerError);
+        operation.fail("run_failed", new Error("Later cleanup failure"));
         await Promise.resolve();
         expect(started).not.toHaveBeenCalled();
         expect(() => createTestReplyOperation({ sessionKey })).toThrow();
@@ -580,17 +578,7 @@ describe("reply run successor barriers", () => {
       const canonicalWait = waitForReplyRunSuccessorAdmission(canonicalKey, 100);
       releaseFirstBarrier();
       for (const wait of [requestWait, canonicalWait]) {
-        await expect(wait).resolves.toEqual({
-          settled: true,
-          sources: [
-            {
-              sessionId: "rotated-alias-session",
-              sessionIds: operation.captureOwnedSessionIds(),
-              operation,
-              databaseIdentity: undefined,
-            },
-          ],
-        });
+        await expect(wait).resolves.toEqual({ settled: true });
       }
       expect(() => createTestReplyOperation({ sessionKey: adoptedKey })).toThrow(
         ReplyRunSuccessorAdmissionBlockedError,
@@ -598,14 +586,6 @@ describe("reply run successor barriers", () => {
       releaseSecondBarrier();
       await expect(waitForReplyRunSuccessorAdmission(adoptedKey, 100)).resolves.toEqual({
         settled: true,
-        sources: [
-          {
-            sessionId: "rotated-alias-session",
-            sessionIds: operation.captureOwnedSessionIds(),
-            operation,
-            databaseIdentity: undefined,
-          },
-        ],
       });
       const successor = createTestReplyOperation({ sessionKey: canonicalKey });
       successor.complete();

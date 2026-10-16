@@ -35,6 +35,7 @@ const [
   { SessionManager: PersistentSessionManager },
   safetyTimeout,
   realSafetyTimeout,
+  { clearRuntimeConfigSnapshot, setRuntimeConfigSnapshot },
 ] = await Promise.all([
   import("../../auto-reply/reply/session-updates.js"),
   import("../../config/sessions/session-accessor.js"),
@@ -44,6 +45,7 @@ const [
   vi.importActual<typeof import("./compaction-safety-timeout.js")>(
     "./compaction-safety-timeout.js",
   ),
+  import("../../config/runtime-snapshot.js"),
 ]);
 
 const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
@@ -52,6 +54,7 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
     await closeOpenClawAgentDatabasesAsync();
     closeOpenClawAgentDatabasesForTest();
     cleanup();
+    clearRuntimeConfigSnapshot();
   }),
 );
 let workspaceDir: string;
@@ -156,7 +159,8 @@ async function withPersistentTranscriptFixture(
 beforeEach(async () => {
   workspaceDir = await realpath(tempDirs.make("openclaw-queued-successor-"));
   resetCompactHooksHarnessMocks(workspaceDir);
-  maintain.mockClear();
+  setRuntimeConfigSnapshot({});
+  maintain.mockReset();
   hookRunner.hasHooks.mockReturnValue(true);
   resolveContextEngineMock.mockResolvedValue({
     info: { id: "test-engine", name: "Test engine", ownsCompaction: true },
@@ -168,6 +172,86 @@ beforeEach(async () => {
 });
 
 describe("queued compaction successor ownership", () => {
+  it.each(["compact", "maintain"] as const)(
+    "does not dispatch plugin %s after its writer is replaced",
+    async (effect) => {
+      const pluginStore = ["retained history"];
+      const replaceWriter = async () => {
+        await patchSessionEntryCore(target(), () => ({ activeWriterRunId: "replacement-writer" }));
+        return undefined;
+      };
+      contextEngineCompactMock.mockImplementationOnce(async () => {
+        if (effect === "compact") {
+          pluginStore.length = 0;
+        }
+        return completed(sessionId);
+      });
+      if (effect === "compact") {
+        hookRunner.runBeforeCompaction.mockImplementationOnce(replaceWriter);
+      } else {
+        maintain.mockImplementationOnce(async () => {
+          pluginStore.length = 0;
+          return { changed: true, bytesFreed: 1, rewrittenEntries: 1 };
+        });
+      }
+
+      await compact(
+        backendCompactParams(),
+        effect === "maintain" ? { onHostCompactionCommitted: replaceWriter } : {},
+      ).catch(() => undefined);
+
+      expect(pluginStore).toEqual(["retained history"]);
+      expect(loadSessionEntry(target())?.activeWriterRunId).toBe("replacement-writer");
+      expect(maintain).not.toHaveBeenCalled();
+      if (effect === "compact") {
+        expect(contextEngineCompactMock).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "hydrates post-compaction history only for a requested rewrite (rewrite=%s)",
+    async (rewrite) => {
+      await withPersistentTranscriptFixture(async ({ request, transcriptBefore }) => {
+        const open = vi.spyOn(PersistentSessionManager, "openAsync");
+        const reload = vi.spyOn(
+          PersistentSessionManager.prototype,
+          "reloadPersistedTranscriptAsync",
+        );
+        contextEngineCompactMock.mockResolvedValueOnce(completed(sessionId));
+        maintain.mockImplementationOnce(async ({ runtimeContext }) => {
+          if (rewrite) {
+            return await runtimeContext!.rewriteTranscriptEntries!(request);
+          }
+          return { changed: false, bytesFreed: 0, rewrittenEntries: 0 };
+        });
+        try {
+          await expect(compact(compactParams())).resolves.toMatchObject({
+            ok: true,
+            compacted: true,
+          });
+          expect(maintain).toHaveBeenCalledOnce();
+          expect(open).toHaveBeenCalledTimes(rewrite ? 1 : 0);
+          expect(reload).not.toHaveBeenCalled();
+          const transcript = loadTranscriptEventsSync(target());
+          if (rewrite) {
+            expect(transcript).toContainEqual(
+              expect.objectContaining({
+                type: "message",
+                message: { role: "user", content: "rewritten", timestamp: 2 },
+              }),
+            );
+          } else {
+            expect(transcript).toEqual(transcriptBefore);
+          }
+        } finally {
+          open.mockRestore();
+          reload.mockRestore();
+        }
+      });
+    },
+  );
+
   it.each([
     { nativePinned: false, observedHarness: "openclaw" },
     { nativePinned: true, observedHarness: "codex" },
@@ -239,6 +323,7 @@ describe("queued compaction successor ownership", () => {
             }
           : {}),
       };
+      setRuntimeConfigSnapshot(config, config);
       const entry: SessionEntry = {
         ...owner,
         updatedAt: 1,
@@ -531,6 +616,8 @@ describe("queued compaction successor ownership", () => {
               updatedAt: 2,
               activeWriterRunId: "replacement-writer",
             });
+          } else {
+            await patchSessionEntryCore(target(), () => ({ label: "renamed while compacting" }));
           }
           const entryBeforeAppend = structuredClone(
             loadSessionEntry({ ...target(), readConsistency: "latest" }),
@@ -559,6 +646,7 @@ describe("queued compaction successor ownership", () => {
             expect(after?.sessionId).toBe(sessionId);
             expect(after?.lifecycleRevision).toBe(owner.lifecycleRevision);
             expect(after?.activeWriterRunId).toBe(capturedWriter);
+            expect(after?.label).toBe("renamed while compacting");
             expect(outcome).toEqual({ written: true });
             expect(result).toMatchObject({ ok: true, compacted: true });
           }

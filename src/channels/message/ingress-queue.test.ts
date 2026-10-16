@@ -9,6 +9,7 @@ import {
   getNodeSqliteKysely,
 } from "../../infra/kysely-sync.js";
 import * as workerAdmission from "../../infra/sqlite-worker-operation-admission.js";
+import { sqliteWorkerOwnerProbe as probe } from "../../infra/sqlite-worker-owner-probe.test-support.js";
 import { withOpenClawStateDatabaseReadSnapshot } from "../../state/openclaw-state-db-readonly.js";
 import type { DB as OpenClawStateKyselyDatabase } from "../../state/openclaw-state-db.generated.js";
 import {
@@ -22,6 +23,7 @@ import {
   listChannelIngressQueueAccountIdsReadOnly,
 } from "./ingress-queue.js";
 import { createTestIngressQueue, useRetainedIngressState } from "./ingress-queue.test-helpers.js";
+import { channelIngressOperations } from "./ingress-queue.worker.js";
 
 type ChannelIngressTestDatabase = Pick<OpenClawStateKyselyDatabase, "channel_ingress_events">;
 
@@ -39,6 +41,46 @@ function openIngressStateDatabase(stateDir: string) {
 }
 
 describe("channel ingress queue", () => {
+  it("reads committed claim states without a transaction for single-statement inspections", async () => {
+    await withTempState(async (stateDir) => {
+      const queue = createTestIngressQueue<{ text: string }>(stateDir);
+      await queue.enqueue("pending", { text: "waiting" });
+      await queue.enqueue("claimed", { text: "active" });
+      await queue.enqueue("failed", { text: "rejected" });
+      await queue.claim("claimed");
+      await queue.fail("failed", { reason: "rejected" });
+      const database = openIngressStateDatabase(stateDir);
+      const context = {
+        open: () => database,
+        stateOptions: () => ({ path: database.path, env: { OPENCLAW_STATE_DIR: stateDir } }),
+      };
+      const queueName = JSON.stringify(["test", "account"]);
+      const transactionSql = vi.spyOn(database.db, "exec");
+      try {
+        for (const [status, ids] of [
+          ["claimed", ["claimed"]],
+          ["failed", ["failed"]],
+          ["unsettled", ["claimed", "pending"]],
+        ] as const) {
+          const rows = channelIngressOperations["channelIngress.list"](
+            { queueName, status, readOnly: false, orderBy: "id" },
+            context,
+          );
+          expect(rows.map((row) => row.event_id)).toEqual(ids);
+        }
+        const snapshot = channelIngressOperations["channelIngress.claimSnapshot"](
+          { queueName, blockedLaneKeys: [], deriveLaneKey: false },
+          context,
+        );
+        expect(snapshot.pending.map((row) => row.event_id)).toEqual(["pending"]);
+        expect(snapshot.claimed).toEqual([]);
+        expect(transactionSql).not.toHaveBeenCalled();
+      } finally {
+        transactionSql.mockRestore();
+      }
+    });
+  });
+
   it("rejects empty claim IDs through its async result", async () => {
     const queue = createChannelIngressQueue({ channelId: "invalid-input" });
     const invalid = { id: " ", claim: { token: "fixture" } };
@@ -109,19 +151,14 @@ describe("channel ingress queue", () => {
       const pending = await queue.listPending();
       const claims = await queue.listClaims();
       const controller = new AbortController();
-      const createAdmission = workerAdmission.createSqliteWorkerOperationAdmission;
       let reachedCommit = false;
-      const admission = vi
-        .spyOn(workerAdmission, "createSqliteWorkerOperationAdmission")
-        .mockImplementation((admit, attachment) =>
-          createAdmission((request, grant) => {
-            if (request.stage === "commit") {
-              reachedCommit = true;
-              controller.abort(new Error("account task retired"));
-            }
-            admit(request, grant);
-          }, attachment),
-        );
+      const admission = probe.admission(workerAdmission, (request, grant, admit) => {
+        if (request.stage === "commit") {
+          reachedCommit = true;
+          controller.abort(new Error("account task retired"));
+        }
+        admit(request, grant);
+      });
       try {
         await expect(queue.purge?.({ signal: controller.signal })).rejects.toThrow(
           "account task retired",
@@ -135,7 +172,7 @@ describe("channel ingress queue", () => {
     });
   });
 
-  it("deduplicates pending and completed ingress events", async () => {
+  it("returns durable values while competing ingress enqueues and claims deduplicate", async () => {
     await withIsolatedState(async (stateDir) => {
       const queue = createTestIngressQueue<
         { text: string },
@@ -153,26 +190,44 @@ describe("channel ingress queue", () => {
         .spyOn(sqliteQueries, "executeSqliteQueryTakeFirstSync")
         .mockImplementation(rejectHostQuery);
       try {
-        const accepted = await queue.enqueue(
-          "event-1",
-          { text: "first" },
-          { metadata: { source: "fixture" }, receivedAt: 50 },
-        );
-        const pending = await queue.enqueue("event-1", { text: "duplicate" });
-        const claim = await queue.claim("event-1", { ownerId: "worker" });
-        expect(claim?.id).toBe("event-1");
+        const [accepted, pending] = await Promise.all([
+          queue.enqueue(
+            "event-1",
+            { text: "first" },
+            { metadata: { source: "fixture" }, receivedAt: 50, laneKey: "chat-1" },
+          ),
+          queue.enqueue(
+            "event-1",
+            { text: "duplicate" },
+            { metadata: { source: "duplicate" }, receivedAt: 75, laneKey: "wrong-chat" },
+          ),
+        ]);
+        const record = {
+          payload: { text: "first" },
+          metadata: { source: "fixture" },
+          receivedAt: 50,
+          updatedAt: 100,
+          laneKey: "chat-1",
+          attempts: 0,
+        };
+        expect(accepted).toMatchObject({ kind: "accepted", duplicate: false, record });
+        expect(pending).toMatchObject({ kind: "pending", duplicate: true, record });
+
+        const [claim, competingClaim] = await Promise.all([
+          queue.claim("event-1", { ownerId: "worker" }),
+          queue.claim("event-1", { ownerId: "competing-worker" }),
+        ]);
+        expect(competingClaim).toBeNull();
+        expect(claim).toMatchObject({
+          ...record,
+          claim: { token: expect.any(String), ownerId: "worker", claimedAt: 100 },
+        });
         await queue.complete(expectDefined(claim, "claimed event"), {
           metadata: { handledBy: "worker" },
           completedAt: 150,
         });
         const completed = await queue.enqueue("event-1", { text: "late duplicate" });
 
-        expect(accepted.kind).toBe("accepted");
-        expect(pending.kind).toBe("pending");
-        if (pending.kind !== "pending") {
-          throw new Error(`Expected pending duplicate, got ${pending.kind}`);
-        }
-        expect(pending.record.payload).toEqual({ text: "first" });
         expect(completed).toEqual({
           kind: "completed",
           duplicate: true,
@@ -847,46 +902,44 @@ describe("channel ingress dead letters", () => {
         accountId: "default",
         stateDir,
       });
-      if (!queue.resubmit) {
-        throw new Error("Expected queue.resubmit");
-      }
+      const resubmit = expectDefined(queue.resubmit?.bind(queue), "resubmit");
 
       await queue.enqueue(
         "event-1",
         { text: "once" },
         { metadata: { source: "webhook" }, receivedAt: 10, laneKey: "chat-1" },
       );
-      const originalClaim = await queue.claim("event-1", { ownerId: "worker" });
-      if (!originalClaim) {
-        throw new Error("Expected a claimed ingress event");
-      }
-      await queue.fail(originalClaim, { reason: "handler-error", failedAt: 20 });
+      const originalClaim = expectDefined(await queue.claim("event-1"), "claimed event");
+      await queue.release(originalClaim, { lastError: "retryable", releasedAt: 15 });
+      const retriedClaim = expectDefined(await queue.claim("event-1"), "retried event");
+      await queue.fail(retriedClaim, { reason: "handler-error", failedAt: 20 });
 
-      await expect(queue.resubmit("event-1", { resubmittedAt: 30 })).resolves.toMatchObject({
+      await expect(resubmit("event-1", { resubmittedAt: 30 })).resolves.toEqual({
         kind: "resubmitted",
         record: {
           id: "event-1",
+          channelId: "line",
+          accountId: "default",
+          queueName: JSON.stringify(["line", "default"]),
           payload: { text: "once" },
           metadata: { source: "webhook" },
           receivedAt: 30,
+          updatedAt: 30,
           laneKey: "chat-1",
           attempts: 0,
         },
-        previous: { attempts: 0, failedAt: 20, reason: "handler-error" },
+        previous: expect.objectContaining({ attempts: 1, failedAt: 20, reason: "handler-error" }),
       });
-      await expect(queue.resubmit("event-1", { resubmittedAt: 31 })).resolves.toEqual({
+      await expect(resubmit("event-1", { resubmittedAt: 31 })).resolves.toEqual({
         kind: "active",
         status: "pending",
       });
 
-      const replay = await queue.claimNext({ ownerId: "replay-worker" });
+      const replay = expectDefined(await queue.claimNext(), "replay claim");
       expect(replay).toMatchObject({ id: "event-1", payload: { text: "once" } });
       await expect(queue.claimNext({ ownerId: "other-worker" })).resolves.toBeNull();
-      if (!replay) {
-        throw new Error("Expected the resubmitted event to be claimable");
-      }
       expect(await queue.complete(replay, { completedAt: 40 })).toBe(true);
-      await expect(queue.resubmit("event-1", { resubmittedAt: 50 })).resolves.toMatchObject({
+      await expect(resubmit("event-1", { resubmittedAt: 50 })).resolves.toMatchObject({
         kind: "completed",
         record: { id: "event-1", completedAt: 40 },
       });

@@ -11,12 +11,14 @@ import { hasModelFallbackStop } from "../agents/failover-error.js";
 import type { AgentMessage } from "../agents/runtime/index.js";
 import type { AgentSessionEvent } from "../agents/sessions/agent-session.js";
 import { parseReplyDirectives } from "../auto-reply/reply/reply-directives.js";
+import { createStreamingDirectiveAccumulator } from "../auto-reply/reply/streaming-directives.js";
 import {
   bindAgentAssistantSource,
   readAgentAssistantSource,
   type AgentAssistantSourceReceipt,
 } from "../infra/agent-events.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { jsonUtf8BytesOrInfinity } from "../infra/json-utf8-bytes.js";
 import {
   resolveAssistantMessagePhase,
   type AssistantPhase,
@@ -25,14 +27,6 @@ import { truncateUtf8Prefix } from "../utils/utf8-truncate.js";
 
 const MAX_LIVE_EVENT_BYTES = 32 * 1024;
 const MAX_LIVE_PREVIEW_BYTES = 4 * 1024;
-
-function liveEventBytes(event: WorkerLiveEvent): number {
-  try {
-    return Buffer.byteLength(JSON.stringify(event), "utf8");
-  } catch {
-    return Number.POSITIVE_INFINITY;
-  }
-}
 
 function truncateLiveText(value: string): string {
   if (
@@ -72,7 +66,7 @@ function boundLiveEvent(event: WorkerLiveEvent): WorkerLiveEvent {
   const textExceedsLimit =
     (event.kind === "assistant" || event.kind === "thinking") &&
     event.payload.text.length > MAX_LIVE_EVENT_BYTES;
-  if (!textExceedsLimit && liveEventBytes(event) <= MAX_LIVE_EVENT_BYTES) {
+  if (!textExceedsLimit && jsonUtf8BytesOrInfinity(event) <= MAX_LIVE_EVENT_BYTES) {
     return event;
   }
   let bounded: WorkerLiveEvent;
@@ -91,34 +85,27 @@ function boundLiveEvent(event: WorkerLiveEvent): WorkerLiveEvent {
     bounded = {
       kind: "thinking",
       payload: {
+        ...event.payload,
         text: truncateLiveText(event.payload.text),
         delta: truncateLiveText(event.payload.delta),
       },
     };
   } else if (event.kind === "tool") {
-    if (event.payload.phase === "start") {
-      bounded = {
-        kind: "tool",
-        payload: { ...event.payload, args: boundLiveValue(event.payload.args) },
-      };
-    } else if (event.payload.phase === "update") {
-      bounded = {
-        kind: "tool",
-        payload: {
-          ...event.payload,
-          partialResult: boundLiveValue(event.payload.partialResult),
-        },
-      };
-    } else {
-      bounded = {
-        kind: "tool",
-        payload: { ...event.payload, result: boundLiveValue(event.payload.result) },
-      };
-    }
+    bounded = {
+      kind: "tool",
+      payload: {
+        ...event.payload,
+        ...(event.payload.phase === "start"
+          ? { args: boundLiveValue(event.payload.args) }
+          : event.payload.phase === "update"
+            ? { partialResult: boundLiveValue(event.payload.partialResult) }
+            : { result: boundLiveValue(event.payload.result) }),
+      },
+    };
   } else {
     throw new Error(`worker live ${event.kind} event exceeds the protocol payload limit`);
   }
-  if (liveEventBytes(bounded) > MAX_LIVE_EVENT_BYTES) {
+  if (jsonUtf8BytesOrInfinity(bounded) > MAX_LIVE_EVENT_BYTES) {
     throw new Error(`worker live ${event.kind} event cannot fit the protocol payload limit`);
   }
   return bounded;
@@ -191,7 +178,7 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
         ...(stopReason ? { stopReason } : {}),
         ...(terminal.aborted ? { aborted: true } : {}),
         ...(replayInvalid ? { replayInvalid: true } : {}),
-        ...(!terminal.aborted && typeof terminal.promptError === "string"
+        ...(typeof terminal.promptError === "string"
           ? { error: redactLiveText(terminal.promptError) }
           : {}),
       },
@@ -202,7 +189,14 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
   let assistantSource: AgentAssistantSourceReceipt | undefined;
   let streamedThinking = "";
   const emitAssistantSnapshot = (message: AgentMessage, complete = false) => {
-    const { text, phase } = readAssistantSnapshot(message);
+    const { text: rawText, phase } = readAssistantSnapshot(message);
+    // Cancellation can synthesize an empty final after checked text was streamed.
+    if (complete && !rawText && message.role === "assistant" && message.stopReason === "aborted") {
+      return;
+    }
+    const protocol = createStreamingDirectiveAccumulator();
+    protocol.consume(rawText, { final: complete });
+    const text = protocol.sourceText;
     const mediaUrls = complete ? parseReplyDirectives(text).mediaUrls : undefined;
     if (text === streamedText && phase === streamedPhase && !mediaUrls?.length) {
       return;
@@ -263,7 +257,11 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
         streamedThinking = readAssistantThinking(event.message);
         enqueueLive({
           kind: "thinking",
-          payload: { text: streamedThinking, delta: event.assistantMessageEvent.delta },
+          payload: {
+            text: streamedThinking,
+            delta: event.assistantMessageEvent.delta,
+            itemId: assistantSource?.itemId,
+          },
         });
       }
       return;
@@ -274,7 +272,11 @@ export function createWorkerLiveRuntime(client: WorkerLiveClient) {
       if (finalThinking !== streamedThinking) {
         enqueueLive({
           kind: "thinking",
-          payload: { text: finalThinking, delta: finalThinking },
+          payload: {
+            text: finalThinking,
+            delta: finalThinking,
+            itemId: assistantSource?.itemId,
+          },
         });
       }
       return;
