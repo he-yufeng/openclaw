@@ -30,6 +30,22 @@ import {
 import { createClientHarness, createCodexTestModel } from "./test-support.js";
 import { startOrResumeThread as startOrResumeThreadImpl } from "./thread-lifecycle-run.js";
 
+export { createCodexRuntimePlanFixture } from "./test-support.js";
+
+export function createLifecycleRequest(
+  respond: (method: string, requestParams?: unknown) => Promise<unknown>,
+) {
+  return vi.fn((method: string, requestParams?: unknown) => {
+    if (method === "config/read") {
+      return Promise.resolve({ config: {}, origins: {}, layers: [] });
+    }
+    if (method === "configRequirements/read") {
+      return Promise.resolve({ requirements: null });
+    }
+    return respond(method, requestParams);
+  });
+}
+
 type NativeFixtureThread = {
   response: Record<string, unknown>;
   thread: Record<string, unknown>;
@@ -40,7 +56,7 @@ type NativeFixtureThread = {
 /** A synthetic native server, not a client mock: requests still cross the real wire and guards. */
 export function createCodexLifecycleHarness(options: {
   respond: (method: string, params?: unknown) => unknown;
-  persistedThreads?: string[];
+  persistedThreads?: Array<string | ReturnType<typeof nativeThreadStartResult>>;
   unsubscribe?: (threadId: string) => unknown;
 }) {
   const threads = new Map<string, NativeFixtureThread>();
@@ -65,8 +81,8 @@ export function createCodexLifecycleHarness(options: {
     };
     threads.set(response.thread.id, entry);
   };
-  for (const threadId of options.persistedThreads ?? []) {
-    remember(nativeThreadStartResult(threadId), false, false);
+  for (const thread of options.persistedThreads ?? []) {
+    remember(typeof thread === "string" ? nativeThreadStartResult(thread) : thread, false, false);
   }
   const dispatch = async (request: RpcRequest) => {
     const params = isJsonObject(request.params) ? request.params : {};
@@ -110,6 +126,11 @@ export function createCodexLifecycleHarness(options: {
         (response.status === "unsubscribed" || response.status === "notSubscribed")
       ) {
         current.subscribed = false;
+        current.loaded = false;
+        harness.send({
+          method: "thread/status/changed",
+          params: { threadId, status: { type: "notLoaded" } },
+        });
       }
       return response;
     }
@@ -117,8 +138,7 @@ export function createCodexLifecycleHarness(options: {
       if (!current) {
         throw new Error(`Unseeded synthetic native resume: ${threadId}`);
       }
-      // Stock 0.151.0 retains an unsubscribed loaded cache entry. Full resume overrides
-      // trigger teardown only when no subscriber can still observe that session.
+      // External native servers may retain unsubscribed idle threads until resume.
       if (
         current.loaded &&
         !current.subscribed &&
@@ -481,17 +501,6 @@ export async function writeNativeCatalogFixture(
   );
 }
 
-export function disabledMcpServerStatus(name: string) {
-  return {
-    name,
-    serverInfo: null,
-    tools: {},
-    resources: [],
-    resourceTemplates: [],
-    authStatus: "unsupported",
-  };
-}
-
 export function createAppServerOptions(): CodexAppServerRuntimeOptions {
   return {
     start: {
@@ -562,27 +571,6 @@ export function setCodexTestModelSupportsTools(
     ...params.model,
     compat: { ...params.model.compat, supportsTools },
   } as EmbeddedRunAttemptParams["model"] & { compat: { supportsTools: boolean } };
-}
-
-export function createCodexRuntimePlanFixture(): NonNullable<
-  EmbeddedRunAttemptParams["runtimePlan"]
-> {
-  return {
-    auth: {},
-    observability: {
-      resolvedRef: "codex/gpt-5.4-codex",
-      provider: "codex",
-      modelId: "gpt-5.4-codex",
-      harnessId: "codex",
-    },
-    prompt: {
-      resolveSystemPromptContribution: () => undefined,
-    },
-    tools: {
-      normalize: (tools: unknown[]) => tools,
-      logDiagnostics: () => undefined,
-    },
-  } as unknown as NonNullable<EmbeddedRunAttemptParams["runtimePlan"]>;
 }
 
 export function createThreadRequestAttemptParams(params: {

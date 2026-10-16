@@ -9,6 +9,7 @@ import {
 } from "../commands/backup-verify-manifest.js";
 import { createDoctorRehearsalDatabaseCoverage } from "../commands/doctor-rehearsal-databases.js";
 import { createConfigIO } from "../config/io.factory.js";
+import { resolveConfigWidePluginMetadataSnapshotAsync } from "../config/io.plugin-metadata.js";
 import { resolveConfigPath, resolveStateDir } from "../config/paths.js";
 import type { PluginDoctorMigrationBackupWarning } from "../plugins/doctor-contract-module.js";
 import { preparePluginDoctorMigrationBackupResources } from "../plugins/doctor-contract-registry.js";
@@ -55,6 +56,7 @@ import { createUpdateDatabaseBackup } from "./update-database-backup.js";
 import { readUpdateDatabaseGenerations } from "./update-database-generations.js";
 import type { UpdateRecoveryCaptureAcquisition } from "./update-recovery-capture-acquisition.js";
 import { hasPendingUpdateRecoverySeal } from "./update-recovery-capture-seal.js";
+import { canonicalEntryPath } from "./update-recovery-path.js";
 import { readUpdateRunDriver, type UpdateRunDriver } from "./update-run-driver.js";
 import { getUpdateRunAsync } from "./update-run-reader.js";
 
@@ -88,14 +90,6 @@ function within(candidate: string, root: string): boolean {
   return (
     relative === "" ||
     (!path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`))
-  );
-}
-
-function canonicalEntryPath(value: string): string {
-  const absolute = path.resolve(value);
-  return path.join(
-    resolvePathViaExistingAncestorSync(path.dirname(absolute)),
-    path.basename(absolute),
   );
 }
 
@@ -234,21 +228,32 @@ export function captureUpdateRecoveryBaseline(params: {
       configPaths.add(declare(file.sourcePath, "file"));
       configPaths.add(declare(file.canonicalPath, "file"));
     }
+    const collect = async () => {
+      const plugins = await preparePluginDoctorMigrationBackupResources({
+        config: snapshot.sourceConfig,
+        env,
+        stateDir,
+        warnings,
+        requireLocalResources: true,
+        ...(snapshot.sourceConfig.database?.engine === "postgres"
+          ? {
+              manifestRegistry: (
+                await resolveConfigWidePluginMetadataSnapshotAsync({
+                  config: snapshot.sourceConfig,
+                  env,
+                  stateDir,
+                })
+              ).manifestRegistry,
+            }
+          : {}),
+      });
+      plugins.assertCurrent();
+      return plugins.resources;
+    };
     const collectResources = () =>
-      withOpenClawStateDatabaseReadSnapshot(
-        async () => {
-          const plugins = await preparePluginDoctorMigrationBackupResources({
-            config: snapshot.sourceConfig,
-            env,
-            stateDir,
-            warnings,
-            requireLocalResources: true,
-          });
-          plugins.assertCurrent();
-          return plugins.resources;
-        },
-        { env },
-      );
+      snapshot.sourceConfig.database?.engine === "postgres"
+        ? collect()
+        : withOpenClawStateDatabaseReadSnapshot(collect, { env });
     const declared = await collectResources();
     assertCurrent();
     for (const resource of declared) {
@@ -367,6 +372,8 @@ export function captureUpdateRecoveryBaseline(params: {
         additionalPaths: [...forcedSqlite],
         additionalFiles: [...files.keys()].filter((pathname) => !configPaths.has(pathname)),
         rehearsal,
+        // Capture is best effort; its callers continue and own the next-step guidance.
+        retryAdvice: false,
       });
       assertCurrent();
       const databasePaths = new Set([
@@ -487,23 +494,33 @@ export function captureUpdateRecoveryBaseline(params: {
       assertCurrent();
       const generations =
         params.acquisition?.mode === "maintenance-owner" &&
+        !databases.databases.some((entry) => entry.engine === "postgres") &&
         maintenanceOwnerMayReadGenerationsInProcess(sharedStatePath, databasePaths)
           ? readUpdateDatabaseGenerations([...databasePaths])
           : await readUpdateDatabaseGenerationsIsolated([...databasePaths], {
               env,
+              pluginOwners: databases.pluginOwners,
               signal: params.signal,
               timeoutMs: params.timeoutMs,
               acquisition: params.acquisition,
+              retryAdvice: false,
             });
-      if (
-        [...databasePaths].some(
-          (pathname) =>
-            !Object.hasOwn(databases.sourceGenerations, pathname) ||
-            databases.sourceGenerations[pathname] !== generations[pathname],
-        )
-      ) {
+      const unverified = [...databasePaths].flatMap((pathname): [string, string][] =>
+        !Object.hasOwn(databases.sourceGenerations, pathname)
+          ? [[pathname, "no stable generation was recorded during its snapshot."]]
+          : databases.sourceGenerations[pathname] !== generations[pathname]
+            ? [[pathname, "generation changed after its snapshot."]]
+            : [],
+      );
+      if (unverified.length) {
         throw new Error(
-          "Original database generation changed or could not be verified; capture is unsealed.",
+          [
+            "Original database generation changed or could not be verified; capture is unsealed.",
+            ...unverified.map(([pathname, reason]) => `${pathname}: ${reason}`),
+            ...databases.warnings.filter((warning) =>
+              unverified.some(([pathname]) => warning.includes(pathname)),
+            ),
+          ].join("\n"),
         );
       }
       for (const [pathname, before] of observed) {

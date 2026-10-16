@@ -212,13 +212,72 @@ describe("sessions page managed roster", () => {
 });
 
 describe("Sessions page typing ownership", () => {
-  it.each([
-    { timing: "queued", resubscribe: true, hidden: false },
-    { timing: "timer", resubscribe: false, hidden: false },
-    { timing: "unsubscribed", resubscribe: true, hidden: true },
-  ])(
-    "retires $timing event work while unobserved and catches up on resubscribe=$resubscribe hidden=$hidden",
-    async ({ timing, resubscribe, hidden }) => {
+  it.each(["click", "Escape"])(
+    "retires selected rows and stale requests when clearing via %s",
+    async (action) => {
+      vi.useFakeTimers();
+      const { page, requests, pending, input, edit, cleanup } = await mountTypingPage();
+      try {
+        const limit = page.querySelector<HTMLInputElement>(".session-filter-input--limit")!;
+        limit.value = "25";
+        limit.dispatchEvent(new Event("input", { bubbles: true }));
+        await vi.advanceTimersByTimeAsync(0);
+        pending.at(-1)!.resolve(result("agent:main:limited"));
+        await vi.advanceTimersByTimeAsync(0);
+        page.selectedSessions = new Map([["agent:main:limited", { key: "agent:main:limited" }]]);
+        await edit("older");
+        await vi.advanceTimersByTimeAsync(200);
+        const oldRequest = pending.at(-1)!;
+        await page.updateComplete;
+        input().focus();
+        if (action === "click") {
+          const clear = page.querySelector<HTMLButtonElement>('button[aria-label="Clear search"]');
+          expect(clear).not.toBeNull();
+          clear!.click();
+        } else {
+          input().dispatchEvent(
+            new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
+          );
+        }
+        await page.updateComplete;
+        expect(input().value).toBe("");
+        expect(document.activeElement).toBe(input());
+        expect(page.selectedSessions.size).toBe(0);
+        expect(page.result).toBeNull();
+        const count = requests.length;
+        await vi.advanceTimersByTimeAsync(200);
+        expect(requests).toHaveLength(count);
+        oldRequest.resolve(result("agent:main:retired"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(page.textContent).not.toContain("agent:main:retired");
+        expect(requests).toHaveLength(count + 1);
+        expect(requests.at(-1)).not.toHaveProperty("search");
+        pending.at(-1)!.resolve(result("agent:main:cleared"));
+        await vi.advanceTimersByTimeAsync(0);
+        expect(input().value).toBe("");
+        expect(page.querySelector<HTMLInputElement>(".session-filter-input--limit")?.value).toBe(
+          "25",
+        );
+        expect(requests.at(-1)).toMatchObject({ limit: 25 });
+        expect(page.result?.sessions[0]?.key).toBe("agent:main:cleared");
+      } finally {
+        await cleanup();
+      }
+    },
+  );
+
+  it.each(
+    [
+      { timing: "queued", resubscribe: true, hidden: false },
+      { timing: "timer", resubscribe: false, hidden: false },
+      { timing: "unsubscribed", resubscribe: true, hidden: true },
+    ].flatMap((scenario) => [
+      { ...scenario, reason: "update" },
+      { ...scenario, reason: "create" },
+    ]),
+  )(
+    "retires $timing $reason event work while unobserved and catches up on resubscribe=$resubscribe hidden=$hidden",
+    async ({ timing, resubscribe, hidden, reason }) => {
       vi.useFakeTimers();
       const visibility = vi.spyOn(document, "visibilityState", "get");
       const active = createDeferred<SessionsListResult>();
@@ -238,16 +297,18 @@ describe("Sessions page typing ownership", () => {
       let unsubscribe = sessions.subscribeList(query, vi.fn());
       const updatedObserved = createDeferred();
       const loading = sessions.refreshList(query);
+      const changed = sessionChangedEvent("agent:main:changed");
+      changed.payload = { ...(changed.payload as Record<string, unknown>), reason };
       try {
         if (timing !== "unsubscribed") {
-          emitEvent(sessionChangedEvent("agent:main:changed"));
+          emitEvent(changed);
           if (timing === "queued") {
             await vi.advanceTimersByTimeAsync(5_000);
           }
         }
         unsubscribe();
         if (timing === "unsubscribed") {
-          emitEvent(sessionChangedEvent("agent:main:changed"));
+          emitEvent(changed);
         }
         visibility.mockReturnValue("hidden");
         document.dispatchEvent(new Event("visibilitychange"));
@@ -274,6 +335,9 @@ describe("Sessions page typing ownership", () => {
           expect(filteredCalls).toBe(1);
           visibility.mockReturnValue("visible");
           document.dispatchEvent(new Event("visibilitychange"));
+          await vi.advanceTimersByTimeAsync(0);
+        } else if (reason === "create" && resubscribe) {
+          // Creation retains its priority through the old read and resubscription.
           await vi.advanceTimersByTimeAsync(0);
         } else if (!resubscribe || timing === "queued") {
           await vi.advanceTimersByTimeAsync(4_999);
@@ -384,13 +448,12 @@ describe("Sessions page typing ownership", () => {
       expect(vi.getTimerCount()).toBe(0);
     }
   });
-  it.each(["detach", "reconnect", "client", "context"])(
+  it.each(["detach", "reconnect", "client"])(
     "retires pending work on %s and starts the new owner's query without the old response",
     async (retirement) => {
       vi.useFakeTimers();
       const harness = await mountTypingPage();
       const { page, input, edit, requests, pending, connection, client } = harness;
-      let replacementSessions: ReturnType<typeof createTestSessionCapability> | undefined;
       try {
         await edit("older");
         await vi.advanceTimersByTimeAsync(200);
@@ -404,21 +467,19 @@ describe("Sessions page typing ownership", () => {
         await vi.advanceTimersByTimeAsync(400);
         expect(requests).toHaveLength(2);
         if (retirement === "detach") {
-          document.body.append(page);
-        } else if (retirement === "context") {
-          const replacement = createGateway(client);
-          replacementSessions = createTestSessionCapability(replacement.gateway);
-          page.context = createContext(replacement.gateway, replacementSessions);
-          page.requestUpdate();
-        } else {
-          connection.emit({
-            phase: "connected",
-            client:
-              retirement === "client"
-                ? ({ request: client.request.bind(client) } as GatewayBrowserClient)
-                : client,
-          });
+          pending[0]!.resolve(result("agent:main:retired"));
+          await vi.advanceTimersByTimeAsync(0);
+          expect(requests).toHaveLength(2);
+          expect(page.isConnected).toBe(false);
+          return;
         }
+        connection.emit({
+          phase: "connected",
+          client:
+            retirement === "client"
+              ? ({ request: client.request.bind(client) } as GatewayBrowserClient)
+              : client,
+        });
         await page.updateComplete;
         await vi.advanceTimersByTimeAsync(0);
         expect(requests).toHaveLength(3);
@@ -440,7 +501,6 @@ describe("Sessions page typing ownership", () => {
         await vi.advanceTimersByTimeAsync(0);
         expect(page.result?.sessions[0]?.key).toBe("agent:main:final");
       } finally {
-        replacementSessions?.dispose();
         await harness.cleanup();
       }
     },
@@ -467,8 +527,6 @@ describe("Sessions page typing ownership", () => {
         .find((button) => button.textContent?.trim() === "Load more sessions")!
         .click();
       await vi.advanceTimersByTimeAsync(0);
-      page.context = { ...harness.context };
-      page.requestUpdate();
       await page.updateComplete;
       expect(requests).toHaveLength(2);
       expect(page.result?.sessions).toHaveLength(50);
@@ -501,14 +559,10 @@ describe("Sessions page typing ownership", () => {
       await edit("latest");
       setScope(null);
       await page.updateComplete;
-      const statusGroup = page.querySelector<HTMLElement & { value: string }>(
-        ".sessions-view-segment",
-      )!;
-      statusGroup.value = "archived";
-      statusGroup.dispatchEvent(new Event("change", { bubbles: true }));
+      const statusGroup = page.querySelector<HTMLElement>(".sessions-view-segment")!;
+      statusGroup.querySelector<HTMLInputElement>('input[value="archived"]')!.click();
       await page.updateComplete;
-      statusGroup.value = "all";
-      statusGroup.dispatchEvent(new Event("change", { bubbles: true }));
+      statusGroup.querySelector<HTMLInputElement>('input[value="all"]')!.click();
       await page.updateComplete;
       expect(requests).toHaveLength(2);
       expect(page.result).toBeNull();

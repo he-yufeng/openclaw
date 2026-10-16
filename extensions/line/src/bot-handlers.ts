@@ -540,9 +540,7 @@ async function handleMessageEvent(
       mentions: decision.mentions,
       buildContext: context.buildContext,
     });
-    if (!messageContext) {
-      logVerbose("line: skipping empty message");
-    } else {
+    if (messageContext) {
       await processMessage(messageContext, {
         // The config this event resolved to, not the one the monitor booted on.
         cfg: context.cfg,
@@ -609,7 +607,6 @@ async function handlePostbackEvent(
   context: LineHandlerContext,
 ): Promise<void> {
   const data = event.postback.data;
-  logVerbose(`line: received postback: ${data}`);
 
   const decision = await resolveLineEventAdmission(event, context);
   if (!decision) {
@@ -705,11 +702,8 @@ export async function handleLineWebhookEvents(
         );
         break;
       case "follow":
-      case "unfollow": {
-        const { userId } = getLineSourceInfo(event.source);
-        logVerbose(`line: user ${userId ?? "unknown"} ${event.type}ed`);
+      case "unfollow":
         break;
-      }
       case "join":
         await handleJoinEvent(event, context);
         break;

@@ -39,7 +39,6 @@ import {
 } from "./bot/delivery.js";
 import { createTelegramDraftStream } from "./draft-stream.js";
 import { recordOutboundMessageForPromptContext } from "./outbound-message-context.js";
-import { retireTelegramStreamPreviewAcrossAccounts } from "./preview-retirement.js";
 import { editMessageTelegram } from "./send.js";
 import { wasSentByBot } from "./sent-message-cache.js";
 
@@ -88,7 +87,6 @@ export type TelegramBotDeps = {
   emitTelegramMessageSentHooks?: typeof emitTelegramMessageSentHooks;
   editMessageTelegram?: typeof editMessageTelegram;
   recordOutboundMessageForPromptContext?: typeof recordOutboundMessageForPromptContext;
-  retireTelegramStreamPreviewAcrossAccounts?: typeof retireTelegramStreamPreviewAcrossAccounts;
   createChannelMessageReplyPipeline?: typeof createChannelMessageReplyPipeline;
 };
 
@@ -121,6 +119,5 @@ export const defaultTelegramBotDeps: TelegramBotDeps = {
   emitTelegramMessageSentHooks,
   editMessageTelegram,
   recordOutboundMessageForPromptContext,
-  retireTelegramStreamPreviewAcrossAccounts,
   createChannelMessageReplyPipeline,
 };

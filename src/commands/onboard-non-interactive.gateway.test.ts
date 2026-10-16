@@ -66,6 +66,12 @@ describe("logNonInteractiveOnboardingFailure", () => {
     });
 
     const parsed = JSON.parse(readCapturedJson()) as { hints: string[] };
+    expect(parsed).toMatchObject({
+      ok: false,
+      error: { type: "cli_error", message: failure.message },
+      phase: failure.phase,
+      message: failure.message,
+    });
     expect(parsed.hints.filter((hint) => hint.startsWith("Fix:"))).toEqual([callerFix]);
   });
 
@@ -214,6 +220,7 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
       expect(output).toHaveBeenCalledOnce();
       expect(JSON.parse(String(output.mock.calls[0]?.[0]))).toEqual({
         ok: false,
+        error: { type: "cli_error", message },
         phase: "options",
         message,
       });
@@ -581,6 +588,10 @@ describe("onboard (non-interactive): gateway and remote auth", () => {
     "uses managed daemon health timing on $platform",
     async ({ platform, healthTimeoutMs }) => {
       await withStateDir("state-local-daemon-health-", async (stateDir) => {
+        // Create native filesystem state before spoofing only the daemon timing platform.
+        const { initializeFreshDaemonRuntimePinMigration } =
+          await import("../infra/state-migrations.daemon-runtime-pins.js");
+        initializeFreshDaemonRuntimePinMigration(process.env);
         const captured = createOnboardGatewayTimeoutCapture();
         gatewayReachableState.mock = captured.mock;
 

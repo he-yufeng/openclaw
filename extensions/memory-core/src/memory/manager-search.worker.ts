@@ -1,14 +1,26 @@
-import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
-import { openOpenClawAgentDatabaseReadOnly } from "openclaw/plugin-sdk/memory-core-host-engine-knn";
+import type { EngineConnection } from "openclaw/plugin-sdk/database-engine-worker-runtime";
 import {
+  openOpenClawAgentDatabaseReadOnly,
+  retainOpenClawAgentDatabaseReadOnly,
+  loadSqliteVecExtension,
+} from "openclaw/plugin-sdk/memory-core-host-engine-knn";
+import {
+  isPostgresSqlConnection,
   readCuratedMemoryTriggerCandidates,
   readCuratedProjectMemoryCandidates,
+  MEMORY_INDEX_FTS_TABLE,
+  MEMORY_INDEX_STATE_TABLE,
 } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import {
+  readOpenClawAgentDatabaseIdentity,
+  withOpenClawAgentDatabaseReadOnly,
+} from "openclaw/plugin-sdk/sqlite-runtime";
 import {
   executeSqliteQuerySync,
   getNodeSqliteKysely,
-  withOpenClawAgentDatabaseReadOnly,
-} from "openclaw/plugin-sdk/sqlite-runtime";
+  getAdmittedSqliteSchemaFacts,
+  runSqliteDeferredTransactionSync,
+} from "openclaw/plugin-sdk/sqlite-worker-runtime";
 import { serveWorkerTasks } from "openclaw/plugin-sdk/worker-task-server";
 import { readMemoryOriginsInWorker } from "../memory-entry-origin-reads.js";
 import type {
@@ -18,28 +30,32 @@ import type {
 import { readMemoryForgetIndexInWorker } from "../memory-forget-index-read.js";
 import type { ForgetIndexPlan, ForgetIndexReadInput } from "../memory-forget-index-task.js";
 import {
+  requireMemorySearchCapability,
+  requireMemorySearchDatabase,
+} from "../memory-search-database.js";
+import type { MemoryDatabaseAdmission } from "./manager-database-admission.js";
+import { readMemoryIndex, type MemoryIndexReadCommand } from "./manager-index-read.js";
+import {
   readMemoryRetrievalIndexState,
   readMemoryRecallData,
+  readMemoryDatabaseFacts,
   type MemoryRecallData,
   type MemoryRecallQuery,
 } from "./manager-retrieval-read.js";
+import {
+  searchPostgresMemoryKeyword,
+  searchPostgresMemoryVector,
+} from "./manager-search-postgres.js";
+import type { MemoryKeywordWorkerQuery, MemoryVectorWorkerQuery } from "./manager-search-types.js";
 import { searchChunksByEmbedding } from "./manager-search-vector.js";
-import { searchKeyword, searchPathKeyword } from "./manager-search.js";
-import { assertMemoryShadowIdentity, type MemoryShadowConnection } from "./manager-shadow-task.js";
-import { loadMemorySourceFileState } from "./manager-source-state.js";
+import {
+  searchKeywordWithFallback,
+  type searchKeyword,
+  type searchPathKeyword,
+} from "./manager-search.js";
 import { inspectMemoryIndexPresenceInWorker } from "./manager-status-presence.js";
+import { collectMemoryStatusSnapshot, type MemoryStatusQuery } from "./manager-status-state.js";
 
-type KeywordParameters = Omit<Parameters<typeof searchKeyword>[0], "db">;
-type PathParameters = Omit<Parameters<typeof searchPathKeyword>[0], "db">;
-export type MemoryKeywordWorkerQuery = {
-  body: KeywordParameters;
-  path: PathParameters;
-  includeRecallMetadata?: boolean;
-};
-export type MemoryVectorWorkerQuery = Omit<
-  Parameters<typeof searchChunksByEmbedding>[0],
-  "db" | "signal"
->;
 export type MemorySearchWorkerInput =
   | ForgetIndexReadInput
   | MemoryOriginReadInput
@@ -49,10 +65,12 @@ export type MemorySearchWorkerInput =
       | { kind: "keyword"; query: MemoryKeywordWorkerQuery; includeIndexState?: boolean }
       | { kind: "vector"; query: MemoryVectorWorkerQuery }
       | { kind: "index-state" }
+      | { kind: "admission" }
+      | { kind: "status"; query: MemoryStatusQuery }
+      | { kind: "vector-load"; extensionPath?: string }
       | {
-          kind: "source-state";
-          query: Omit<Parameters<typeof loadMemorySourceFileState>[0], "db">;
-          fileIdentity: MemoryShadowConnection["fileIdentity"];
+          kind: "index-read";
+          command: MemoryIndexReadCommand;
         }
       | ({ kind: "recall-metadata" } & MemoryRecallQuery)
       | {
@@ -70,7 +88,10 @@ export type MemorySearchWorkerOutput =
   | { kind: "prewarm" }
   | { kind: "presence"; present: boolean }
   | { kind: "index-state"; state: ReturnType<typeof readMemoryRetrievalIndexState> }
-  | { kind: "source-state"; rows: ReturnType<typeof loadMemorySourceFileState> }
+  | { kind: "admission"; admission: MemoryDatabaseAdmission }
+  | { kind: "status"; snapshot: ReturnType<typeof collectMemoryStatusSnapshot> }
+  | { kind: "vector-load"; result: Awaited<ReturnType<typeof loadSqliteVecExtension>> }
+  | { kind: "index-read"; read: ReturnType<typeof readMemoryIndex> }
   | ({ kind: "recall-metadata" } & ReturnType<typeof readMemoryRecallData>)
   | {
       kind: "curated";
@@ -88,6 +109,35 @@ export type MemorySearchWorkerOutput =
 
 export type MemoryKeywordWorkerResult = Extract<MemorySearchWorkerOutput, { kind: "keyword" }>;
 
+/** Internal query entry; public admission stays closed until the remaining memory lifecycle is ported. */
+export function executeMemorySearchWorkerQuery(
+  database: EngineConnection,
+  request: { kind: "vector"; query: MemoryVectorWorkerQuery },
+  activation?: { postgres: "test-only" },
+): Promise<Extract<MemorySearchWorkerOutput, { kind: "vector" }>>;
+export function executeMemorySearchWorkerQuery(
+  database: EngineConnection,
+  request: { kind: "keyword"; query: MemoryKeywordWorkerQuery },
+  activation?: { postgres: "test-only" },
+): Promise<MemoryKeywordWorkerResult>;
+export async function executeMemorySearchWorkerQuery(
+  database: EngineConnection,
+  request:
+    | { kind: "vector"; query: MemoryVectorWorkerQuery }
+    | { kind: "keyword"; query: MemoryKeywordWorkerQuery },
+  activation?: { postgres: "test-only" },
+): Promise<MemoryKeywordWorkerResult | Extract<MemorySearchWorkerOutput, { kind: "vector" }>> {
+  if (activation?.postgres === "test-only" && isPostgresSqlConnection(database)) {
+    return request.kind === "vector"
+      ? { kind: "vector", rows: await searchPostgresMemoryVector(database, request.query) }
+      : { kind: "keyword", ...(await searchPostgresMemoryKeyword(database, request.query)) };
+  }
+  const db = requireMemorySearchDatabase(database);
+  return request.kind === "vector"
+    ? { kind: "vector", rows: await searchChunksByEmbedding({ ...request.query, db }) }
+    : { kind: "keyword", ...(await searchKeywordWithFallback({ ...request.query, db })) };
+}
+
 serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
   // SAFETY: The paired runtime constructs the private request union.
   const request = input as MemorySearchWorkerInput;
@@ -95,6 +145,7 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
     // A reply confirms module evaluation without opening an index or loading a provider.
     return { kind: "prewarm" };
   }
+  requireMemorySearchCapability();
   if (request.kind === "presence") {
     // This pre-manager probe also recognizes shipped memory-only databases.
     return { kind: "presence", present: inspectMemoryIndexPresenceInWorker(request.databasePath) };
@@ -102,17 +153,12 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
   if (request.kind === "forget-index-plan") {
     return { kind: request.kind, plan: await readMemoryForgetIndexInWorker(request) };
   }
-  if (
-    request.kind === "origin-rows" ||
-    request.kind === "origin-exists" ||
-    request.kind === "session-tombstones" ||
-    request.kind === "origin-index-keys"
-  ) {
+  if (request.kind === "origin-rows" || request.kind === "session-tombstones") {
     return readMemoryOriginsInWorker(request);
   }
   if (request.kind === "recall-metadata") {
     const result = withOpenClawAgentDatabaseReadOnly(
-      ({ db }) => readMemoryRecallData(db, request),
+      ({ db }) => readMemoryRecallData(requireMemorySearchDatabase(db), request),
       { agentId: request.agentId, path: request.databasePath },
     );
     if (!result.found) {
@@ -120,14 +166,21 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
     }
     return { kind: "recall-metadata", ...result.value };
   }
-  if (request.kind === "source-state") {
-    assertMemoryShadowIdentity(request.databasePath, request.fileIdentity);
-  }
-  const opened = openOpenClawAgentDatabaseReadOnly({
-    agentId: request.agentId,
-    path: request.databasePath,
-  });
+  const target = { agentId: request.agentId, path: request.databasePath };
+  const opened =
+    request.kind === "vector-load"
+      ? openOpenClawAgentDatabaseReadOnly(target, { allowExtension: true })
+      : retainOpenClawAgentDatabaseReadOnly(target);
   if (!opened.found) {
+    if (opened.reason === "database-missing" && request.kind === "admission") {
+      return { kind: "admission", admission: { hasIndex: false, ftsAvailable: false } };
+    }
+    if (opened.reason === "database-missing" && request.kind === "status") {
+      return {
+        kind: "status",
+        snapshot: collectMemoryStatusSnapshot(undefined, request.databasePath, request.query),
+      };
+    }
     if (
       opened.reason === "database-missing" &&
       (request.kind === "index-state" || (request.kind === "keyword" && request.includeIndexState))
@@ -144,11 +197,51 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
     }
     throw new Error(`Memory search database unavailable: ${opened.reason}`);
   }
-  const { db } = opened.database;
   try {
-    if (request.kind === "source-state") {
-      assertMemoryShadowIdentity(request.databasePath, request.fileIdentity);
-      return { kind: "source-state", rows: loadMemorySourceFileState({ db, ...request.query }) };
+    const db = requireMemorySearchDatabase(opened.database.db);
+    if (request.kind === "admission" || request.kind === "status") {
+      const schema = getAdmittedSqliteSchemaFacts(db);
+      if (!schema) {
+        throw new Error("Memory reader requires admitted schema facts");
+      }
+      const hasIndex = schema.tables.has(MEMORY_INDEX_STATE_TABLE);
+      if (request.kind === "admission") {
+        return {
+          kind: "admission",
+          admission: {
+            hasIndex,
+            ftsAvailable: hasIndex && schema.tables.has(MEMORY_INDEX_FTS_TABLE),
+            facts: hasIndex ? readMemoryDatabaseFacts(db) : undefined,
+            identity: readOpenClawAgentDatabaseIdentity(opened.database),
+            schemaVersion: schema.userVersion,
+          },
+        };
+      }
+      return {
+        kind: "status",
+        snapshot: collectMemoryStatusSnapshot(
+          hasIndex ? db : undefined,
+          request.databasePath,
+          request.query,
+        ),
+      };
+    }
+    if (request.kind === "vector-load") {
+      return {
+        kind: "vector-load",
+        result: await loadSqliteVecExtension({ db, extensionPath: request.extensionPath }),
+      };
+    }
+    if (request.kind === "index-read") {
+      const read = () => readMemoryIndex(db, request.command);
+      return {
+        kind: "index-read",
+        // Cache lookup can span provider identities and batches of hashes.
+        read:
+          request.command.type === "cache.read"
+            ? runSqliteDeferredTransactionSync(db, read)
+            : read(),
+      };
     }
     if (request.kind === "index-state") {
       return { kind: "index-state", state: readMemoryRetrievalIndexState(db) };
@@ -176,15 +269,10 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
       };
     }
     if (request.kind === "vector") {
-      return { kind: "vector", rows: await searchChunksByEmbedding({ ...request.query, db }) };
+      return await executeMemorySearchWorkerQuery(db, request);
     }
     const indexState = request.includeIndexState ? readMemoryRetrievalIndexState(db) : undefined;
-    const body = await searchKeyword({ ...request.query.body, db })
-      .then((rows) => ({ rows }))
-      .catch((error: unknown) => ({ rows: [], error: formatErrorMessage(error) }));
-    const path = await searchPathKeyword({ ...request.query.path, db })
-      .then((rows) => ({ rows }))
-      .catch((error: unknown) => ({ rows: [], error: formatErrorMessage(error) }));
+    const { body, path } = await executeMemorySearchWorkerQuery(db, request);
     const recallData = request.query.includeRecallMetadata
       ? readMemoryRecallData(db, {
           candidates: [...body.rows, ...path.rows],
@@ -199,8 +287,12 @@ serveWorkerTasks(async (input): Promise<MemorySearchWorkerOutput> => {
       ...(recallData ? { recallData } : {}),
     };
   } finally {
-    // The caller retains its published-generation lease until this close and reply,
-    // or until the pool confirms worker termination after cancellation.
-    opened.database.close();
+    // Release this request's borrow; the database owner retains the idle reader.
+    // Extension loading needs its own connection and must not change that reader.
+    if ("claim" in opened) {
+      opened.claim.release();
+    } else {
+      opened.database.close();
+    }
   }
 });

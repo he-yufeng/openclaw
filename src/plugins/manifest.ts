@@ -7,6 +7,7 @@ import { normalizeTrimmedStringList } from "../../packages/normalization-core/sr
 import { validatePluginCategories } from "../../packages/plugin-package-contract/src/index.js";
 import { matchRootFileOpenFailure } from "../infra/boundary-file-read.js";
 import { isRecord } from "../utils.js";
+import { loadPluginControlUiDeclaration } from "./control-ui-build-manifest.js";
 import { coerceDoctorSessionRouteStateOwners } from "./doctor-session-route-state-owner-types.js";
 import * as capabilityNormalizers from "./manifest-capability-normalizers.js";
 import { normalizeManifestCommandAliases } from "./manifest-command-aliases.js";
@@ -236,6 +237,18 @@ export function loadPluginManifest(
         ...(stateMigrations !== undefined ? { stateMigrations } : {}),
       } as PluginManifestDoctorContract)
     : undefined;
+  let modelCatalog: ReturnType<typeof normalizeModelCatalog>;
+  try {
+    modelCatalog = normalizeModelCatalog(raw.modelCatalog, {
+      ownedProviders: new Set([...providers, ...cliBackends]),
+    });
+  } catch {
+    return cacheResult({
+      ok: false,
+      error: "invalid plugin manifest modelCatalog ownership metadata",
+      manifestPath,
+    });
+  }
   const manifestBeforeDashboard = {
     id,
     configSchema,
@@ -255,15 +268,14 @@ export function loadPluginManifest(
       channels,
     ),
     providers,
+    ...(raw.managesOwnAvailability === true ? { managesOwnAvailability: true } : {}),
     providerCatalogEntry: normalizeOptionalString(raw.providerCatalogEntry),
     capabilityCatalogEntry:
       raw.capabilityCatalogEntry === undefined
         ? undefined
         : (normalizeOptionalString(raw.capabilityCatalogEntry) ?? ""),
     modelSupport: modelProviderNormalizers.normalizeManifestModelSupport(raw.modelSupport),
-    modelCatalog: normalizeModelCatalog(raw.modelCatalog, {
-      ownedProviders: new Set([...providers, ...cliBackends]),
-    }),
+    modelCatalog,
     modelPricing: modelProviderNormalizers.normalizeManifestModelPricing(raw.modelPricing, {
       ownedProviders: new Set(providers),
     }),
@@ -309,7 +321,12 @@ export function loadPluginManifest(
     return fail(`invalid plugin manifest dashboard: ${dashboardResult.error}`);
   }
   const uiCapabilities = validatePluginUiCapabilities(raw.uiCapabilities);
-  const controlUiResult = setupNormalizers.normalizeManifestControlUi(raw.controlUi);
+  const controlUiResult = loadPluginControlUiDeclaration({
+    rootDir,
+    controlUi: raw.controlUi,
+    rejectHardlinks,
+    rootRealPath,
+  });
   if (!controlUiResult.ok) {
     return fail(`invalid plugin manifest controlUi: ${controlUiResult.error}`);
   }

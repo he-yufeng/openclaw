@@ -13,6 +13,7 @@ import {
   normalizeRoleForGrouping,
   normalizeMessage,
 } from "../../lib/chat/message-normalizer.ts";
+import { hasVisiblePreparedActivity } from "../../lib/chat/tool-call-grouping.ts";
 import {
   extractToolCardsCached,
   extractToolPreview,
@@ -423,7 +424,8 @@ export function hasRenderableNormalizedMessage(
     normalized.content.length ||
     normalized.replyTarget ||
     label ||
-    (role === "user" && readTranscriptMediaEntries(message).length),
+    hasVisiblePreparedActivity(message) ||
+    readTranscriptMediaEntries(message).length,
   );
 }
 
@@ -550,11 +552,8 @@ export function insertChatItemsByTimestamp(items: ChatItem[], inserts: ChatProje
       };
     })
     .toSorted((a, b) => {
-      if (a.effectiveTimestamp == null && b.effectiveTimestamp == null) {
-        return a.index - b.index;
-      }
       if (a.effectiveTimestamp == null) {
-        return 1;
+        return b.effectiveTimestamp == null ? a.index - b.index : 1;
       }
       if (b.effectiveTimestamp == null) {
         return -1;

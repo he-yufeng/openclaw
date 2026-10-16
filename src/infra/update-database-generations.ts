@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import { sha256Hex } from "./crypto-digest.js";
+import type { DatabasePortPluginOwners } from "./database-engine/port-descriptor.js";
 import { hashFileDescriptorSync } from "./file-descriptor.js";
 import { openNodeSqliteDatabase } from "./node-sqlite.js";
 import { hasNodeErrorCode } from "./path-guards.js";
@@ -108,7 +109,10 @@ export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateD
         throw new Error(`SQLite WAL commit publication could not be verified: ${pathname}`);
       }
       // Checkpoints preserve iChange and the last committed frame checksum,
-      // including TRUNCATE, which resets frame count and salts.
+      // including TRUNCATE, which resets frame count and salts. Rebuilding the
+      // WAL index does not: the first native open of a family with no holder
+      // recovers -shm and resets iChange. Callers that must compare generations
+      // across a capture acquire sources without opening them natively.
       // A reversed write leaving identical bytes and write evidence is
       // indistinguishable from no write; restoring loses no later data.
       return [
@@ -126,4 +130,28 @@ export function readUpdateDatabaseGenerations(paths: readonly string[]): UpdateD
       ];
     }),
   );
+}
+
+export async function readUpdatePhysicalDatabaseGenerations(
+  paths: readonly string[],
+  pluginOwners?: DatabasePortPluginOwners,
+) {
+  const result = readUpdateDatabaseGenerations(paths);
+  const { readBackupEngine, fingerprintPostgresBackup } =
+    await import("../snapshot/database-backup.js");
+  const postgres = paths.filter(
+    (pathname) => result[pathname] !== null && readBackupEngine(pathname).engine === "postgres",
+  );
+  if (postgres.length) {
+    const { createConfigIO } = await import("../config/io.js");
+    const { config } = await createConfigIO({
+      observe: false,
+      pluginValidation: "core-only",
+      shellEnvFallback: "defer",
+    }).readConfigFileSnapshot();
+    for (const pathname of postgres) {
+      result[pathname] = await fingerprintPostgresBackup(pathname, config, pluginOwners);
+    }
+  }
+  return result;
 }

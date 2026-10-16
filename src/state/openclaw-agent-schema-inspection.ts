@@ -24,22 +24,18 @@ import {
   hasPendingCurrentVersionAgentDatabaseMigration,
 } from "./openclaw-agent-db-schema-helpers.js";
 import type { OpenClawAgentSchemaPreflightResult } from "./openclaw-database-preflight.types.js";
-import {
-  canReuseOpenClawAgentIntegrityVerification,
-  type readOpenClawAgentIntegrityVerification,
-} from "./openclaw-quarantine-store.js";
 import { OPENCLAW_SQLITE_BUSY_TIMEOUT_MS } from "./openclaw-state-db-contract.js";
 
 export type AgentSchemaInspectionInput = {
   pathname: string;
   agentId?: string;
+  env?: NodeJS.ProcessEnv;
   supportedVersion: number;
   verifyCurrentSchemaShape?: boolean;
   inspectOwnership?: boolean;
   requireStartupMigrationReadiness?: boolean;
   deferRuntimeIntegrity?: boolean;
-  startupIntegrityStateDir?: string;
-  startupIntegrityVerification?: ReturnType<typeof readOpenClawAgentIntegrityVerification>;
+  startupIntegrityVerification?: { verifiedAt: number };
 };
 
 export type AgentSchemaInspection = {
@@ -85,13 +81,7 @@ export function inspectAgentDatabaseSchema(
       const migrationPending =
         version !== input.supportedVersion ||
         hasPendingCurrentVersionAgentDatabaseMigration(database);
-      if (
-        canReuseOpenClawAgentIntegrityVerification(
-          input.pathname,
-          input.startupIntegrityVerification,
-          migrationPending,
-        )
-      ) {
+      if (input.startupIntegrityVerification !== undefined && !migrationPending) {
         inspection.integrityGateOutcome = "cached";
       } else if (input.deferRuntimeIntegrity && !migrationPending) {
         // The pending Gateway owner claims the live lease and validates before writes.
@@ -99,6 +89,9 @@ export function inspectAgentDatabaseSchema(
       } else {
         assertSqliteIntegrity(database, input.pathname);
         inspection.integrityGateOutcome = "healthy";
+      }
+      if (migrationPending && version === input.supportedVersion) {
+        inspection.preparationPending = true;
       }
       assertCanonicalAgentPersistenceVersion(database, input.pathname, version);
     }

@@ -1,5 +1,5 @@
 import {
-  ensureAuthProfileStore,
+  ensureAuthProfileStoreAsync,
   resolveAuthProfileEligibility,
   resolveProfileUnusableUntilForDisplay,
   type AuthProfileCredential,
@@ -60,7 +60,7 @@ export async function readCodexAccountAuthOverview(params: {
   }
   const config = params.ctx.config;
   const agentDir = params.agentDir;
-  const store = ensureAuthProfileStore(agentDir, {
+  const store = await ensureAuthProfileStoreAsync(agentDir, {
     allowKeychainPrompt: false,
     config,
   });
@@ -169,7 +169,7 @@ function describeInactiveProfileStatus(params: {
     return `rate-limited - resets in ${formatRelativeDuration(Math.max(60_000, blockedUntil - params.now))}`;
   }
   const unusableUntil = resolveProfileUnusableUntilForDisplay(params.store, params.profileId);
-  if (isActiveUntil(unusableUntil ?? undefined, params.now)) {
+  if (isActiveUntil(unusableUntil, params.now)) {
     return describeFailureStatus(stats?.disabledReason ?? stats?.cooldownReason, params.credential);
   }
   const eligibility = resolveAuthProfileEligibility({
@@ -314,6 +314,6 @@ function describeEligibilityStatus(
   return ELIGIBILITY_STATUS.get(reason) ?? "unavailable";
 }
 
-function isActiveUntil(value: number | undefined, now: number): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > now;
+function isActiveUntil(value: number | null | undefined, now: number): value is number {
+  return value != null && value > now;
 }

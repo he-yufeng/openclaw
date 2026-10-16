@@ -159,15 +159,6 @@ type TelegramMessageRetirementStore = {
   register(key: string, value: { retiredAt: number }): Promise<void>;
 };
 
-function telegramMessageCacheKey(params: {
-  scopeKey: string | undefined;
-  accountId: string;
-  chatId: string | number;
-  messageId: string;
-}) {
-  return `${telegramMessageCacheKeyPrefix(params)}${params.messageId}`;
-}
-
 function telegramMessageCacheKeyPrefix(params: {
   scopeKey: string | undefined;
   accountId: string;
@@ -529,10 +520,10 @@ export function createTelegramMessageCache(params?: {
         return null;
       }
       const store = await openRetainedStore();
-      const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId: id });
+      const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${id}`;
       return parseRetainedCacheNode(key, await store.lookup(key));
     }
-    const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId });
+    const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${messageId}`;
     const entry = messages.get(key);
     if (!entry) {
       return null;
@@ -554,7 +545,7 @@ export function createTelegramMessageCache(params?: {
         return false;
       }
       const store = await openRetainedStore();
-      const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId: id });
+      const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${id}`;
       return withKeyWriter(key, async () => {
         await markRetired(key);
         let observation = await store.observe(key);
@@ -577,12 +568,7 @@ export function createTelegramMessageCache(params?: {
         }
       });
     }
-    const key = telegramMessageCacheKey({
-      scopeKey,
-      accountId,
-      chatId,
-      messageId: String(messageId),
-    });
+    const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${String(messageId)}`;
     return withKeyWriter(key, async () => {
       await markRetired(key);
       const removed = messages.delete(key);
@@ -792,11 +778,11 @@ export function createTelegramMessageCache(params?: {
           throw new Error("Telegram history requires a native message ID");
         }
         const store = await openRetainedStore();
-        const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId: id });
+        const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${id}`;
         await updateRetainedCacheNode({ store, key, botUserId, update: withMedia });
         return;
       }
-      const key = telegramMessageCacheKey({ scopeKey, accountId, chatId, messageId });
+      const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${messageId}`;
       const node = withMedia(messages.get(key));
       messages.delete(key);
       messages.set(key, node);
@@ -905,18 +891,6 @@ function normalizeSessionBoundaryTimestamp(timestampMs?: number): number | undef
   return Math.floor(timestampMs / 1000) * 1000;
 }
 
-function isAtOrAfterSessionBoundaryTimestamp(
-  node: TelegramCachedMessageNode,
-  boundaryTimestampMs?: number,
-): boolean {
-  if (boundaryTimestampMs === undefined) {
-    return true;
-  }
-  return typeof node.timestamp !== "number" || !Number.isFinite(node.timestamp)
-    ? true
-    : node.timestamp >= boundaryTimestampMs;
-}
-
 /**
  * Hard cap on reply-chain nodes rendered into the prompt. Model-visible context
  * must be bounded; every producer that appends chain entries shares this ceiling
@@ -935,14 +909,12 @@ export async function buildTelegramReplyChain(params: {
   if (!replyMessage?.message_id || String(replyMessage.chat?.id) !== String(params.chatId)) {
     return [];
   }
+  const get = (messageId: string) =>
+    params.cache.get({ accountId: params.accountId, chatId: params.chatId, messageId });
   const maxDepth = params.maxDepth ?? TELEGRAM_REPLY_CHAIN_MAX_DEPTH;
   const visited = new Set<string>();
   const chain: TelegramCachedMessageNode[] = [];
-  let current: TelegramCachedMessageNode | null = await params.cache.get({
-    accountId: params.accountId,
-    chatId: params.chatId,
-    messageId: String(replyMessage.message_id),
-  });
+  let current: TelegramCachedMessageNode | null = await get(String(replyMessage.message_id));
   if (!current && params.msg.reply_to_message) {
     current = normalizeMessageNode(params.msg.reply_to_message, {
       threadId:
@@ -963,11 +935,7 @@ export async function buildTelegramReplyChain(params: {
     ) {
       break;
     }
-    const storedReply = await params.cache.get({
-      accountId: params.accountId,
-      chatId: params.chatId,
-      messageId: current.replyToId,
-    });
+    const storedReply = await get(current.replyToId);
     // Legacy retained roots can contain reply snapshots without separate ancestor rows.
     current =
       storedReply ??
@@ -997,18 +965,22 @@ export async function buildTelegramConversationContext(params: {
   const selected = new Map<string, TelegramConversationContextNode>();
   const replyTargetIds = new Set<string>();
   const sessionBoundaryTimestamp = normalizeSessionBoundaryTimestamp(params.minTimestampMs);
-  const addNode = (node: TelegramCachedMessageNode, flags?: { replyTarget?: boolean }) => {
+  const addNode = (node: TelegramCachedMessageNode, replyTarget = false) => {
     if (!node.messageId || node.messageId === params.messageId) {
       return false;
     }
-    if (!isAtOrAfterSessionBoundaryTimestamp(node, sessionBoundaryTimestamp)) {
+    if (
+      sessionBoundaryTimestamp !== undefined &&
+      typeof node.timestamp === "number" &&
+      Number.isFinite(node.timestamp) &&
+      !(node.timestamp >= sessionBoundaryTimestamp)
+    ) {
       return false;
     }
     const existing = selected.get(node.messageId);
-    const isReplyTarget = existing?.isReplyTarget === true || flags?.replyTarget === true;
     selected.set(node.messageId, {
       node: existing?.node ?? node,
-      isReplyTarget: isReplyTarget ? true : undefined,
+      isReplyTarget: existing?.isReplyTarget === true || replyTarget ? true : undefined,
     });
     return true;
   };
@@ -1022,7 +994,7 @@ export async function buildTelegramConversationContext(params: {
       before: params.replyTargetWindowSize,
       after: params.replyTargetWindowSize,
     })) {
-      addNode(node, { replyTarget: node.messageId === messageId });
+      addNode(node, node.messageId === messageId);
     }
   };
 
@@ -1041,7 +1013,7 @@ export async function buildTelegramConversationContext(params: {
   }
 
   for (const [index, node] of params.replyChainNodes.entries()) {
-    const added = addNode(node, { replyTarget: index === 0 });
+    const added = addNode(node, index === 0);
     if (added && index === 0 && node.messageId) {
       await addReplyTargetWindow(node.messageId);
     }
@@ -1057,7 +1029,7 @@ export async function buildTelegramConversationContext(params: {
       messageId,
     });
     if (node) {
-      addNode(node, { replyTarget: true });
+      addNode(node, true);
     }
   }
 

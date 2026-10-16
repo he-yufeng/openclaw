@@ -16,9 +16,9 @@ import * as reindexLock from "./manager-reindex-lock.js";
 
 const { closeAllMemorySearchManagers, getMemorySearchManager } = await import("./index.js");
 const embeddings = await import("./embeddings.js");
+const listCorpus = sessions.listSessionTranscriptCorpusEntriesForAgent;
 
 function observeCorpusPreparation() {
-  const listCorpus = sessions.listSessionTranscriptCorpusEntriesForAgent;
   const work: Array<ReturnType<typeof listCorpus>> = [];
   const spy = vi
     .spyOn(sessions, "listSessionTranscriptCorpusEntriesForAgent")
@@ -56,20 +56,38 @@ function expectNoStateDirectoryOpens(spy: MockInstance<typeof fsSync.mkdirSync>,
 }
 
 function observePublicationLifetime(events: string[]) {
-  const open = sqliteRuntime.openOpenClawAgentSqliteWorkerStore;
-  return vi
-    .spyOn(sqliteRuntime, "openOpenClawAgentSqliteWorkerStore")
+  const capture = sqliteRuntime.captureOpenClawAgentDatabaseExecution;
+  const retention = vi
+    .spyOn(sqliteRuntime, "captureOpenClawAgentDatabaseExecution")
+    .mockImplementationOnce((...args) => {
+      const execution = capture(...args);
+      events.push("retained");
+      const release = execution.release.bind(execution);
+      vi.spyOn(execution, "release").mockImplementation(async () => {
+        await release();
+        events.push("released");
+      });
+      return execution;
+    });
+  const open = sqliteRuntime.openOpenClawAgentSqliteWorkerStoreV2;
+  const publication = vi
+    .spyOn(sqliteRuntime, "openOpenClawAgentSqliteWorkerStoreV2")
     .mockImplementation(async (...args) => {
       const store = await open(...args);
-      const retention = args[2].input === undefined;
-      events.push(retention ? "retained" : "publication");
+      events.push("publication");
       const close = store.close.bind(store);
       vi.spyOn(store, "close").mockImplementation(async () => {
         await close();
-        events.push(retention ? "released" : "publication-closed");
+        events.push("publication-closed");
       });
       return store;
     });
+  return {
+    mockRestore() {
+      retention.mockRestore();
+      publication.mockRestore();
+    },
+  };
 }
 
 describe("memory preparation shutdown", () => {
@@ -185,15 +203,13 @@ describe("memory preparation shutdown", () => {
     try {
       await Promise.race([entered.promise, searching]);
       expect(acquisitions).toBe(2);
-      expect(events).toEqual(["retained", "publication", "publication-closed", "lock-released-1"]);
+      expect(events).toEqual(["retained", "lock-released-1"]);
       resume.resolve();
       expect(await searching).toEqual(
         expect.arrayContaining([expect.objectContaining({ path: "memory/2026-01-12.md" })]),
       );
       expect(events).toEqual([
         "retained",
-        "publication",
-        "publication-closed",
         "lock-released-1",
         "publication",
         "publication-closed",
@@ -238,7 +254,7 @@ describe("memory preparation shutdown", () => {
           ).resolves.toBe(true);
         } else {
           await publishSessionTranscriptUpdateByIdentity(target);
-          await vi.advanceTimersByTimeAsync(5_000);
+          await vi.advanceTimersByTimeAsync(30_000);
         }
         await barrier.entered;
         let closed = false;
@@ -252,13 +268,13 @@ describe("memory preparation shutdown", () => {
         await closing;
         mkdirSpy = vi.spyOn(fsSync, "mkdirSync");
         await Promise.all(corpus.work);
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(30_000);
         await setImmediate();
         expectNoStateDirectoryOpens(mkdirSpy, fixture.paths.stateDir);
       } finally {
         barrier.resume();
         await Promise.allSettled([...corpus.work, closing]);
-        await vi.advanceTimersByTimeAsync(5_000);
+        await vi.advanceTimersByTimeAsync(30_000);
         await Promise.allSettled(corpus.work);
         vi.useRealTimers();
         barrier.restore();

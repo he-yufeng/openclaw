@@ -11,7 +11,6 @@ export function createCodexAppServerMessageWriter(options: {
     message: RpcRequest | RpcResponse,
     onError?: (error: Error) => void,
     beforeWrite?: () => void,
-    onWriteResult?: (error?: Error | null) => void,
   ): void => {
     if (options.isClosed()) {
       return;
@@ -35,7 +34,6 @@ export function createCodexAppServerMessageWriter(options: {
       options.onNativeExecution();
     }
     child.stdin.write(`${frame}\n`, (error?: Error | null) => {
-      onWriteResult?.(error);
       if (error) {
         embeddedAgentLog.warn("codex app-server write failed", { error, id, method });
         onError?.(error);
@@ -172,8 +170,7 @@ export function readCodexCatalogDecodeRoute(line: Buffer): CodexCatalogDecodeRou
       for (;;) {
         index = line.indexOf(34, index + 1);
         if (index < 0) {
-          // A raw newline may precede the ID in a result-first envelope. Keep
-          // recovery off-main until the decoded ID can select its projection.
+          // Keep malformed-payload parsing and diagnostics off the main thread.
           return "unresolved";
         }
         let slash = index - 1;

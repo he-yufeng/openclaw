@@ -41,6 +41,7 @@ export type MSTeamsDebounceEntry = Awaited<ReturnType<typeof prepareMSTeamsDebou
 
 export async function prepareMSTeamsDebounceEntry(params: {
   context: MSTeamsTurnContext;
+  accountId: string;
   turnAdoptionLifecycle?: MSTeamsIngressLifecycle;
 }) {
   const activity = params.context.activity;
@@ -58,7 +59,11 @@ export async function prepareMSTeamsDebounceEntry(params: {
   const implicitMentionKinds: Array<"reply_to_bot"> =
     conversationId &&
     replyToId &&
-    (await wasMSTeamsMessageSentWithPersistence({ conversationId, messageId: replyToId }))
+    (await wasMSTeamsMessageSentWithPersistence({
+      conversationId,
+      messageId: replyToId,
+      accountId: params.accountId,
+    }))
       ? ["reply_to_bot"]
       : [];
 
@@ -133,12 +138,6 @@ export function assembleMSTeamsInboundFacts(entry: MSTeamsDebounceEntry) {
     rawBody: entry.text,
     advertisedMedia,
     quoteInfo: extractMSTeamsQuoteInfo(entry.attachments),
-    attachmentTypes: entry.attachments
-      .map((attachment) =>
-        typeof attachment.contentType === "string" ? attachment.contentType : undefined,
-      )
-      .filter(Boolean)
-      .slice(0, 3),
     htmlSummary: summarizeMSTeamsHtmlAttachments(entry.attachments),
     rawConversationId,
     conversationId,

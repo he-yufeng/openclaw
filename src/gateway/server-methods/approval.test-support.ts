@@ -8,7 +8,8 @@ import {
   type OpenClawStateDatabaseOptions,
 } from "../../state/openclaw-state-db.js";
 import { captureGatewayDeviceRevocation } from "../device-revocation.js";
-import { getOperatorApprovalDetailedInDatabase } from "../operator-approval-store.kernel.js";
+import type { ExecApprovalRecord } from "../exec-approval-manager.js";
+import { getOperatorApprovalDetailedInDatabase } from "../operator-approval-store.kernel.worker.js";
 import type { OperatorApprovalDatabase } from "../operator-approval-store.types.js";
 import { SharedGatewaySessionGenerationState } from "../server-shared-auth-generation.js";
 import { createOperatorWsClient } from "../server/ws-connection/authenticated-request-dispatch.test-support.js";
@@ -201,4 +202,13 @@ export async function handleApprovalResolve<
   };
   using authority = createApprovalRequestAuthority(options);
   return await handleOwnedApprovalResolve({ ...params, context, authority });
+}
+
+export function requestedEvent<TPayload>(record: ExecApprovalRecord<TPayload>) {
+  return {
+    id: record.id,
+    request: record.request,
+    createdAtMs: record.createdAtMs,
+    expiresAtMs: record.expiresAtMs,
+  };
 }

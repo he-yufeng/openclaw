@@ -1,8 +1,6 @@
-import { readSourceReplyDeliveryRuntime } from "../../../auto-reply/reply/source-reply-delivery-runtime.js";
 import type { ThinkLevel } from "../../../auto-reply/thinking.js";
 import { resolveProviderRuntimePluginHandle } from "../../../plugins/provider-hook-runtime.js";
 import { createStageTimingTracker } from "../../../shared/stage-timing.js";
-import { resolvePreparedRunAdmission } from "../../admitted-run-context.js";
 import type { AuthProfileStore } from "../../auth-profiles.js";
 import { resolvePreparedModelThinkingCompat } from "../../model-catalog-lookup.js";
 import type { PreparedModelRuntimeSnapshot } from "../../prepared-model-runtime.js";
@@ -32,7 +30,7 @@ import { resolveEmbeddedRunModelSetup } from "./model-setup.js";
 import type { RunEmbeddedAgentParams } from "./params.js";
 import { resolveInitialThinkLevel } from "./runtime-resolution.js";
 
-export async function prepareEmbeddedRunRuntime(input: {
+export async function prepareEmbeddedRunTransport(input: {
   assertCurrent: () => void;
   runParams: RunEmbeddedAgentInternalParams;
   sessionAdmission?: Parameters<typeof resolveEmbeddedRunModelSetup>[0]["sessionAdmission"];
@@ -50,6 +48,13 @@ export async function prepareEmbeddedRunRuntime(input: {
   ) => void;
   fallbackConfigured: boolean;
   preparedModelRuntime?: PreparedModelRuntimeSnapshot;
+  /** Refreshing transport cannot admit another model, harness, or credential source. */
+  refreshTransport?: {
+    provider: string;
+    modelId: string;
+    api: string;
+    harnessId: string;
+  };
 }) {
   const params = input.runParams;
   const modelSetup = await resolveEmbeddedRunModelSetup({
@@ -76,6 +81,7 @@ export async function prepareEmbeddedRunRuntime(input: {
     expectedHarnessArtifact,
     pinnedHarnessId,
     nativeModelOwned,
+    observedRoutes,
     nativeSessionRuntime,
     modelConfigProvider,
     model,
@@ -97,9 +103,6 @@ export async function prepareEmbeddedRunRuntime(input: {
       pinnedHarnessId,
     });
   let resolvedRuntimeModel = resolveEffectiveModel(model);
-  const buildContextTokenMeta = (contextTokens: number | undefined): { contextTokens?: number } =>
-    contextTokens === undefined ? {} : { contextTokens };
-  let outerContextTokenMeta = buildContextTokenMeta(resolvedRuntimeModel.contextTokenBudget);
   const models: EmbeddedRunAuthState["models"] = {
     runtime: model,
     effective: resolvedRuntimeModel.effectiveModel,
@@ -124,7 +127,6 @@ export async function prepareEmbeddedRunRuntime(input: {
         : resolveEffectiveModel(resolvedModel);
     models.runtime = resolvedModel;
     models.effective = resolvedRuntimeModel.effectiveModel;
-    outerContextTokenMeta = buildContextTokenMeta(resolvedRuntimeModel.contextTokenBudget);
   };
   const selectHarness = (
     candidate: typeof model,
@@ -141,6 +143,21 @@ export async function prepareEmbeddedRunRuntime(input: {
           requestStreamTransportOverrides,
           pinnedHarnessId,
         });
+  const assertRefreshTarget = () => {
+    const expected = input.refreshTransport;
+    if (
+      expected &&
+      (provider !== expected.provider ||
+        modelId !== expected.modelId ||
+        models.effective.api !== expected.api ||
+        agentHarness.id !== expected.harnessId ||
+        nativeModelOwned ||
+        requestStreamTransportOverrides)
+    ) {
+      throw new Error("Connection recovery cannot change the admitted model or harness.");
+    }
+  };
+  assertRefreshTarget();
   input.markStartupStage("model-resolution");
   input.notifyExecutionPhase("model_resolution", { provider, model: modelId });
 
@@ -157,10 +174,12 @@ export async function prepareEmbeddedRunRuntime(input: {
     workspaceDir: input.workspaceDir,
     requestStreamTransportOverrides,
     nativeModelOwned,
+    observedRoutes,
     nativeSessionRuntime,
     authStorage,
     modelRegistry,
     preparedModelRuntime: input.preparedModelRuntime,
+    requireConfiguredTransportAuth: input.refreshTransport !== undefined,
     getAgentHarness: () => agentHarness,
     setAgentHarness: (nextHarness) => {
       agentHarness = nextHarness;
@@ -172,6 +191,7 @@ export async function prepareEmbeddedRunRuntime(input: {
     selectHarnessForPreparedAttempts: selectHarness,
     markStage: (stage) => authStages?.mark(stage),
   });
+  assertRefreshTarget();
   const {
     attemptAuthProfileStore,
     lockedProfileId,
@@ -316,6 +336,7 @@ export async function prepareEmbeddedRunRuntime(input: {
     authStorage,
     profileCandidates,
     lockedProfileId,
+    authProfileBinding: params.authProfileBinding,
     initialThinkLevel,
     attemptedThinking,
     fallbackConfigured: input.fallbackConfigured,
@@ -446,26 +467,7 @@ export async function prepareEmbeddedRunRuntime(input: {
     prepared: true as const,
   };
 
-  const admittedRunContext = await resolvePreparedRunAdmission({
-    runId: params.runId,
-    runtimeKind: pluginHarnessOwnsTransport ? "plugin-harness" : "embedded",
-    admittedRunContext: params.admittedRunContext,
-    preparedRunAdmission: params.preparedRunAdmission,
-  });
-
-  const sourceReplyDeliveryRuntime = readSourceReplyDeliveryRuntime(params);
-  if (sourceReplyDeliveryRuntime?.origin === "runtime_default") {
-    // Route/auth/transport preparation owns the final harness selection. Publishing
-    // an earlier guess can either suppress a valid final or leak a private one.
-    const visibleReplies =
-      agentHarness.deliveryDefaults?.visibleReplies ??
-      agentHarness.deliveryDefaults?.sourceVisibleReplies;
-    const mode = visibleReplies === "message_tool" ? "message_tool_only" : "automatic";
-    sourceReplyDeliveryRuntime.applyPreparedMode(params, mode);
-    params.forceMessageTool = mode === "message_tool_only";
-  }
   return {
-    admittedRunContext,
     provider,
     modelId,
     requestedModelId,
@@ -513,7 +515,10 @@ export async function prepareEmbeddedRunRuntime(input: {
       contextTokenBudget: resolvedRuntimeModel.contextTokenBudget,
       authoredContextTokenCap: resolvedRuntimeModel.authoredContextTokenCap,
       contextWindowInfo: resolvedRuntimeModel.contextWindowInfo,
-      outerContextTokenMeta,
+      outerContextTokenMeta: {
+        contextTokens: resolvedRuntimeModel.contextTokenBudget,
+        contextTokensSource: resolvedRuntimeModel.contextTokensSource,
+      },
       activePreparedAuthPlan: authState.apiKeyInfo
         ? {
             ...activePreparedAuthPlan,

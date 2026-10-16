@@ -20,6 +20,7 @@ import {
 } from "../../../plugins/runtime.js";
 import { createDeferredCore } from "../../../shared/deferred.js";
 import { prepareSystemAgentRunAdmission } from "../../admitted-run-context.js";
+import { forgetPromptBuildDrainCacheForRun } from "../../plugin-turn-context.js";
 import {
   createAssistant,
   createAssistantResultStream,
@@ -32,10 +33,9 @@ import { leasePendingAgentSteeringItems } from "../../subagents/registry/subagen
 import type { ToolSearchCatalogRef } from "../../tool-search.js";
 import {
   clearEmbeddedSessionPromptStates,
-  getEmbeddedSessionPromptState,
+  retainEmbeddedSessionPromptState,
 } from "../session-prompt-state.js";
 import { prepareEmbeddedAttemptPromptAssembly } from "./attempt-prompt-build.js";
-import { forgetPromptBuildDrainCacheForRun } from "./attempt-prompt-helpers.js";
 import { submitEmbeddedAttemptPrompt } from "./attempt-prompt-submit.js";
 import { createPromptBuildToolPolicy } from "./attempt-prompt-support.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
@@ -144,7 +144,6 @@ async function fixture(
         };
   const policy = createPromptBuildToolPolicy({
     session,
-    readModelTools: () => session.agent.state.tools,
     effectiveTools: mode === "structured" ? tools : [...controlTools, tools[1]!],
     uncompactedEffectiveTools: tools,
     tools,
@@ -153,8 +152,10 @@ async function fixture(
     forceToolNames: ["message", "denied"],
   });
   const admission = prepareSystemAgentRunAdmission(cfg, runId, agentId, "prefilter-test");
+  const promptStateLease = retainEmbeddedSessionPromptState(runId);
   onTestFinished(() => {
     admission.close();
+    promptStateLease[Symbol.dispose]();
     forgetPromptBuildDrainCacheForRun(runId);
     clearEmbeddedSessionPromptStates([runId]);
   });
@@ -201,8 +202,8 @@ async function fixture(
     assembly: Awaited<ReturnType<typeof assemble>>,
     persistToolResultProjections: () => Promise<void>,
   ) => {
-    const state = getEmbeddedSessionPromptState(runId);
-    return submitEmbeddedAttemptPrompt({
+    const state = promptStateLease.state;
+    return await submitEmbeddedAttemptPrompt({
       attempt,
       activeSession: session,
       contextTokenBudget: 8000,

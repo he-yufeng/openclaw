@@ -1,6 +1,9 @@
 import type { ProgressCard, ProgressCardGetParams } from "@openclaw/gateway-protocol";
-import type { ReactiveController, ReactiveControllerHost } from "lit";
 import type { ApplicationGateway } from "../app/gateway.ts";
+import type {
+  SolidController,
+  SolidControllerHost,
+} from "../lib/reactive/solid-controller-host.ts";
 import {
   sessionProgressCardsForGateway,
   type SessionProgressCardStore,
@@ -9,10 +12,11 @@ import {
 type SessionProgressCardControllerOptions = {
   gateway: () => ApplicationGateway | null | undefined;
   target: () => ProgressCardGetParams | null | undefined;
+  onChange?: (target: ProgressCardGetParams, card: ProgressCard | null) => void;
 };
 
 /** Keeps one view on the gateway-scoped durable progress-card snapshot. */
-export class SessionProgressCardController implements ReactiveController {
+export class SessionProgressCardController implements SolidController {
   private connected = false;
   private store: SessionProgressCardStore | null = null;
   private stopUpdates: (() => void) | null = null;
@@ -22,10 +26,25 @@ export class SessionProgressCardController implements ReactiveController {
   private presentation?: ReturnType<SessionProgressCardController["readPresentation"]>;
 
   constructor(
-    private readonly host: ReactiveControllerHost,
+    private readonly host: SolidControllerHost,
     private readonly options: SessionProgressCardControllerOptions,
   ) {
     host.addController(this);
+  }
+
+  invalidate(target = this.target): void {
+    if (target) {
+      this.store?.invalidate(target);
+    }
+  }
+
+  hydrate(target: ProgressCardGetParams, card: ProgressCard | null): void {
+    const gateway = this.options.gateway();
+    if (!gateway) {
+      return;
+    }
+    sessionProgressCardsForGateway(gateway).hydrate(target, card);
+    this.synchronize();
   }
 
   get card(): ProgressCard | null {
@@ -105,6 +124,9 @@ export class SessionProgressCardController implements ReactiveController {
     const previous = this.presentation;
     const next = this.readPresentation();
     this.presentation = next;
+    if (this.target && next?.card !== undefined && next.card !== previous?.card) {
+      this.options.onChange?.(this.target, next.card);
+    }
     if (
       next &&
       (!previous ||
@@ -154,6 +176,9 @@ export class SessionProgressCardController implements ReactiveController {
       },
     });
     this.presentation = this.readPresentation();
+    if (this.target && this.presentation?.card !== undefined) {
+      this.options.onChange?.(this.target, this.presentation.card);
+    }
   }
 
   private release(): void {
