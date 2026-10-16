@@ -1,6 +1,7 @@
 import { normalizeAccountId } from "openclaw/plugin-sdk/account-id";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/plugin-entry";
+import { createRuntimeConfigReader } from "openclaw/plugin-sdk/runtime-config-snapshot";
 import { listXAccountIds, resolveDefaultXAccountId, resolveXAccount } from "./accounts.js";
 import {
   mergeXAllowlist,
@@ -10,6 +11,8 @@ import {
 } from "./allowlist.js";
 import { getXApi } from "./client.js";
 import { getXGuestStatus } from "./guests.js";
+import { openXSpend, XBudgetExceededError, type XSpendStatus } from "./spend.js";
+import { getXGitHubStatus } from "./verified-github.js";
 
 type Request = Parameters<Parameters<OpenClawPluginApi["registerGatewayMethod"]>[1]>[0];
 
@@ -18,6 +21,8 @@ export type XAllowlistSnapshot = {
   accounts: Array<{ accountId: string; username: string }>;
   entries: XEffectiveAllowlistEntry[];
   guests: Awaited<ReturnType<typeof getXGuestStatus>>;
+  spend: XSpendStatus;
+  verifiedFromGitHub?: Awaited<ReturnType<typeof getXGitHubStatus>>;
 };
 
 class XAdminError extends Error {
@@ -59,6 +64,7 @@ export function registerXAllowlistMethods(
   api: Pick<OpenClawPluginApi, "registerGatewayMethod" | "logger"> & {
     runtime: {
       state: Pick<OpenClawPluginApi["runtime"]["state"], "openKeyedStore" | "resolveStateDir">;
+      logging: Pick<OpenClawPluginApi["runtime"]["logging"], "getChildLogger">;
     };
   },
 ) {
@@ -84,9 +90,16 @@ export function registerXAllowlistMethods(
     const account = selectedAccountId
       ? resolveXAccount(cfg, selectedAccountId)
       : accountFor(request, cfg).account;
-    const [entries, guests] = await Promise.all([
+    const readConfig = createRuntimeConfigReader(cfg);
+    const [entries, guests, spend, verifiedFromGitHub] = await Promise.all([
       getAllowlist().list(account.accountId),
       getXGuestStatus(api.runtime, account, cfg),
+      openXSpend(
+        api.runtime,
+        account.accountId,
+        () => resolveXAccount(readConfig(), account.accountId).costLimits,
+      ).status(),
+      getXGitHubStatus(api.runtime, account),
     ]);
     assertAdmin(request);
     return {
@@ -97,6 +110,8 @@ export function registerXAllowlistMethods(
       })),
       entries: mergeXAllowlist(account.config.allowFrom ?? [], entries),
       guests,
+      spend,
+      verifiedFromGitHub,
     };
   };
   const handlers: Record<string, (request: Request) => Promise<unknown>> = {
@@ -173,6 +188,8 @@ export function registerXAllowlistMethods(
         } catch (error) {
           if (error instanceof XAdminError) {
             request.respond(false, undefined, { code: error.code, message: error.message });
+          } else if (error instanceof XBudgetExceededError) {
+            request.respond(false, undefined, { code: "UNAVAILABLE", message: error.message });
           } else {
             api.logger.error(
               `X replies operation failed (${method}): ${error instanceof Error ? error.message : String(error)}`,

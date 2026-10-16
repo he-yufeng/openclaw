@@ -403,7 +403,7 @@ append_clawhub_dispatch_args() { clawhub_dispatch_args=(); }
         child({ id: 93, status: "in_progress", jobs: [{ status: "in_progress" }] }),
       ],
     }).run(
-      `${source}cleanup_clawhub_children() { :; }\n${step("Clean up ClawHub children after failure").run}`,
+      `${source}cleanup_clawhub_children() { :; }\n${step("Clean up npm children after failure").run}`,
       { CHILD_PLUGIN_NPM_RUN_ID: "91", CHILD_OPENCLAW_NPM_RUN_ID: "93" },
     );
     expect(result.status, result.stderr).toBe(0);

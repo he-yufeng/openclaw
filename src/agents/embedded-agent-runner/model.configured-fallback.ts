@@ -7,7 +7,10 @@ import type { PluginMetadataSnapshotOwnerMaps } from "../../plugins/plugin-metad
 import { createProviderModelCatalogIdNormalizer } from "../../plugins/provider-model-routes.js";
 import type { ProviderRuntimeModel } from "../../plugins/provider-runtime-model.types.js";
 import { DEFAULT_CONTEXT_TOKENS } from "../defaults.js";
-import { resolveCatalogOwnedModelCompat } from "../model-compat-catalog.js";
+import {
+  modelTransportRoutesMatch,
+  resolveCatalogOwnedModelCompat,
+} from "../model-compat-catalog.js";
 import { attachModelProviderLocalService } from "../provider-local-service.js";
 import {
   attachModelProviderRequestRouteFacts,
@@ -45,7 +48,7 @@ export function buildConfiguredFallbackModel(params: {
   workspaceDir?: string;
   runtimeHooks?: ProviderRuntimeHooks;
 }): Model | undefined {
-  const { provider, modelId, cfg, workspaceDir, runtimeHooks } = params;
+  const { provider, modelId, cfg } = params;
   const providerConfig = resolveConfiguredProviderConfig(cfg, provider);
   const requestTimeoutMs = finiteSecondsToTimerSafeMilliseconds(providerConfig?.timeoutSeconds, {
     floorSeconds: true,
@@ -82,8 +85,7 @@ export function buildConfiguredFallbackModel(params: {
   const manifestAliasBaseUrl = normalizeOptionalString(manifestAliasTransport?.baseUrl);
   const staticCatalogBaseUrl = normalizeOptionalString(staticCatalogModel?.baseUrl);
   const fallbackTransport = resolveProviderTransport({
-    provider,
-    modelId,
+    ...params,
     api:
       normalizeResolvedTransportApi(configuredModel?.api) ??
       providerConfiguredApi ??
@@ -99,9 +101,6 @@ export function buildConfiguredFallbackModel(params: {
       providerConfiguredBaseUrl ??
       manifestAliasBaseUrl ??
       staticCatalogBaseUrl,
-    cfg,
-    workspaceDir,
-    runtimeHooks,
   });
   if (
     !hasConfiguredModelRouteSupport({
@@ -184,6 +183,12 @@ export function buildConfiguredFallbackModel(params: {
             }),
             contextWindow: resolvedFallbackContextWindow,
             contextTokens: configuredModel?.contextTokens ?? staticCatalogModel?.contextTokens,
+            parameterCount:
+              configuredModel?.parameterCount ??
+              (staticCatalogModel &&
+              modelTransportRoutesMatch(staticCatalogModel, fallbackTransport)
+                ? staticCatalogModel.parameterCount
+                : undefined),
             // maxTokens is a wire-level output cap, not a context-budget fallback.
             // Omit an unknown cap so strict providers can apply their own limit.
             ...(normalizedResolvedFallbackMaxTokens !== undefined

@@ -2,14 +2,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import {
-  createPluginStateKeyedStoreForTests,
-  resetPluginStateStoreForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
-import type {
-  OpenKeyedStoreOptions,
-  PluginDoctorStateMigrationContext,
-} from "openclaw/plugin-sdk/runtime-doctor-migrations";
+import { resetPluginStateStoreForTests } from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { getSessionEntry } from "openclaw/plugin-sdk/session-store-runtime";
 import {
   closeOpenClawAgentDatabasesAsync,
@@ -17,35 +10,14 @@ import {
   closeOpenClawStateDatabaseAsync,
 } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { stateMigrations } from "./doctor-contract-api.js";
+import { createDoctorContext } from "./doctor-contract-api.test-support.js";
+
+export { createDoctorContext };
 import {
   CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
   CODEX_APP_SERVER_BINDING_NAMESPACE,
   type StoredCodexAppServerBinding,
 } from "./src/app-server/session-binding.js";
-
-export function createDoctorContext(
-  env: NodeJS.ProcessEnv,
-  afterRegister?: () => Promise<void>,
-): PluginDoctorStateMigrationContext {
-  return {
-    openPluginStateKeyedStore<T>(options: OpenKeyedStoreOptions) {
-      const store = createPluginStateKeyedStoreForTests<T>("codex", {
-        ...options,
-        env: options.env ?? env,
-      });
-      return afterRegister
-        ? {
-            ...store,
-            async registerIfAbsent(...args: Parameters<typeof store.registerIfAbsent>) {
-              const registered = await store.registerIfAbsent(...args);
-              await afterRegister();
-              return registered;
-            },
-          }
-        : store;
-    },
-  };
-}
 
 export function openBindingStore(env: NodeJS.ProcessEnv) {
   return createDoctorContext(env).openPluginStateKeyedStore<StoredCodexAppServerBinding>({

@@ -1,4 +1,3 @@
-/** De-duplicates assistant reply payloads against message-tool sends on the same route. */
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
@@ -38,7 +37,6 @@ type MessagingToolDedupeRouteParams = {
   accountId?: string;
 };
 
-/** Removes media payload URLs already sent by message tools. */
 export function filterMessagingToolMediaDuplicates(params: {
   payloads: ReplyPayload[];
   sentMediaUrls: string[];
@@ -97,10 +95,9 @@ export function hasEnabledDeliveryOperation(payload: ReplyPayload): boolean {
 
 function normalizeProviderForComparison(value?: string): string | undefined {
   const trimmed = normalizeOptionalString(value);
-  if (!trimmed) {
-    return undefined;
-  }
-  return normalizeAnyChannelId(trimmed) || normalizeLowercaseStringOrEmpty(trimmed);
+  return trimmed
+    ? normalizeAnyChannelId(trimmed) || normalizeLowercaseStringOrEmpty(trimmed)
+    : undefined;
 }
 
 function normalizeTargetForDedupe(provider: string, target?: string): string | undefined {
@@ -141,7 +138,6 @@ function resolveOriginThreadIdForPayload(
   return originThreadId;
 }
 
-/** Finds message-tool sends that target the same channel/account/thread as the source reply. */
 function getMatchingMessagingToolReplyTargets(
   params: MessagingToolDedupeRouteParams,
 ): MessagingToolSend[] {
@@ -186,9 +182,8 @@ function getMatchingMessagingToolReplyTargets(
       threadId: originThreadId,
     };
     const targetRoute = {
-      channel: provider,
+      ...originRoute,
       to: targetTo,
-      accountId: routeAccount,
       threadId: target.threadId ?? (target.threadImplicit ? originThreadId : undefined),
     };
     if (channelRouteTargetsMatchExact({ left: originRoute, right: targetRoute })) {
@@ -214,20 +209,15 @@ function getMatchingMessagingToolReplyTargets(
   });
 }
 
-/** Resolves whether and how to dedupe final payloads against message-tool sends. */
 export function resolveMessagingToolPayloadDedupe(params: MessagingToolDedupeRouteParams) {
   const sentTargets = params.messagingToolSentTargets ?? [];
   const matchingTargets = getMatchingMessagingToolReplyTargets(params);
   const matchingRoute = matchingTargets.length > 0;
   const routeSentTexts = matchingTargets.flatMap((target) =>
-    typeof target.text === "string" && target.text.trim() ? [target.text] : [],
+    target.text?.trim() ? [target.text] : [],
   );
-  const routeSentMediaUrls = matchingTargets.flatMap((target) =>
-    Array.isArray(target.mediaUrls)
-      ? target.mediaUrls.filter(
-          (url): url is string => typeof url === "string" && Boolean(url.trim()),
-        )
-      : [],
+  const routeSentMediaUrls = matchingTargets.flatMap(
+    (target) => target.mediaUrls?.filter((url) => url.trim()) ?? [],
   );
   const allTargetsMatchRoute = matchingRoute && matchingTargets.length === sentTargets.length;
 

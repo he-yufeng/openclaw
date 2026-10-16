@@ -81,6 +81,7 @@ const currentPayload = activePayload.ref.deref();
             registries: retained.registries.filter(ref => ref.deref()).length,
             captured: retained.registries.length,
             nativeExports: retained.exports.filter(ref => ref.deref()).length,
+            currentExportAlive: retained.exports.at(-1).deref() !== undefined,
             controlCollected: retained.control.deref() === undefined,
             memory: process.memoryUsage(),
           }));
@@ -137,8 +138,10 @@ ${execution(PROVIDER_ID)}`,
           `const fs = require("node:fs");
 module.exports = { id: ${JSON.stringify(provider)}, register(api) {
   ${registration(provider)}
+  let normalization = 0;
   api.registerProvider({
     id: ${JSON.stringify(provider)}, label: "Scoped reuse fixture", auth: [],
+    normalizeResolvedModel: ({ model }) => ({ ...model, name: "Observed " + ++normalization }),
     catalog: { run(context) {
       ${execution(provider)}
       const auth = context.resolveProviderApiKey(${JSON.stringify(provider)});
@@ -261,6 +264,13 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
       expect(
         catalog.entries.filter((entry) => entry.provider === provider).map(({ id }) => id),
       ).toEqual([`auth-${key}`]);
+      // Catalog display and executable rows must share one provider observation.
+      expect(snapshot.readPublishedModels?.()?.get(provider)).toContainEqual(
+        expect.objectContaining({
+          id: `auth-${key}`,
+          name: catalog.entries.find((entry) => entry.provider === provider)?.name,
+        }),
+      );
       expect(
         getPreparedModelFullCatalogAuth(catalog)?.authStore.profiles[profileId(provider)],
       ).toMatchObject({ key });
@@ -289,9 +299,11 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
   const retained = JSON.parse(fs.readFileSync(path.join(fixture.root, "retention.json"), "utf8"));
   console.log("Retired catalog registries", JSON.stringify(retained));
   expect(retained.controlCollected).toBe(true);
-  // The auth-only base is replaced once for all known owners; both native exports stay rooted.
+  // The auth-only base is replaced once. Engines may collect the retired native export.
   expect(retained.captured).toBe(2);
-  expect(retained.nativeExports).toBe(retained.captured);
+  expect(retained.nativeExports).toBeGreaterThanOrEqual(1);
+  expect(retained.nativeExports).toBeLessThanOrEqual(retained.captured);
+  expect(retained.currentExportAlive).toBe(true);
   expect(retained.registries).toBe(1);
   const warmedRegistrations = registrations();
   const warmedFootprint = readCatalogCaptureFootprint(captureRoot);
@@ -330,7 +342,7 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
     JSON.parse(fs.readFileSync(path.join(fixture.root, "retention.json"), "utf8")),
   ).toMatchObject({
     captured: 2,
-    nativeExports: 2,
+    currentExportAlive: true,
     registries: 1,
     controlCollected: true,
   });

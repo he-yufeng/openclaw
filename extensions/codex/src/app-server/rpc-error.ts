@@ -1,7 +1,25 @@
-import { coerceErrorMessage } from "openclaw/plugin-sdk/error-runtime";
+import { coerceErrorMessage, formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { isJsonObject, type JsonValue } from "./protocol.js";
 
 export const CODEX_APP_SERVER_OVERLOADED_ERROR_CODE = -32_001;
+
+export class CodexCatalogResponseTooLargeError extends Error {
+  constructor() {
+    super("Codex catalog response exceeds 8 MiB; reduce oversized thread previews and retry.");
+    this.name = "CodexCatalogResponseTooLargeError";
+  }
+
+  /** Transport and background reconciliation preserve the local rejection as a cause. */
+  static fromError(error: unknown): CodexCatalogResponseTooLargeError | undefined {
+    let current = error;
+    for (let depth = 0; current instanceof Error && depth < 8; depth++, current = current.cause) {
+      if (current instanceof CodexCatalogResponseTooLargeError) {
+        return current;
+      }
+    }
+    return undefined;
+  }
+}
 
 /** A scoped guard rejected the request before a physical write. */
 export class CodexAppServerScopedRequestRejectedError extends Error {
@@ -25,7 +43,9 @@ export class CodexAppServerRpcError extends Error {
   readonly method: string;
 
   constructor(error: { code?: number; message: string; data?: JsonValue }, method: string) {
-    super(formatCodexAppServerRpcErrorMessage(error, method));
+    const message = error.message || `${method} failed`;
+    const detail = readCodexAppServerRpcReloginDetail(error.data);
+    super(detail && !message.includes(detail) ? `${message}: ${detail}` : message);
     this.name = "CodexAppServerRpcError";
     this.code = error.code;
     this.data = error.data;
@@ -42,15 +62,6 @@ export function isCodexThreadReadMissingError(error: unknown, threadId: string):
     error.code === -32_600 &&
     error.message === `thread not loaded: ${threadId}`
   );
-}
-
-function formatCodexAppServerRpcErrorMessage(
-  error: { message: string; data?: JsonValue },
-  method: string,
-): string {
-  const message = error.message || `${method} failed`;
-  const detail = readCodexAppServerRpcReloginDetail(error.data);
-  return detail && !message.includes(detail) ? `${message}: ${detail}` : message;
 }
 
 function readCodexAppServerRpcReloginDetail(data: JsonValue | undefined): string | undefined {
@@ -86,5 +97,13 @@ export class CodexAppServerLocalRequestCancellationError extends Error {
 export function isCodexAppServerOverloadError(error: unknown): error is CodexAppServerRpcError {
   return (
     error instanceof CodexAppServerRpcError && error.code === CODEX_APP_SERVER_OVERLOADED_ERROR_CODE
+  );
+}
+
+export function isMissingCodexParentThreadError(error: unknown): boolean {
+  const message = formatErrorMessage(error);
+  return (
+    message.includes("no rollout found for thread id") ||
+    message.includes("includeTurns is unavailable before first user message")
   );
 }

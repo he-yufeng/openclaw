@@ -422,7 +422,7 @@ describe("provider local service", () => {
     await expect(
       ensureModelProviderLocalService(model, { Authorization: `Bearer ${unknown}` }),
     ).rejects.toThrow(
-      `Secret sentinel ${unknown} is not registered in this process; refusing to probe local model provider health`,
+      `Secret sentinel ${unknown} is not registered in this process; refusing to check local model provider health`,
     );
   });
 
@@ -431,6 +431,8 @@ describe("provider local service", () => {
     const sockets = new Set<net.Socket>();
     const server = net.createServer((socket) => {
       sockets.add(socket);
+      // Consume the request so graceful close is observable; keep the response unfinished.
+      socket.resume();
       socket.on("error", () => undefined);
       socket.on("close", () => {
         sockets.delete(socket);

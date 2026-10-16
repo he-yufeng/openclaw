@@ -72,7 +72,7 @@ The `models` root also owns global model-catalog behavior.
 - `models.mode`: provider catalog behavior (`merge` or `replace`).
 - `models.providers`: custom provider map keyed by provider id.
 - `models.providers.*.localService`: optional on-demand process manager for
-  local model servers. OpenClaw probes the configured health endpoint, starts
+  local model servers. OpenClaw checks the configured health endpoint, starts
   the absolute `command` when needed, waits for readiness, then sends the model
   request. See [Local model services](/gateway/local-model-services).
 - `models.catalogRefresh.enabled`: controls the hosted model catalog refresh
@@ -87,6 +87,17 @@ The `models` root also owns global model-catalog behavior.
   is prepared and published as one model-and-pricing generation without a
   Gateway restart. Readers retain the current generation until preparation
   succeeds; a release whose bundled catalog is newer always wins.
+
+Unknown input modalities are dropped from individual remote model rows with a
+warning naming the row. Malformed model rows are skipped without rejecting the
+other models; required bundle and provider fields remain strictly validated.
+If no valid model rows remain, the download is rejected and the previous catalog
+stays active. Pricing-only v1 catalogs without model providers remain supported.
+Both hosted catalog formats keep the `text`, `image`, and `document` input
+modalities accepted by released clients. Bundled model metadata can include
+newer modalities.
+Rows with only unsupported input modalities are omitted rather than exposed as
+text models; defaults and recommendations do not reference omitted hosted rows.
 
 V2 includes pricing in each model row. Unknown or unavailable pricing does not
 mean a model is free. Models outside the catalog, such as older model IDs or

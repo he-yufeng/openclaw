@@ -25,7 +25,6 @@ import {
   type CodexDynamicToolSpec,
   type CodexThreadResumeParams,
   type CodexThreadStartParams,
-  type CodexTurnEnvironmentParams,
   type JsonObject,
   type JsonValue,
 } from "./protocol.js";
@@ -153,6 +152,10 @@ export function buildCodexThreadConfiguration(
   params: CodexThreadConfigurationContext,
   options: CodexThreadConfigurationOptions,
 ) {
+  const config = buildCodexRuntimeThreadConfigForRun(params, options.config, {
+    ...options,
+    directOnlyToolNamespaces: resolveDirectOnlyToolNamespaces(options.dynamicTools),
+  });
   return {
     ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
     ...(options.appServer.sessionRoot
@@ -164,30 +167,30 @@ export function buildCodexThreadConfiguration(
     ...(options.appServer.serviceTier !== undefined
       ? { serviceTier: options.appServer.serviceTier }
       : {}),
-    config: buildCodexRuntimeThreadConfigForRun(params, options.config, {
-      ...options,
-      directOnlyToolNamespaces: resolveDirectOnlyToolNamespaces(options.dynamicTools),
-    }),
+    config,
     // Catalog-owned collaboration messages replace caller collaboration instructions
     // (codex-rs/core/src/context/world_state/collaboration_mode.rs), so refreshable
     // workspace instructions ride the thread developer carrier after the immutable generic policy.
     developerInstructions: joinPresentSections(
       options.developerInstructions ??
-        buildDeveloperInstructions(params, { dynamicTools: options.dynamicTools }),
+        buildDeveloperInstructions(params, {
+          dynamicTools: options.dynamicTools,
+          nativeCodeModeOnlyEnabled: config["features.code_mode_only"] === true,
+        }),
       options.refreshableInstructions,
     ),
   };
 }
 
-export function buildThreadStartParams(
+export async function buildThreadStartParams(
   params: AgentHarnessSessionRuntimeParamsV1,
   options: CodexThreadConfigurationOptions & { cwd: string; dynamicTools: CodexDynamicToolSpec[] },
-): CodexThreadStartParams {
-  const resolvedModelProvider = resolveCodexAppServerModelProvider({
+): Promise<CodexThreadStartParams> {
+  const resolvedModelProvider = await resolveCodexAppServerModelProvider({
     ...params,
     homeScope: options.appServer.start.homeScope,
   });
-  const modelSelection = resolveCodexAppServerRequestModelSelection({
+  const modelSelection = await resolveCodexAppServerRequestModelSelection({
     ...params,
     homeScope: options.appServer.start.homeScope,
     model: options.model ?? params.modelId,
@@ -203,9 +206,11 @@ export function buildThreadStartParams(
     personality: CODEX_NATIVE_PERSONALITY_NONE,
     serviceName: "OpenClaw",
     threadSource: "openclaw",
-    ...resolveCodexThreadEnvironmentSelection(
-      params.requireWorkspaceOnly === true ? { nativeCodeModeEnabled: false } : options,
-    ),
+    ...(params.requireWorkspaceOnly === true || options.nativeCodeModeEnabled === false
+      ? { environments: [] }
+      : options.environmentSelection
+        ? { environments: options.environmentSelection }
+        : {}),
     // Codex 0.146 accepts canonical typed function and namespace specs natively.
     dynamicTools: [...options.dynamicTools],
     experimentalRawEvents: true,
@@ -216,27 +221,27 @@ export function buildThreadStartParams(
   };
 }
 
-export function buildThreadResumeParams(
+export async function buildThreadResumeParams(
   params: AgentHarnessSessionRuntimeParamsV1,
   options: CodexThreadConfigurationOptions & {
     threadId: string;
     authProfileId?: string;
     preserveNativeModel?: boolean;
   },
-): CodexThreadResumeParams & { developerInstructions: string } {
+): Promise<CodexThreadResumeParams & { developerInstructions: string }> {
   const modelSelection = options.preserveNativeModel
     ? undefined
-    : resolveCodexAppServerRequestModelSelection({
+    : await resolveCodexAppServerRequestModelSelection({
         ...params,
         homeScope: options.appServer.start.homeScope,
         model: options.model ?? params.modelId,
         modelProvider:
           options.modelProvider ??
-          resolveCodexAppServerModelProvider({
+          (await resolveCodexAppServerModelProvider({
             ...params,
             homeScope: options.appServer.start.homeScope,
             authProfileId: options.authProfileId ?? params.authProfileId,
-          }),
+          })),
         authProfileId: options.authProfileId ?? params.authProfileId,
       });
   return {
@@ -276,7 +281,12 @@ export function buildCodexRuntimeThreadConfig(
         "features.goals": false,
         "tools.update_plan.enabled": false,
         ...(!enabled
-          ? { "features.code_mode": false, "features.code_mode_only": false }
+          ? {
+              "features.code_mode": false,
+              "features.code_mode_only": false,
+              "features.shell_tool": false,
+              "features.unified_exec": false,
+            }
           : codeModeOnly
             ? { "features.code_mode_only": true }
             : {}),
@@ -340,6 +350,7 @@ export function isCodexNativeDelegationDisabledForRun(
   return (
     isCodexResponsesOAuthRun(params) ||
     params.delegationCapability === "report_only" ||
+    params.delegationCapability === "host_only" ||
     params.requireWorkspaceOnly === true ||
     params.pluginHarnessToolPolicyRestricted === true ||
     isMessageOnlyCodexSourceReply(params) ||
@@ -361,6 +372,7 @@ export function buildCodexRuntimeThreadConfigForRun(
     restrictedToolSurfaceInheritedMcpServerNames?: readonly string[];
     shellEnvironment?: Readonly<Record<string, string>>;
     shellPathPrepend?: readonly string[];
+    shellGitConfigParameters?: string;
     disableLoginShell?: boolean;
   } = {},
 ): JsonObject {
@@ -451,6 +463,7 @@ export function buildCodexRuntimeThreadConfigForRun(
     options.shellEnvironment,
     options.disableLoginShell,
     options.shellPathPrepend,
+    options.shellGitConfigParameters,
   );
 }
 
@@ -683,17 +696,4 @@ export function codexThreadSandboxOrPermissions(
     return {};
   }
   return { sandbox: appServer.sandbox };
-}
-
-function resolveCodexThreadEnvironmentSelection(options: {
-  nativeCodeModeEnabled?: boolean;
-  environmentSelection?: CodexTurnEnvironmentParams[];
-}): Pick<CodexThreadStartParams, "environments"> {
-  if (options.nativeCodeModeEnabled === false) {
-    return { environments: [] };
-  }
-  if (options.environmentSelection) {
-    return { environments: options.environmentSelection };
-  }
-  return {};
 }

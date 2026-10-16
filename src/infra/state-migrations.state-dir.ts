@@ -6,11 +6,10 @@ import {
   resolvePathPrefixSync,
   retainEntryForPublication,
 } from "@openclaw/fs-safe/advanced";
-import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import { resolveProfileStateDir } from "../cli/profile-utils.js";
 import {
   assertNoRetiredOAuthSidecarsBeforeConfigRecovery,
-  listLegacyOAuthSidecarPaths,
+  listReferencedLegacyOAuthSidecarPaths,
 } from "../commands/doctor-auth-legacy-paths.js";
 import { readCurrentConfigForResolution } from "../config/io.runtime.js";
 import type { OpenClawConfigWithLegacyRoster } from "../config/legacy.roster.js";
@@ -25,8 +24,10 @@ import { withArtifactPreservingStateReads } from "../state/openclaw-state-db-rea
 import { resolveIdentityPathViaExistingAncestorSync } from "./boundary-path.js";
 import { resolveUserPath } from "./home-dir.js";
 import { migrationFileExists } from "./state-migrations.fs.js";
+import { resolveLegacyProfileMigrationExceptions } from "./state-migrations.profile-scope.js";
 import { listRetiredDeliveryQueueFiles } from "./state-migrations.retired-delivery-files.js";
 import { assertNoRetiredStateFiles } from "./state-migrations.retired-files.js";
+import { assertNoRetiredRuntimeStateFiles } from "./state-migrations.retired-runtime-files.js";
 
 let autoMigrateStateDirChecked = false;
 
@@ -107,13 +108,16 @@ export function resolveLegacyProfileWorkspaceMigrationPaths(params: {
 }): { source: string; target: string } | undefined {
   const env = params.env ?? process.env;
   const homedir = params.homedir ?? os.homedir;
-  const profile = env.OPENCLAW_PROFILE?.trim();
-  if (!profile || normalizeLowercaseStringOrEmpty(profile) === "default") {
+  const { profileWorkspace: source } = resolveLegacyProfileMigrationExceptions({ env, homedir });
+  if (!source) {
     return undefined;
   }
   const paths = {
-    source: path.join(resolveProfileStateDir("default", env, homedir), `workspace-${profile}`),
-    target: path.join(resolveProfileStateDir(profile, env, homedir), "workspace"),
+    source,
+    target: path.join(
+      resolveProfileStateDir(env.OPENCLAW_PROFILE ?? "default", env, homedir),
+      "workspace",
+    ),
   };
   return resolveConfiguredProfileWorkspace({ ...params, ...paths }) ? undefined : paths;
 }
@@ -305,13 +309,17 @@ function migrateLegacyStateDirRoot(params: StateDirMigrationParams): StateDirMig
     );
     return result();
   }
+  assertNoRetiredRuntimeStateFiles(source, env, params.homedir);
   const configPath = resolveLegacyStateConfigPath(source);
   assertNoRetiredStateFiles("JSON delivery queues", listRetiredDeliveryQueueFiles(source));
-  assertNoRetiredOAuthSidecarsBeforeConfigRecovery({ env, configPath });
-  const { env: inspectionEnv } = readCurrentConfigForResolution({ env, configPath });
+  assertNoRetiredOAuthSidecarsBeforeConfigRecovery({ env, configPath, stateDir: source });
+  const { config: inspectionConfig, env: inspectionEnv } = readCurrentConfigForResolution({
+    env,
+    configPath,
+  });
   assertNoRetiredStateFiles(
     "OAuth credential sidecars",
-    listLegacyOAuthSidecarPaths(inspectionEnv, undefined, source),
+    listReferencedLegacyOAuthSidecarPaths(inspectionEnv, inspectionConfig, source),
   );
   const legacyIndexPath = resolveLegacyInstalledPluginIndexStorePath({ stateDir: source });
   const pluginInstallWarning = migrationFileExists(legacyIndexPath)

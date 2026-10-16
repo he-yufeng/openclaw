@@ -294,27 +294,25 @@ test.each([
   expect(write).not.toHaveBeenCalled();
 });
 
-test.each(["constructor", "__proto__"])(
-  "send-keys writes literal %s before the cursor key mode is known",
-  async (key) => {
-    const session = createSession();
-    session.cursorKeyMode = "unknown";
-    const write = vi.fn<NonNullable<ProcessSession["stdin"]>["write"]>((_data, callback) =>
-      callback?.(),
-    );
-    session.stdin = { write, end: vi.fn() };
+test("send-keys writes literal constructor before the cursor key mode is known", async () => {
+  const key = "constructor";
+  const session = createSession();
+  session.cursorKeyMode = "unknown";
+  const write = vi.fn<NonNullable<ProcessSession["stdin"]>["write"]>((_data, callback) =>
+    callback?.(),
+  );
+  session.stdin = { write, end: vi.fn() };
 
-    const result = await createProcessTool().execute("literal-key", {
-      action: "send-keys",
-      sessionId: session.id,
-      keys: [key],
-    });
+  const result = await createProcessTool().execute("literal-key", {
+    action: "send-keys",
+    sessionId: session.id,
+    keys: [key],
+  });
 
-    expect(result.details).toMatchObject({ status: "running", sessionId: session.id });
-    expect(write).toHaveBeenCalledTimes(1);
-    expect(write).toHaveBeenCalledWith(Buffer.from(key), expect.any(Function));
-  },
-);
+  expect(result.details).toMatchObject({ status: "running", sessionId: session.id });
+  expect(write).toHaveBeenCalledTimes(1);
+  expect(write).toHaveBeenCalledWith(Buffer.from(key), expect.any(Function));
+});
 
 test("a retained old snapshot cannot consume a successor poll delivery", async () => {
   const h = pollFixture("old-output\n");
@@ -387,4 +385,22 @@ test("composes lazy process actions through generated declarations and JavaScrip
     status: "completed",
     value: [{ id: "typed-process", lines: 2, output: "FIRST\nSECOND" }],
   });
+});
+
+test("keeps a poll wait live when the wall clock steps forward", async () => {
+  // The wait budget measures elapsed time; a wall-clock step is not elapsed work.
+  vi.useFakeTimers({
+    toFake: ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval"],
+  });
+  const h = pollFixture();
+  const pending = h.poll("wall-clock-step", 5_000);
+  vi.setSystemTime(Date.now() + 60_000);
+  const append = setTimeout(() => appendOutput(h.session, "stdout", "late output\n"), 1_000);
+  try {
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(resultText(await pending)).toContain("late output");
+  } finally {
+    clearTimeout(append);
+    await pending;
+  }
 });

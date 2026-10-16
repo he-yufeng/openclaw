@@ -159,15 +159,15 @@ export function createNetworkRegistrars(state: PluginRegistryState) {
       return;
     }
     if (provider.continueSession) {
-      getPluginInstance(record)?.admitFactory(provider.continueSession);
+      getPluginInstance(record)?.admitFactory(provider.continueSession, ["afterConversationBound"]);
     }
     const normalizedProvider = { ...provider, id, label };
-    registry.sessionCatalogs.push(
-      createRegistration(record, {
-        provider:
-          state.getNativeCatalogGate(record)?.catalog(normalizedProvider) ?? normalizedProvider,
-      }),
-    );
+    const catalog =
+      state.getNativeCatalogGate(record)?.catalog(normalizedProvider) ?? normalizedProvider;
+    if (catalog.continueSession) {
+      getPluginInstance(record)?.admitFactory(catalog.continueSession, ["afterConversationBound"]);
+    }
+    registry.sessionCatalogs.push(createRegistration(record, { provider: catalog }));
   };
 
   const describeHttpRouteOwner = (entry: PluginHttpRouteRegistration): string => {
@@ -335,7 +335,7 @@ export function createNetworkRegistrars(state: PluginRegistryState) {
     const agentTools = plugin.agentTools;
     if (agentTools) {
       plugin.agentTools = typeof agentTools === "function" ? agentTools : () => agentTools;
-      getPluginInstance(record)?.admitFactory(plugin.agentTools);
+      getPluginInstance(record)?.admitFactory(plugin.agentTools, "tool");
     }
     const metadata = {
       // Normalization copied the input; teardown must retain its registration owner.

@@ -7,10 +7,23 @@ type ScopeCase = {
 };
 const scoped: ScopeCase["expected"] = {
   baselineRatchets: true,
+  madgeImportCycles: true,
+  kyselyGuardrails: true,
   lint: true,
   types: true,
 };
 const cases: ScopeCase[] = [
+  ...[
+    ["packages/gateway-protocol/README.md", false],
+    ["packages/gateway-protocol/README.mdx", false],
+    ["packages/gateway-protocol/src/schema.ts", true],
+    ["packages/gateway-protocol/test/fixtures/README.md", true],
+    ["packages/gateway-protocol/prompts/runtime.md", true],
+  ].map(([file, selected]): ScopeCase => ({
+    paths: [String(file), "src/utils/absolute-deadline.test.ts"],
+    expected: { fastTasks: selected ? ["bundled-protocol"] : [] },
+  })),
+
   {
     paths: ["src/agents/session.test.ts"],
     expected: {
@@ -23,6 +36,9 @@ const cases: ScopeCase[] = [
   },
   ...[
     "src/shared/runtime.ts",
+    "src/shared/view.tsx",
+    "packages/media-core/src/runtime.mts",
+    "packages/media-core/src/runtime.cts",
     "extensions/telegram/src/runtime.ts",
     "packages/media-core/src/types.d.ts",
   ].map((path) => ({
@@ -90,8 +106,35 @@ const cases: ScopeCase[] = [
     expected: { checkTasks: expect.arrayContaining(["npm-lock"]) },
   },
   { paths: ["src/config/catalog.yaml"], expected: { lint: true, types: false } },
-  { paths: ["src/config/catalog.json"], expected: { lint: true, types: true } },
+  {
+    paths: ["src/config/catalog.json"],
+    expected: { lint: true, types: true, madgeImportCycles: false, kyselyGuardrails: false },
+  },
+  {
+    paths: ["src/shared/runtime.js"],
+    expected: { madgeImportCycles: false, kyselyGuardrails: false },
+  },
+  {
+    paths: ["ui/src/runtime.tsx"],
+    expected: {
+      madgeImportCycles: true,
+      kyselyGuardrails: false,
+      checkTasks: ["guards", "dependencies"],
+    },
+  },
+  {
+    paths: ["ui/src/runtime.tsx", "src/config/catalog.json"],
+    expected: { madgeImportCycles: true, kyselyGuardrails: false },
+  },
   { paths: ["test/openclaw-launcher.e2e.test.ts"], expected: { fastTasks: ["bun-launcher"] } },
+  {
+    paths: ["cli-invocation.mjs"],
+    expected: { fastTasks: expect.arrayContaining(["bun-launcher"]) },
+  },
+  {
+    paths: ["src/infra/sqlite-existing-database.ts"],
+    expected: { fastTasks: ["bun-launcher"] },
+  },
 ];
 
 describe("narrow PR check families", () => {
@@ -102,6 +145,8 @@ describe("narrow PR check families", () => {
       fastTasks: [],
       additionalGroups: [],
       baselineRatchets: false,
+      madgeImportCycles: false,
+      kyselyGuardrails: false,
       lint: true,
       types: false,
     });

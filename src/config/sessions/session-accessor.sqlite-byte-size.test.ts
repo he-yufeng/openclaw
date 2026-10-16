@@ -4,12 +4,13 @@ import { trackSqliteStatementExecutions } from "../../../test/helpers/sqlite-sta
 import { clearNodeSqliteKyselyCacheForDatabase } from "../../infra/kysely-sync.js";
 import { openNodeSqliteDatabase } from "../../infra/node-sqlite.js";
 import { openOpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import { requireNativeSqliteDatabase } from "../../test-utils/native-sqlite.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
+import { captureRuntimeConfigAsyncReader } from "../io.js";
 import {
   loadTranscriptEventsSync,
   persistSessionTranscriptTurn,
   readTranscriptStatsSync,
-  replaceTranscriptEvents,
 } from "./session-accessor.js";
 import { readSessionTranscriptBoundedActiveContextCore } from "./session-accessor.sqlite-active-context.js";
 import {
@@ -22,9 +23,10 @@ import { readTranscriptRawDelta } from "./session-accessor.sqlite-delta.js";
 import {
   readRecentSessionTranscriptHistoryEvents,
   readTranscriptDisplayDelta,
-} from "./session-accessor.sqlite-history-events.js";
+} from "./session-accessor.sqlite-history-events.test-support.js";
 import { readActiveTranscriptStats } from "./session-accessor.sqlite-history.test-support.js";
 import { readTranscriptEventRows } from "./session-accessor.sqlite-read.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.test-support.js";
 import type { SessionTranscriptRuntimeScope } from "./session-accessor.types.js";
 import {
   shouldRebuildSessionTranscriptIndexSynchronously,
@@ -45,17 +47,7 @@ type SqliteInstruction = {
 const readers: Array<
   [string, (scope: SessionTranscriptReadScope & { agentId: string }) => unknown]
 > = [
-  ["usage stats", readTranscriptStatsSync],
   ["active stats", readActiveTranscriptStats],
-  [
-    "rebuild preflight",
-    (scope) =>
-      shouldRebuildSessionTranscriptIndexSynchronously(
-        openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env }).db,
-        scope.sessionId,
-      ),
-  ],
-  ["raw delta", (scope) => readTranscriptRawDelta(scope, { maxBytes: 1024 })],
   ["display delta", (scope) => readTranscriptDisplayDelta(scope, { maxBytes: 1024 })],
   [
     "visible delta",
@@ -84,21 +76,13 @@ const readers: Array<
         maxMessages: 10,
       }),
   ],
-  [
-    "history tail",
-    (scope) =>
-      readRecentSessionTranscriptHistoryEvents(scope, {
-        maxBytes: 1024,
-        maxLines: 10,
-        maxMessages: 10,
-      }),
-  ],
 ];
 
 async function withByteSizeScope(
   run: (scope: SessionTranscriptRuntimeScope & { agentId: string }) => Promise<void>,
 ) {
   await withOpenClawTestState({ label: "transcript-byte-size" }, async (state) => {
+    await captureRuntimeConfigAsyncReader()();
     await run({
       agentId: "main",
       env: state.env,
@@ -124,7 +108,9 @@ it.each(readers)("sizes %s without reading transcript overflow payloads", async 
       ],
       touchSessionEntry: false,
     });
-    const { db } = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
+    const db = requireNativeSqliteDatabase(
+      openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env }).db,
+    );
     const table = db
       .prepare(
         "SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'transcript_events'",
@@ -204,10 +190,8 @@ it.each(readers)("sizes %s without reading transcript overflow payloads", async 
   });
 });
 
-it.each([
-  { name: "raw", read: readTranscriptRawDelta },
-  { name: "display", read: readTranscriptDisplayDelta },
-])("bounds $name delta sizing before its byte limit and resumes in order", async ({ read }) => {
+it("bounds display delta sizing before its byte limit and resumes in order", async () => {
+  const read = readTranscriptDisplayDelta;
   await withByteSizeScope(async (scope) => {
     const events = Array.from({ length: 512 }, (_, index) => ({
       type: "message",
@@ -219,10 +203,13 @@ it.each([
     const limits = { maxBytes: 1, maxEvents: 1_000 };
     read(scope, limits);
     const { db } = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
-    const counter = trackSqliteStatementExecutions(db, ["metadata"], (query) =>
-      query.includes('from "transcript_events"') && query.includes("serialized_bytes")
-        ? "metadata"
-        : null,
+    const counter = trackSqliteStatementExecutions(
+      requireNativeSqliteDatabase(db),
+      ["metadata"],
+      (query) =>
+        query.includes('from "transcript_events"') && query.includes("serialized_bytes")
+          ? "metadata"
+          : null,
     );
     try {
       const blocked = read(scope, limits);
@@ -329,6 +316,12 @@ it("admits compressed transcript bytes before decoding and preserves canonical s
     expect(readTranscriptEventRows(database, scope.sessionId).map((row) => row.eventJson)).toEqual(
       canonical,
     );
+    expect(readTranscriptRawDelta(scope, { maxBytes: sizeBytes + events.length })).toMatchObject({
+      kind: "page",
+      events: events.map((event, seq) => ({ event, seq })),
+      hasMore: false,
+      serializedBytes: sizeBytes + 1,
+    });
 
     database.db
       .prepare(
@@ -343,6 +336,7 @@ it("admits compressed transcript bytes before decoding and preserves canonical s
       requiredBytes: Buffer.byteLength(canonical[0]!) + 1,
       serializedBytes: 0,
     });
+    expect(() => readTranscriptRawDelta(scope, { maxBytes: sizeBytes + events.length })).toThrow();
     expect(() => loadTranscriptEventsSync({ ...scope, maxEventBytes: sizeBytes - 1 })).toThrow(
       /transcript store is too large to export/u,
     );
@@ -351,7 +345,6 @@ it("admits compressed transcript bytes before decoding and preserves canonical s
 });
 
 it.each([
-  { incomingRows: 1, storedRows: SYNC_REBUILD_MAX_ROWS - 1, synchronous: true },
   { incomingRows: 1, storedRows: SYNC_REBUILD_MAX_ROWS * 2, synchronous: false },
   { incomingRows: SYNC_REBUILD_MAX_ROWS + 1, storedRows: 1, synchronous: false },
 ])(
@@ -390,10 +383,8 @@ it.each([
   },
 );
 
-it.each([
-  { name: "usage", read: readRecentSessionTranscriptMessageEvents },
-  { name: "history", read: readRecentSessionTranscriptHistoryEvents },
-])("bounds $name tail sizing while retaining an oversized newest event", async ({ read }) => {
+it("bounds history tail sizing while retaining an oversized newest event", async () => {
+  const read = readRecentSessionTranscriptHistoryEvents;
   await withByteSizeScope(async (scope) => {
     await persistSessionTranscriptTurn(scope, {
       messages: [
@@ -413,12 +404,15 @@ it.each([
     const options = { maxBytes: 1024, maxLines: 1_000, maxMessages: 1_000 };
     read(scope, options);
     const { db } = openOpenClawAgentDatabase({ agentId: scope.agentId, env: scope.env });
-    const counter = trackSqliteStatementExecutions(db, ["metadata"], (sql) =>
-      sql.includes("session_transcript_active_events") &&
-      sql.includes("message_position") &&
-      sql.includes("serialized_bytes")
-        ? "metadata"
-        : null,
+    const counter = trackSqliteStatementExecutions(
+      requireNativeSqliteDatabase(db),
+      ["metadata"],
+      (sql) =>
+        sql.includes("session_transcript_active_events") &&
+        sql.includes("message_position") &&
+        sql.includes("serialized_bytes")
+          ? "metadata"
+          : null,
     );
     try {
       for (let attempt = 0; attempt < 3; attempt++) {

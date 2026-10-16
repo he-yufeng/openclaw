@@ -55,7 +55,7 @@ function selectMcpEnvelope(text: string, requestId: string): JsonRpcMessage {
     }
   };
 
-  const body = (text ?? "").trim();
+  const body = text.trim();
   if (!body) {
     return envelope;
   }
@@ -184,7 +184,7 @@ export async function runParallelMcpSearch(params: {
     // caller only supplied keyword queries, use them as the objective rather
     // than failing the call.
     objective: params.objective ?? params.searchQueries.join(" "),
-    search_queries: [...params.searchQueries],
+    search_queries: params.searchQueries,
     session_id: sessionId,
   };
   if (params.modelName) {

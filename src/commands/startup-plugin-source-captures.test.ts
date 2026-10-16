@@ -19,18 +19,25 @@ const mocks = vi.hoisted(() => ({
   preserving: false,
 }));
 
-vi.mock("./config-preflight-snapshot.js", () => ({
-  readConfigPreflightSnapshot: mocks.read,
+vi.mock("./config-preflight-snapshot.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./config-preflight-snapshot.js")>()),
+  createConfigPreflightSnapshotReader: () => ({
+    read: mocks.read,
+    takePluginCache: () => undefined,
+    [Symbol.asyncDispose]: async () => {},
+  }),
   readAdmittedConfigSnapshot: mocks.read,
-  needsRefreshedPluginIndexPersistence: () => false,
-  assertPreflightConfigUnchanged: vi.fn(),
-  persistRefreshedPluginIndex: vi.fn(),
 }));
 vi.mock("../infra/sqlite-readonly-worker.js", () => ({
   withSqliteReadOnlyWorkerScope: (run: () => unknown) => run(),
 }));
-vi.mock("../state/openclaw-state-db-readonly.js", () => ({
+vi.mock("../state/openclaw-state-db-readonly.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../state/openclaw-state-db-readonly.js")>()),
   isArtifactPreservingStateRead: () => mocks.preserving,
+}));
+vi.mock("../state/openclaw-state-db.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../state/openclaw-state-db.js")>()),
+  initializeNativeOpenClawStateDatabase: vi.fn(),
 }));
 vi.mock("./doctor-sqlite-maintenance-lock.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./doctor-sqlite-maintenance-lock.js")>()),

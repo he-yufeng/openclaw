@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
-import { replaceSessionEntry } from "../../../config/sessions/session-accessor.js";
+import * as sessionAccessor from "../../../config/sessions/session-accessor.js";
 import type { GatewayRequestContext } from "../../../gateway/server-methods/types.js";
+import { WorkerTaskError } from "../../../infra/worker-task-pool.js";
 import {
   assertAgentDatabaseAdmitted,
   createAgentDatabaseInspectionRefusal,
@@ -12,10 +13,14 @@ import type {
   GatewayRequest,
   SessionStoreEntry,
 } from "./subagent-registry.lifecycle-fixture.test-support.js";
+import { prepareSubagentRecoveryFixture } from "./subagent-registry.persistence.test-support.js";
+import type { PrepareRequesterWakeChildSession } from "./subagent-registry.requester-wake-session.test-support.js";
 import * as registry from "./subagent-registry.test-helpers.js";
+import type { SubagentRunRecord } from "./subagent-registry.types.js";
 
 export function registerRequesterStartupAdmissionTests({
   requesterSessionKey: MAIN_REQUESTER_SESSION_KEY,
+  prepareChildSession,
   getFixture,
   createGatewayContext,
   flushOwnedWork,
@@ -23,6 +28,7 @@ export function registerRequesterStartupAdmissionTests({
   wakeRequester,
 }: {
   requesterSessionKey: string;
+  prepareChildSession: PrepareRequesterWakeChildSession;
   getFixture: () => {
     testState: OpenClawTestState;
     sessionStore: Record<string, SessionStoreEntry>;
@@ -33,20 +39,128 @@ export function registerRequesterStartupAdmissionTests({
   getRequesterWakeCalls: () => GatewayRequest[];
   wakeRequester: typeof maybeWakeRequesterAfterAllChildrenSettled;
 }) {
+  it.each(["retry", "cancel", "replace"] as const)(
+    "preserves a saved wake through worker capacity preparation (%s)",
+    async (outcome) => {
+      vi.setSystemTime(100_000);
+      const runId = "preparation-child";
+      const childSessionKey = `agent:main:subagent:${runId}`;
+      const { sessionId, lifecycleRevision } = await prepareChildSession(childSessionKey, runId, 1);
+      const recovered: SubagentRunRecord = {
+        runId,
+        childSessionKey,
+        childSessionIdentity: { sessionId, lifecycleRevision },
+        requesterSessionKey: MAIN_REQUESTER_SESSION_KEY,
+        requesterAgentId: "main",
+        requesterDisplayKey: "main",
+        task: "Finish the retained request",
+        cleanup: "keep",
+        createdAt: 1_000,
+        execution: {
+          status: "terminal",
+          startedAt: 2_000,
+          endedAt: 3_000,
+          outcome: { status: "ok" },
+        },
+        expectsCompletionMessage: true,
+        completion: {
+          required: true,
+          terminalReply: { disposition: "visible", text: "old result" },
+          capturedAt: 3_000,
+        },
+        delivery: { status: "delivered" },
+        requesterSettleWake: {
+          status: "pending",
+          attemptCount: 0,
+          replayCount: 0,
+          batchRunIds: [runId],
+          requesterYieldBatch: true,
+          rearmGeneration: 1,
+          progressOperationId: "original-progress",
+          retireAfterSettle: true,
+        },
+      };
+      const { sessionStore, sessionStorePath } = getFixture();
+      await prepareSubagentRecoveryFixture(recovered, {
+        entries: sessionStore,
+        storePath: sessionStorePath,
+      });
+      await registry.addSubagentRunForTests(recovered);
+      const original = registry.getSubagentRunByRunId(runId)!;
+      const read = vi
+        .spyOn(sessionAccessor, "findTranscriptEvent")
+        .mockRejectedValueOnce(new WorkerTaskError("worker task capacity reached", "overloaded"))
+        .mockResolvedValue(undefined);
+      const context = createGatewayContext();
+      await registry.initSubagentRegistry();
+      await registry.activateSubagentRegistry(() => context);
+      await flushOwnedWork();
+      expect(read).toHaveBeenCalled();
+      expect(getRequesterWakeCalls()).toHaveLength(0);
+      const retained = registry.getSubagentRunByRunId(runId)!;
+      expect(retained.requesterSettleWake).toEqual({
+        ...original.requesterSettleWake,
+        nextAttemptAt: 130_000,
+      });
+      expect(retained.delivery).toEqual(original.delivery);
+      expect(retained.suppressCompletionDelivery).not.toBe(true);
+
+      if (outcome === "cancel") {
+        await registry.cancelSubagentRequesterSettleWake(retained, () => {});
+      } else if (outcome === "replace") {
+        await registry.addSubagentRunForTests({
+          ...retained,
+          generation: (retained.generation ?? 0) + 1,
+          completion: {
+            ...retained.completion!,
+            terminalReply: { disposition: "visible", text: "replacement result" },
+          },
+          requesterSettleWake: undefined,
+        });
+      } else {
+        // Reopen the registry to prove retry custody and deadline were persisted.
+        await registry.resetSubagentRegistryForTests({ persist: false });
+        await registry.initSubagentRegistry();
+        await registry.activateSubagentRegistry(() => context);
+        await flushOwnedWork();
+        expect(getRequesterWakeCalls()).toHaveLength(0);
+      }
+      await vi.advanceTimersByTimeAsync(30_000);
+      await flushOwnedWork();
+      const wakes = getRequesterWakeCalls();
+      expect(wakes).toHaveLength(outcome === "retry" ? 1 : 0);
+      if (outcome === "retry") {
+        expect(wakes[0]?.params?.idempotencyKey).toBe(
+          `announce:requester-settle:main:${MAIN_REQUESTER_SESSION_KEY}:${runId}:yield-1`,
+        );
+        expect(wakes[0]?.params?.message).toContain("old result");
+        expect(registry.getSubagentRunByRunId(runId)).toBeUndefined();
+      } else if (outcome === "cancel") {
+        expect(registry.getSubagentRunByRunId(runId)?.requesterSettleWake).toBeUndefined();
+      } else {
+        expect(registry.getSubagentRunByRunId(runId)).toMatchObject({
+          generation: (retained.generation ?? 0) + 1,
+          completion: { terminalReply: { text: "replacement result" } },
+        });
+        expect(registry.getSubagentRunByRunId(runId)?.requesterSettleWake).toBeUndefined();
+      }
+      await vi.advanceTimersByTimeAsync(120_000);
+      await flushOwnedWork();
+      expect(getRequesterWakeCalls()).toHaveLength(wakes.length);
+    },
+  );
+
   it("resumes a persisted requester cohort after database startup inspection finishes", async () => {
-    const { testState, sessionStore, sessionStorePath } = getFixture();
+    const { testState } = getFixture();
     vi.setSystemTime(100_000);
     const runIds = ["restored-alpha", "restored-beta"];
     for (const runId of runIds) {
       const childSessionKey = `agent:main:subagent:${runId}`;
-      sessionStore[childSessionKey] = { sessionId: runId, updatedAt: 1 };
-      await replaceSessionEntry(
-        { storePath: sessionStorePath, sessionKey: childSessionKey },
-        sessionStore[childSessionKey],
-      );
-      await registry.addSubagentRunForTests({
+      const { sessionId, lifecycleRevision } = await prepareChildSession(childSessionKey, runId, 1);
+      const recovered: SubagentRunRecord = {
         runId,
         childSessionKey,
+        childSessionIdentity: { sessionId, lifecycleRevision },
         requesterSessionKey: MAIN_REQUESTER_SESSION_KEY,
         requesterAgentId: "main",
         requesterDisplayKey: "main",
@@ -72,7 +186,13 @@ export function registerRequesterStartupAdmissionTests({
           progressOperationId: runId,
           ...(runId === runIds[0] ? { retireAfterSettle: true } : {}),
         },
+      };
+      const { sessionStore, sessionStorePath } = getFixture();
+      await prepareSubagentRecoveryFixture(recovered, {
+        entries: sessionStore,
+        storePath: sessionStorePath,
       });
+      await registry.addSubagentRunForTests(recovered);
     }
     await registry.resetSubagentRegistryForTests({ persist: false });
     const pending = createAgentDatabaseInspectionRefusal({

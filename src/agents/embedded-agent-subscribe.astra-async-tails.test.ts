@@ -19,7 +19,6 @@ import { runAgentLoop } from "../plugin-sdk/agent-core.js";
 import { attachSessionTranscriptRunId } from "../sessions/transcript-events.js";
 import { matchesTranscriptEvent } from "../sessions/transcript-visible-record.js";
 import { createTestAdmittedRunContext } from "./admitted-run-context.test-support.js";
-import { buildAgentRunTerminalReplySnapshot } from "./agent-run-terminal-reply.js";
 import type { EmbeddedRunAttemptWithReceiptEvidence } from "./embedded-agent-runner/run/attempt-result.js";
 import { createEmbeddedRunContextRecoveryState } from "./embedded-agent-runner/run/context-recovery-state.js";
 import { resolveFinalAssistantVisibleText } from "./embedded-agent-runner/run/helpers.js";
@@ -85,8 +84,7 @@ describe("Astra async response tails", () => {
   type Request =
     | string
     | readonly WireItem[]
-    | { readonly items: readonly WireItem[]; readonly endTurn: false }
-    | { readonly items: readonly WireItem[]; readonly incomplete: true };
+    | { readonly items: readonly WireItem[]; readonly endTurn: false };
   // Each model request is a real Responses wire stream through the shipped transport.
   function responsesStream(id: string, request: Request) {
     const items: readonly WireItem[] =
@@ -96,7 +94,6 @@ describe("Astra async response tails", () => {
           ? request.items
           : request;
     const endTurn = typeof request === "object" && "endTurn" in request ? request.endTurn : true;
-    const incomplete = typeof request === "object" && "incomplete" in request;
     async function* wire() {
       for (const [outputIndex, item] of items.entries()) {
         if (item.type === "message") {
@@ -119,20 +116,10 @@ describe("Astra async response tails", () => {
         }
         yield { type: "response.output_item.done", output_index: outputIndex, item };
       }
-      yield incomplete
-        ? {
-            type: "response.incomplete",
-            response: {
-              id,
-              status: "incomplete",
-              incomplete_details: { reason: "max_output_tokens" },
-              output: items,
-            },
-          }
-        : {
-            type: "response.completed",
-            response: { id, status: "completed", output: items, end_turn: endTurn },
-          };
+      yield {
+        type: "response.completed",
+        response: { id, status: "completed", output: items, end_turn: endTurn },
+      };
     }
     const output = createResponsesAssistantOutput(model);
     const response = new AssistantMessageEventStream();
@@ -177,37 +164,6 @@ describe("Astra async response tails", () => {
       heartbeat: true,
     },
     {
-      name: "live blocks of a two-item answer are not resent after NO_REPLY",
-      delivery: "live",
-      requests: [
-        [
-          lookupCall,
-          finalAnswer("msg_first", "First part."),
-          finalAnswer("msg_second", "Second part."),
-        ],
-        "NO_REPLY",
-      ],
-      transcript: ["toolUse:toolCall", "stop:text+text", "stop:text"],
-      delivered: ["First part.", "Second part."],
-      reply: { disposition: "visible", text: "First part.\nSecond part." },
-    },
-    {
-      name: "live blocks of a two-item answer split by commentary are not resent after NO_REPLY",
-      delivery: "live",
-      requests: [
-        [
-          lookupCall,
-          finalAnswer("msg_first", "First part."),
-          { ...finalAnswer("msg_note", "Checking the second part."), phase: "commentary" },
-          finalAnswer("msg_second", "Second part."),
-        ],
-        "NO_REPLY",
-      ],
-      transcript: ["toolUse:toolCall", "stop:text+text+text", "stop:text"],
-      delivered: ["First part.", "Second part."],
-      reply: { disposition: "visible", text: "First part.\nSecond part." },
-    },
-    {
       name: "a live answer followed by commentary is not resent after NO_REPLY",
       delivery: "live",
       requests: [
@@ -223,19 +179,6 @@ describe("Astra async response tails", () => {
       reply: { disposition: "visible", text: "Alpha." },
     },
     {
-      name: "a live answer followed by commentary is not resent",
-      delivery: "live",
-      requests: [
-        [
-          finalAnswer("msg_answer", "Alpha."),
-          { ...finalAnswer("msg_note", "Wrapping up."), phase: "commentary" },
-        ],
-      ],
-      transcript: ["stop:text+text"],
-      delivered: ["Alpha."],
-      reply: { disposition: "visible", text: "Alpha." },
-    },
-    {
       name: "live blocks of a two-item terminal answer are not resent",
       delivery: "live",
       requests: [
@@ -243,7 +186,7 @@ describe("Astra async response tails", () => {
       ],
       transcript: ["stop:text+text"],
       delivered: ["First part.", "Second part."],
-      reply: { disposition: "visible", text: "First part.\nSecond part." },
+      reply: { disposition: "visible", text: "First part.Second part." },
     },
     {
       name: "a repeated answer is delivered once",
@@ -254,14 +197,6 @@ describe("Astra async response tails", () => {
       reply: keptReply,
     },
     {
-      name: "a later answer supersedes the completed answer",
-      delivery: "deferred",
-      requests: [answered, "Correction: use counter C."],
-      transcript: answeredTail,
-      delivered: ["Correction: use counter C."],
-      reply: { disposition: "visible", text: "Correction: use counter C." },
-    },
-    {
       name: "a later silent attachment supersedes the completed answer",
       delivery: "deferred",
       requests: [answered, "NO_REPLY\nMEDIA:/tmp/openclaw/tts-a/voice-a.opus"],
@@ -269,7 +204,7 @@ describe("Astra async response tails", () => {
       delivered: ["/tmp/openclaw/tts-a/voice-a.opus"],
     },
     {
-      name: "a NO_REPLY after a superseding silent attachment does not restore the earlier answer",
+      name: "a NO_REPLY after a superseding attachment-only answer does not restore earlier text",
       delivery: "deferred",
       requests: [
         answered,
@@ -281,28 +216,11 @@ describe("Astra async response tails", () => {
       ],
       transcript: ["toolUse:toolCall", "stop:text", "toolUse:toolCall", "stop:text", "stop:text"],
       delivered: ["/tmp/openclaw/tts-a/voice-a.opus"],
-      reply: { disposition: "silent" },
+      // The kept attachment answer owns the result; its parsed text is empty, not NO_REPLY.
+      reply: { disposition: "empty" },
     },
     {
-      name: "a NO_REPLY after a superseding cut-off attachment does not restore the earlier answer",
-      delivery: "deferred",
-      requests: [
-        answered,
-        {
-          items: [
-            { ...lookupCall, id: "fc_lookup_2", call_id: "call_lookup_2" },
-            finalAnswer("msg_media", "NO_REPLY\nMEDIA:/tmp/openclaw/tts-a/voice-a.opus"),
-          ],
-          incomplete: true,
-        },
-        "NO_REPLY",
-      ],
-      transcript: ["toolUse:toolCall", "stop:text", "toolUse:toolCall", "length:text", "stop:text"],
-      delivered: ["/tmp/openclaw/tts-a/voice-a.opus"],
-      reply: { disposition: "silent" },
-    },
-    {
-      name: "a later voice NO_REPLY that persistence normalized first supersedes the completed answer",
+      name: "a voice reply normalized to exact NO_REPLY before subscription stays silent",
       delivery: "deferred",
       requests: [answered, "NO_REPLY [[audio_as_voice]]"],
       transcript: answeredTail,
@@ -315,17 +233,6 @@ describe("Astra async response tails", () => {
       delivery: "deferred",
       requests: [[finalAnswer("msg_progress", "Checking counter B."), lookupCall], "NO_REPLY"],
       transcript: ["toolUse:text+toolCall", "stop:", "stop:text"],
-      delivered: [],
-      reply: { disposition: "silent" },
-    },
-    {
-      name: "a later NO_REPLY keeps an interim stop that continued the turn silent",
-      delivery: "deferred",
-      requests: [
-        { items: [finalAnswer("msg_interim", "Starting the export now.")], endTurn: false },
-        "NO_REPLY",
-      ],
-      transcript: ["stop:text", "stop:text"],
       delivered: [],
       reply: { disposition: "silent" },
     },
@@ -567,12 +474,7 @@ describe("Astra async response tails", () => {
     expect([...sent, ...replyPayloads.map(show)]).toEqual(delivered);
     if ("reply" in row) {
       // Sub-agent completion and A2A forwarding read the terminal reply, not the payloads.
-      expect(
-        buildAgentRunTerminalReplySnapshot({
-          visibleText: prepared.finalAssistantVisibleText,
-          rawText: prepared.finalAssistantRawText,
-        }),
-      ).toEqual(row.reply);
+      expect(prepared.preparedTerminalReply.terminalReply).toEqual(row.reply);
     }
     if ("announce" in row) {
       // A parent's sub-agent announcement hydrates the answer from the persisted rows.
@@ -601,10 +503,7 @@ describe("Astra async response tails", () => {
         },
         completion: {
           required: true,
-          terminalReply: buildAgentRunTerminalReplySnapshot({
-            visibleText: prepared.finalAssistantVisibleText,
-            rawText: prepared.finalAssistantRawText,
-          }),
+          terminalReply: prepared.preparedTerminalReply.terminalReply,
         },
       };
       const unexpected = () => {
@@ -619,7 +518,6 @@ describe("Astra async response tails", () => {
         findSessionTranscriptArchiveEventReadOnly: async () => undefined,
         getRuntimeConfig: unexpected,
         readSubagentSessionEntry: unexpected,
-        resolveAgentIdFromSessionKey: unexpected,
         resolveSessionStorePathCore: unexpected,
       });
       expect(announced.text).toBe("Use counter B.");

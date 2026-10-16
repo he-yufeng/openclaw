@@ -63,6 +63,7 @@ import {
   windowsProviderOnlyPluginIsolationScript,
   windowsCodexPlatformPackageRepairFunction,
 } from "../../scripts/e2e/parallels/plugin-isolation.ts";
+import { windowsAgentTurnScript } from "../../scripts/e2e/parallels/powershell.ts";
 import {
   resolveParallelsProviderAuth,
   runParallelsPrerequisiteEval,
@@ -322,7 +323,7 @@ function waitForProcessClose(
 }
 
 function runNode(source: string, options: NonNullable<Parameters<typeof run>[2]> = {}) {
-  return run(testNodeExecPath, ["-e", source], { quiet: true, ...options });
+  return run(testNodeExecPath, ["-e", source], options);
 }
 
 type FakeCommandResult = { status: number; stderr: string; stdout: string };
@@ -467,7 +468,14 @@ if (fs.readFileSync(owner, 'utf8') === String(process.pid)) {
   return preload;
 }
 
-const SIGNAL_GRANDCHILD_SCRIPT = `const { writeFileSync } = require('node:fs'); writeFileSync(process.env.OPENCLAW_TEST_GRANDCHILD_PID, String(process.pid)); process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);`;
+const SIGNAL_GRANDCHILD_SCRIPT = `
+const { renameSync, writeFileSync } = require('node:fs');
+process.on('SIGTERM', () => {});
+const pidPath = process.env.OPENCLAW_TEST_GRANDCHILD_PID;
+writeFileSync(pidPath + '.tmp', String(process.pid));
+renameSync(pidPath + '.tmp', pidPath);
+setInterval(() => {}, 1000);
+`;
 const SIGNAL_PARENT_SCRIPT = `const { spawn } = require('node:child_process'); const { writeFileSync } = require('node:fs'); spawn(process.execPath, ['-e', ${JSON.stringify(SIGNAL_GRANDCHILD_SCRIPT)}], { env: process.env, stdio: 'ignore' }); writeFileSync(process.env.OPENCLAW_TEST_READY_FILE, 'ready'); process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000);`;
 
 function createSignaledHostCommandFixture() {
@@ -497,7 +505,6 @@ setInterval(() => {}, 1000);`;
 run(process.execPath, ['--input-type=module', '-e', ${JSON.stringify(parentScript)}], {
   check: false,
   env: { ...process.env, OPENCLAW_TEST_GRANDCHILD_PID: ${JSON.stringify(grandchildPidPath)}, OPENCLAW_TEST_READY_FILE: ${JSON.stringify(readyPath)} },
-  quiet: true,
   timeoutMs: 30_000,
 });`,
   );
@@ -551,6 +558,11 @@ describe("Parallels smoke model selection", () => {
     windows,
     windowsGit,
   } = TS_SOURCE;
+  const windowsAgentTurn = windowsAgentTurnScript({
+    command: "Invoke-OpenClaw @args",
+    sessionId: "parallels-windows-smoke",
+    retryOnCommandFailure: true,
+  });
 
   it("parses macOS dscl user homes with spaces on mounted volumes", () => {
     expect(parseMacosDsclUserHomeLine("clawuser /Volumes/Macintosh HD/Users/clawuser")).toEqual({
@@ -696,10 +708,11 @@ ensure_vm_running`,
 
   it("resets Linux product state before both install lanes", () => {
     for (const lane of ["fresh", "upgrade"]) {
-      const restoreIndex = linux.indexOf(`"${lane}.restore-snapshot"`);
-      const resetIndex = linux.indexOf(`"${lane}.reset-state"`);
+      expect(linux).toContain(`return this.runInstallLane("${lane}")`);
+      const restoreIndex = linux.indexOf("`${lane}.restore-snapshot`");
+      const resetIndex = linux.indexOf("`${lane}.reset-state`");
       const installIndex = linux.indexOf(
-        `"${lane}.${lane === "fresh" ? "install-main" : "install-latest"}"`,
+        lane === "fresh" ? "`${lane}.install-main`" : '"upgrade.install-latest"',
       );
       expect(restoreIndex).toBeGreaterThanOrEqual(0);
       expect(resetIndex).toBeGreaterThan(restoreIndex);
@@ -729,14 +742,6 @@ ensure_vm_running`,
       [linux, "this.downloadGuestFile(tgzUrl"],
       [linux, "curl -fsSL --connect-timeout 10 --max-time 120 --retry 2"],
       [linux, "wget -q --timeout=10 --read-timeout=120 --tries=3"],
-    ],
-    "keeps Linux bad-plugin diagnostics gated for historical update baselines": [
-      [linux, 'BAD_PLUGIN_DIAGNOSTIC_MIN_VERSION = "2026.5.7"'],
-      [linux, "parseOpenClawPackageVersion"],
-      [linux, "maybeInjectBadPluginFixture"],
-      [linux, "maybeVerifyBadPluginDiagnostic"],
-      [linux, "Skipping bad plugin diagnostic fixture"],
-      [linux, "Skipping bad plugin diagnostic assertion"],
     ],
     "uses collision-resistant guest script names": [
       [transports, 'import { randomUUID } from "node:crypto"'],
@@ -840,12 +845,12 @@ ensure_vm_running`,
       [windows, "windowsAgentTurnConfigPatchScript(this.auth.modelId)"],
       [windows, "--model"],
       [windows, 'resolveParallelsModelTimeoutSeconds("windows")'],
-      [windows, "finalAssistant(Raw|Visible)Text"],
-      [windows, "parallels-windows-smoke-retry-$attempt"],
-      [windows, "agent turn attempt $attempt failed or finished without OK response"],
+      [windowsAgentTurn, "finalAssistant(Raw|Visible)Text"],
+      [windowsAgentTurn, "parallels-windows-smoke-retry-$attempt"],
+      [windowsAgentTurn, "agent turn attempt $attempt failed or finished without OK response"],
       [windows, "$config.models.providers", false],
       [windows, "timeoutSeconds = 300", false],
-      [windows, '"$sessionId.jsonl"'],
+      [windowsAgentTurn, '"$sessionId.jsonl"'],
     ],
     "waits through transient Windows restoring state before VM operations": [
       [windows, "waitForVmNotRestoring"],
@@ -1269,10 +1274,16 @@ ensure_vm_running`,
     }
   });
 
-  it("waits for host artifact server exit after SIGKILL before stop resolves", async () => {
+  it.each(["running", "signaled"] as const)("stops a %s host artifact server", async (state) => {
     vi.useFakeTimers();
     try {
       const child = new FakeHostServerChild();
+      if (state === "signaled") {
+        child.exitWithSignal("SIGTERM");
+        await expect(hostServerTesting.stopHostServerChild(child as never)).resolves.toBe(true);
+        expect(child.signals).toEqual([]);
+        return;
+      }
       const stop = hostServerTesting.stopHostServerChild(child as never);
       expect(child.signals).toEqual(["SIGTERM"]);
 
@@ -1294,14 +1305,6 @@ ensure_vm_running`,
     }
   });
 
-  it("treats signaled host artifact server children as already exited", async () => {
-    const child = new FakeHostServerChild();
-    child.exitWithSignal("SIGTERM");
-
-    await expect(hostServerTesting.stopHostServerChild(child as never)).resolves.toBe(true);
-    expect(child.signals).toEqual([]);
-  });
-
   it("uses a temporary npmrc file and cleans it after resolving the latest package version", () => {
     const tempRoot = makeTempDir(tempDirs, "openclaw-parallels-version-");
     let userConfigPath = "";
@@ -1310,11 +1313,10 @@ ensure_vm_running`,
         expect(prefix).toBe(join(tmpdir(), "openclaw-npm-"));
         return mkdtempSync(join(tempRoot, "npm-"));
       },
-      runCommand: (command, args, options) => {
+      runCommand: (command, args) => {
         userConfigPath = args.at(-1) ?? "";
         expect(command).toBe("npm");
         expect(args).toEqual(["view", "openclaw", "version", "--userconfig", userConfigPath]);
-        expect(options).toEqual({ quiet: true });
         expect(statSync(userConfigPath).isFile()).toBe(true);
         return { status: 0, stderr: "", stdout: "2026.6.1\n" };
       },
@@ -1378,17 +1380,21 @@ kill -TERM "$$"`,
             date: "2026-07-26 11:52:02",
           },
           "{other}": { name: "unrelated", state: "poweroff" },
+          "{old-macos}": { name: "macOS 26.3.1 LATEST", state: "poweron" },
+          "{current-macos}": { name: "macOS 26.5", state: "poweron" },
         },
       },
       () => {
         const snapshot = resolveSnapshot("vm", "fresh");
         const latestE2e = resolveSnapshot("vm", "pre-openclaw-native-e2e-");
         const missingDate = resolveSnapshot("vm", "undated-family-");
+        const latestMacos = resolveSnapshot("vm", "macOS 26.5 latest");
         return [
           shellQuote("it's ok"),
           [snapshot.id, snapshot.state, snapshot.name].join("\t"),
           [latestE2e.id, latestE2e.state, latestE2e.name].join("\t"),
           [missingDate.id, missingDate.state, missingDate.name].join("\t"),
+          [latestMacos.id, latestMacos.state, latestMacos.name].join("\t"),
         ].join("\n");
       },
     );
@@ -1397,23 +1403,7 @@ kill -TERM "$$"`,
     expect(output).toContain("{wanted}\tpoweroff\tfresh-poweroff-2026-04-01");
     expect(output).toContain("{new-e2e}\tpoweroff\tpre-openclaw-native-e2e-2026-07-26");
     expect(output).toContain("{undated-first}\tpoweroff\tundated-family-1");
-  });
-
-  it("resolves a latest snapshot hint to the matching version before older LATEST labels", () => {
-    const output = withJsonFakePrlctl(
-      {
-        "snapshot-list": {
-          "{old}": { name: "macOS 26.3.1 LATEST", state: "poweron" },
-          "{wanted}": { name: "macOS 26.5", state: "poweron" },
-        },
-      },
-      () => {
-        const snapshot = resolveSnapshot("vm", "macOS 26.5 latest");
-        return [snapshot.id, snapshot.state, snapshot.name].join("\t");
-      },
-    );
-
-    expect(output).toBe("{wanted}\tpoweron\tmacOS 26.5");
+    expect(output.split("\n").at(-1)).toBe("{current-macos}\tpoweron\tmacOS 26.5");
   });
 
   it.each(["poweron", "poweroff"] as const)(
@@ -1769,9 +1759,7 @@ if (commandArgs[0] === "list") {
       expect(script, scriptPath).toContain("--thinking");
       expect(script, scriptPath).toContain("off");
       expect(script, scriptPath).toContain(
-        scriptPath === TS_PATHS.windows
-          ? "finalAssistant(Raw|Visible)Text"
-          : "posixAgentTurnScript({",
+        scriptPath === TS_PATHS.windows ? "windowsAgentTurnScript({" : "posixAgentTurnScript({",
       );
     }
     expect(smokeCommon).toContain("finalAssistant(Raw|Visible)Text");
@@ -1788,7 +1776,13 @@ if (commandArgs[0] === "list") {
     expect(npmUpdateScripts).toContain("windowsAgentWorkspaceScript");
     expect(npmUpdateScripts).toContain("tools.profile");
     expect(npmUpdateScripts).toContain("--thinking off");
-    expect(npmUpdateScripts).toContain("finalAssistant(Raw|Visible)Text");
+    expect(
+      windowsAgentTurnScript({
+        command: "Invoke-OpenClaw @args",
+        sessionId: "parallels-npm-update-windows",
+        retryOnCommandFailure: false,
+      }),
+    ).toContain("finalAssistant(Raw|Visible)Text");
     expect(npmUpdateScripts).toContain("posixAssertAgentOkScript");
     expect(npmUpdateScripts).toContain("posixAgentTurnScript({");
     expect(npmUpdateScripts).toContain("windowsAgentTurnConfigPatchScript");
@@ -1944,8 +1938,8 @@ if (commandArgs[0] === "list") {
     expect(combined).toContain("MinGit-");
     expect(combined).toContain("portable-git");
     expect(combined).toContain("where.exe git.exe");
-    expect(windowsGit.indexOf('"MinGit-2.55.0.5-64-bit.zip"')).toBeLessThan(
-      windowsGit.indexOf('"MinGit-2.55.0.5-arm64.zip"'),
+    expect(windowsGit.indexOf('"MinGit-2.56.0.2-64-bit.zip"')).toBeLessThan(
+      windowsGit.indexOf('"MinGit-2.56.0.2-arm64.zip"'),
     );
     expect(
       combined.match(/curl\.exe -fsSL --connect-timeout 10 --max-time 120 --retry 2/g),
@@ -2000,15 +1994,6 @@ if (commandArgs[0] === "list") {
     expect(output.join("")).toContain("update complete");
   });
 
-  it("propagates a detached POSIX background exit failure", async () => {
-    const { result } = runFakePosixBackground(
-      { exit: [fakeResult(0, "7\n")], tail: () => fakeResult(0, "update failed\n") },
-      { script: "exit 7" },
-    );
-
-    await expect(result).rejects.toThrow("macos update failed");
-  });
-
   it("reads the POSIX background exit after log drain consumes the deadline", async () => {
     const { result, state } = runFakePosixBackground(
       {
@@ -2028,29 +2013,36 @@ if (commandArgs[0] === "list") {
     expect(state.exitRead).toBe(true);
   });
 
-  it("cleans up an ambiguous POSIX launch when PID materialization is missed", async () => {
-    const { result, state } = runFakePosixBackground(
-      { launch: fakeResult(124), pid: fakeResult(1) },
-      { script: "sleep 60", timeoutMs: 25 },
-    );
-
-    await expect(result).rejects.toThrow("macos update background launch failed");
-
-    expect(state.cleanupRun).toBe(true);
-  });
-
-  it("force-stops the verified POSIX background process tree on timeout", async () => {
-    const { result, state } = runFakePosixBackground(
-      { done: fakeResult(1) },
-      { script: "sleep 60", timeoutMs: 25 },
-    );
-
-    await expect(result).rejects.toThrow("macos update timed out");
-
-    expect(state.cleanupPayload).toContain('command=$(/bin/ps -p "$background_pid" -o command=');
-    expect(state.cleanupPayload).toContain('for child in $(/usr/bin/pgrep -P "$1"');
-    expect(state.cleanupPayload).toContain('/bin/kill -TERM "$1"');
-    expect(state.cleanupPayload).toContain('/bin/kill -KILL "$1"');
+  it.each([
+    {
+      name: "detached exit failure",
+      fake: { exit: [fakeResult(0, "7\n")], tail: () => fakeResult(0, "update failed\n") },
+      options: { script: "exit 7" },
+      error: "macos update failed",
+    },
+    {
+      name: "missing PID after ambiguous launch",
+      fake: { launch: fakeResult(124), pid: fakeResult(1) },
+      options: { script: "sleep 60", timeoutMs: 25 },
+      error: "macos update background launch failed",
+    },
+    {
+      name: "timeout",
+      fake: { done: fakeResult(1) },
+      options: { script: "sleep 60", timeoutMs: 25 },
+      error: "macos update timed out",
+    },
+  ])("handles POSIX background $name", async ({ name, fake, options, error }) => {
+    const { result, state } = runFakePosixBackground(fake, options);
+    await expect(result).rejects.toThrow(error);
+    if (name === "missing PID after ambiguous launch") {
+      expect(state.cleanupRun).toBe(true);
+    } else if (name === "timeout") {
+      expect(state.cleanupPayload).toContain('command=$(/bin/ps -p "$background_pid" -o command=');
+      expect(state.cleanupPayload).toContain('for child in $(/usr/bin/pgrep -P "$1"');
+      expect(state.cleanupPayload).toContain('/bin/kill -TERM "$1"');
+      expect(state.cleanupPayload).toContain('/bin/kill -KILL "$1"');
+    }
   });
 
   it("carries refreshed Windows guest environment into every PowerShell script", () => {
@@ -2305,7 +2297,6 @@ if (commandArgs[0] === "list") {
             DEADLINE_FILE: deadlineFile,
             NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --require ${JSON.stringify(preload)}`,
           },
-          quiet: true,
           // Let the command spawn its pipe holder before exercising timeout settlement.
           timeoutMs: 200,
         });
@@ -2368,7 +2359,6 @@ if (commandArgs[0] === "list") {
     expect(() =>
       run("openclaw-definitely-missing-host-command", [], {
         check: false,
-        quiet: true,
         timeoutMs: 50,
       }),
     ).toThrow(/ENOENT/u);

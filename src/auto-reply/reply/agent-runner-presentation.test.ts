@@ -1,10 +1,9 @@
 import { resolveSendableOutboundReplyParts } from "openclaw/plugin-sdk/reply-payload";
 import { describe, expect, it, vi } from "vitest";
-import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
 import { createStructuredOutboundPayloadPlan } from "../../infra/outbound/payloads.js";
 import { createDeferredCore } from "../../shared/deferred.js";
-import { appendReplyMediaFailures } from "../reply-payload.js";
-import type { ReplyPayload } from "../types.js";
+import { appendReplyMediaFailures, setReplyPayloadMetadata } from "../reply-payload.js";
+import type { GetReplyOptions, ReplyPayload } from "../types.js";
 import type { AgentTurnParams } from "./agent-runner-execution.types.js";
 import { createAgentTurnPresentation } from "./agent-runner-presentation.js";
 import { createBlockReplyPipeline } from "./block-reply-pipeline.js";
@@ -18,6 +17,7 @@ function createPresentation(
     isHeartbeat?: boolean;
     silentExpected?: boolean;
     conversationContext?: string;
+    onPartialReply?: GetReplyOptions["onPartialReply"];
     normalizeMediaPaths?: (payload: ReplyPayload) => Promise<ReplyPayload>;
     replyOperation?: AgentTurnParams["replyOperation"];
     delivery?: Pick<
@@ -30,7 +30,12 @@ function createPresentation(
     followupRun: { run: { silentExpected: options.silentExpected === true } },
     isHeartbeat: options.isHeartbeat === true,
     sessionCtx: { agentText: options.conversationContext },
-    opts: undefined,
+    opts: { onPartialReply: options.onPartialReply },
+    typingSignals: createTypingSignaler({
+      typing: createTypingController({}),
+      mode: "never",
+      isHeartbeat: options.isHeartbeat === true,
+    }),
     replyOperation: options.replyOperation,
     ...options.delivery,
   } as unknown as AgentTurnParams;
@@ -46,8 +51,10 @@ function createPresentation(
 
 describe("agent runner streaming presentation", () => {
   it.each([
-    { name: "cleaned silent token", caption: "NO_REPLY", silent: true },
-    { name: "cleaned silent envelope", caption: '{"action":"NO_REPLY"}', silent: true },
+    { name: "recorded silent caption", caption: "NO_REPLY", silent: true },
+    { name: "JSON action caption", caption: '{"action":"NO_REPLY"}', silent: false },
+    { name: "quoted token caption", caption: '"NO_REPLY"', silent: false },
+    { name: "punctuated token caption", caption: "NO_REPLY.", silent: false },
     { name: "ordinary code-literal caption", caption: "Use `NO_REPLY` literally.", silent: false },
   ])("preserves $name policy across attachment normalization", async ({ caption, silent }) => {
     const retainedMedia = "https://example.invalid/retained.png";
@@ -75,14 +82,17 @@ describe("agent runner streaming presentation", () => {
       throw new Error("expected the prepared block delivery handler");
     }
     try {
-      await handler({
-        text: `[tool calls omitted]\n${caption}`,
-        mediaUrls: ["https://example.invalid/failed.png", retainedMedia],
-      });
+      await handler(
+        setReplyPayloadMetadata(
+          {
+            text: `[tool calls omitted]\n${caption}`,
+            mediaUrls: ["https://example.invalid/failed.png", retainedMedia],
+          },
+          silent ? { silentReply: true } : {},
+        ),
+      );
       expect(delivered.mock.calls.map(([payload]) => payload.text)).toEqual([
-        silent
-          ? ""
-          : "Use `NO_REPLY` literally.\n⚠️ Example: Delivery failed. Try sending this file again.",
+        silent ? "" : `${caption}\n⚠️ Example: Delivery failed. Try sending this file again.`,
       ]);
       expect(
         delivered.mock.calls.map(
@@ -94,11 +104,28 @@ describe("agent runner streaming presentation", () => {
     }
   });
 
-  it.each(["NO_REPLY", '{"action":"NO_REPLY"}'])(
-    "suppresses cleaned silent blocks before coalesced prepared delivery: %s",
-    async (silentText) => {
-      const { createSubscribedSessionHarness } =
-        await import("../../agents/embedded-agent-subscribe.e2e-harness.js");
+  it.each([
+    {
+      name: "producer-authored silence",
+      text: "NO_REPLY",
+      silent: true,
+      expected: "First.\n\nLast.",
+    },
+    {
+      name: "prepared literal suffix",
+      text: "NO_REPLY",
+      silent: false,
+      expected: "First.\n\nNO_REPLY\n\nLast.",
+    },
+    {
+      name: "directive-stripped literal",
+      text: "[tool calls omitted]\nNO_REPLY",
+      silent: false,
+      expected: "First.\n\nNO_REPLY\n\nLast.",
+    },
+  ])(
+    "preserves $name policy through coalesced prepared delivery",
+    async ({ text, silent, expected }) => {
       const delivered = vi.fn(async (_payload: ReplyPayload) => {});
       const dispatcher = createReplyDispatcher({
         deliver: delivered,
@@ -133,59 +160,16 @@ describe("agent runner streaming presentation", () => {
       if (!handler) {
         throw new Error("expected the prepared block delivery handler");
       }
-      const blocks: string[] = [];
-      const { emit, subscription } = createSubscribedSessionHarness({
-        runId: "run-cleaned-silence",
-        onBlockReply: async (payload) => {
-          blocks.push(payload.text ?? "");
-          await handler(payload);
-        },
-        blockReplyBreak: "text_end",
-        blockReplyChunking: {
-          minChars: 1,
-          maxChars: 1200,
-          breakPreference: "paragraph",
-          flushOnParagraph: true,
-        },
-      });
-      const source = `First.\n\n[tool calls omitted]\n${silentText}\n\nLast.\n\n`;
-      const message = makeAgentAssistantMessage({
-        api: "google-generative-ai",
-        provider: "google",
-        model: "gemini-2.5-flash",
-        content: [{ type: "text", text: source }],
-      });
+      const middle = setReplyPayloadMetadata({ text }, silent ? { silentReply: true } : {});
       try {
-        emit({ type: "message_start", message: { ...message, content: [] } });
-        emit({
-          type: "message_update",
-          message,
-          assistantMessageEvent: {
-            type: "text_delta",
-            contentIndex: 0,
-            delta: source,
-            partial: message,
-          },
-        });
-        emit({
-          type: "message_update",
-          message,
-          assistantMessageEvent: {
-            type: "text_end",
-            contentIndex: 0,
-            content: source,
-            partial: message,
-          },
-        });
-        emit({ type: "message_end", message });
-        await subscription.waitForPendingEvents();
+        await handler({ text: "First." });
+        await handler(middle);
+        await handler({ text: "Last." });
         await pipeline.flush({ force: true });
         await dispatcher.waitForIdle();
 
-        expect(blocks).toEqual(["First.", `[tool calls omitted]\n${silentText}`, "Last."]);
-        expect(delivered.mock.calls.map(([payload]) => payload.text)).toEqual(["First.\n\nLast."]);
+        expect(delivered.mock.calls.map(([payload]) => payload.text)).toEqual([expected]);
       } finally {
-        subscription.unsubscribe();
         pipeline.stop();
         typing.cleanup();
         dispatcher.markComplete();
@@ -368,7 +352,7 @@ describe("agent runner streaming presentation", () => {
     });
   });
 
-  it("classifies streaming control tokens without changing final text", () => {
+  it("presents streaming control tokens without changing final text", async () => {
     const cases: Array<{
       payload: ReplyPayload;
       options?: Parameters<typeof createPresentation>[0];
@@ -384,17 +368,26 @@ describe("agent runner streaming presentation", () => {
         "N",
         "NO_",
         "NO_REPLY",
+        "NO_REPLY.",
+        '"NO_REPLY"',
+        '{"action":"NO_REPLY"}',
         "HEARTBEAT_",
-        "HEARTBEAT_OK",
-        " ",
-        "  ",
-        "  \n",
-        "[tool calls omitted]",
-      ].map((text) => ({ payload: { text }, expected: { skip: true } })),
-      { payload: { text: "NO_REPLYVisible" }, expected: { text: "Visible", skip: false } },
+      ].map((text) => ({ payload: { text }, expected: { text, skip: false } })),
+      ...["HEARTBEAT_OK", " ", "  ", "  \n", "[tool calls omitted]"].map((text) => ({
+        payload: { text },
+        expected: { skip: true },
+      })),
+      {
+        payload: { text: "NO_REPLYVisible" },
+        expected: { text: "NO_REPLYVisible", skip: false },
+      },
       {
         payload: { text: "NO_REPLYVisible answer" },
-        expected: { text: "Visible answer", skip: false },
+        expected: { text: "NO_REPLYVisible answer", skip: false },
+      },
+      {
+        payload: { text: "NO_REPLY\nVisible answer" },
+        expected: { text: "NO_REPLY\nVisible answer", skip: false },
       },
       {
         payload: { mediaUrls: ["https://example.invalid/image.png"] },
@@ -412,30 +405,32 @@ describe("agent runner streaming presentation", () => {
       },
     ];
     for (const { payload, options, expected } of cases) {
-      const presentation = createPresentation(options);
-      const classified = presentation.classifyStreamingPartial(payload);
-      const actual =
-        classified.skip || !classified.text
-          ? classified
-          : presentation.sanitizeStreamingText(classified.text, Boolean(payload.isError));
-      expect(actual).toEqual(expected);
-      if (options || payload.text === "No, that is wrong.") {
-        expect(classified).toEqual(expected);
+      const onPartialReply = vi.fn<NonNullable<GetReplyOptions["onPartialReply"]>>();
+      const presentation = createPresentation({ ...options, onPartialReply });
+      await presentation.presentPartialReply(payload, "cli");
+      if (expected.skip || !expected.text) {
+        expect(onPartialReply).not.toHaveBeenCalled();
+      } else {
+        expect(onPartialReply).toHaveBeenCalledExactlyOnceWith({ text: expected.text });
+      }
+      if (payload.mediaUrls) {
+        expect(presentation.normalizeStreamingText(payload)).toEqual(expected);
       }
       if (payload.text === "N") {
         // Final text is not an incomplete cumulative preview (#122476).
-        expect(classified).toEqual({ skip: true });
         expect(presentation.normalizeStreamingText(payload)).toEqual({ text: "N", skip: false });
       }
     }
   });
 
-  it("holds punctuation-prefixed silent previews until they diverge or finish", () => {
-    const presentation = createPresentation();
+  it("forwards prepared punctuation-prefixed text without control buffering", async () => {
+    const onPartialReply = vi.fn<NonNullable<GetReplyOptions["onPartialReply"]>>();
+    const presentation = createPresentation({ onPartialReply });
 
     for (const text of [".N", ". N", "- N", ".NO", ".NO_", ".NO_REPL", "*NO_", '"NO_', "（NO_"]) {
-      expect(presentation.classifyStreamingPartial({ text })).toEqual({ skip: true });
+      await presentation.presentPartialReply({ text }, "cli");
     }
+    expect(onPartialReply).toHaveBeenCalledTimes(9);
     for (const text of [
       ".NOTE: real content",
       "- Note: real content",
@@ -446,17 +441,20 @@ describe("agent runner streaming presentation", () => {
       ".",
       "*",
     ]) {
-      expect(presentation.classifyStreamingPartial({ text })).toEqual({ text, skip: false });
+      await presentation.presentPartialReply({ text }, "cli");
+      expect(onPartialReply).toHaveBeenLastCalledWith({ text });
     }
     for (const text of [".NO", ".N", ". N", "- N", "*NO_", '"NO_', "（NO_", ".", "*"]) {
       expect(presentation.normalizeStreamingText({ text })).toEqual({ text, skip: false });
     }
   });
 
-  it("keeps large ordinary previews visible after a punctuation prefix", () => {
-    const presentation = createPresentation();
+  it("keeps large ordinary previews visible after a punctuation prefix", async () => {
+    const onPartialReply = vi.fn<NonNullable<GetReplyOptions["onPartialReply"]>>();
+    const presentation = createPresentation({ onPartialReply });
     const text = `.NOTE: ${"ordinary text ".repeat(10_000)}`;
 
-    expect(presentation.classifyStreamingPartial({ text })).toEqual({ text, skip: false });
+    await presentation.presentPartialReply({ text }, "cli");
+    expect(onPartialReply).toHaveBeenCalledExactlyOnceWith({ text });
   });
 });

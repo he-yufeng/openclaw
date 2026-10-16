@@ -3,6 +3,7 @@ import {
   normalizeNullableString as toTrimmedString,
   normalizeLowercaseStringOrEmpty,
 } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { SessionOperationEvent } from "../../../../packages/gateway-protocol/src/schema/sessions.js";
 import type { ExecApprovalRequest } from "../../app/exec-approval.ts";
 import type { ChatQueueItem } from "../../lib/chat/chat-types.ts";
@@ -307,9 +308,7 @@ function handleLifecycleFallbackEvent(host: ToolStreamHost, payload: AgentEventP
   const active =
     resolveModelLabel(data.activeProvider, data.activeModel) ??
     resolveModelLabel(data.toProvider, data.toModel);
-  const previous =
-    resolveModelLabel(data.previousActiveProvider, data.previousActiveModel) ??
-    toTrimmedString(data.previousActiveModel);
+  const previous = resolveModelLabel(data.previousActiveProvider, data.previousActiveModel);
   if (!selected || !active) {
     return;
   }
@@ -370,6 +369,51 @@ function handleLifecycleApprovalEvent(host: ToolStreamHost, payload: AgentEventP
 }
 
 export function handleStreamStatus(host: ToolStreamHost, payload: AgentEventPayload): boolean {
+  if (
+    payload.stream === "run_status" &&
+    (payload.data.phase === "waiting_for_model" || payload.data.phase === "starting_model")
+  ) {
+    reconcileChatRunStartup(host, {
+      state: "status",
+      runId: payload.runId,
+      phase: payload.data.phase,
+      ...(payload.data.phase === "waiting_for_model"
+        ? { waitReason: payload.data.reason === "slot" ? "slot" : "response" }
+        : {}),
+      seq: payload.seq,
+    });
+    return true;
+  }
+  if (
+    payload.stream === "lifecycle" &&
+    payload.data.phase === "start" &&
+    host.chatRunStartup?.state === "status" &&
+    host.chatRunStartup.phase === "finishing"
+  ) {
+    reconcileChatRunStartup(host, { state: "activity", runId: payload.runId, seq: payload.seq });
+  }
+  if (payload.stream === "lifecycle" && payload.data.phase === "finishing") {
+    reconcileChatRunStartup(host, {
+      state: "status",
+      runId: payload.runId,
+      phase: "finishing",
+      seq: payload.seq,
+    });
+    return true;
+  }
+  if (payload.stream === "lifecycle" && payload.data.phase === "fallback_step") {
+    const model = toTrimmedString(payload.data.fallbackStepToModel);
+    if (payload.data.fallbackStepFinalOutcome === "next_fallback" && model) {
+      reconcileChatRunStartup(host, {
+        state: "status",
+        runId: payload.runId,
+        phase: "fallback",
+        message: formatUiExternalText(truncateUtf16Safe(model, 256)),
+        seq: payload.seq,
+      });
+    }
+    return true;
+  }
   if (payload.stream === "run_status" && payload.data.phase === "retrying") {
     const message = toTrimmedString(payload.data.message);
     if (message) {
@@ -377,14 +421,27 @@ export function handleStreamStatus(host: ToolStreamHost, payload: AgentEventPayl
         state: "status",
         runId: payload.runId,
         phase: "retrying",
-        message: formatUiExternalText(message.slice(0, 256)),
+        message: formatUiExternalText(truncateUtf16Safe(message, 256)),
+        ...(typeof payload.data.retryAt === "number" && Number.isFinite(payload.data.retryAt)
+          ? { retryAt: payload.data.retryAt }
+          : {}),
         seq: payload.seq,
       });
     }
     return true;
   }
   if (payload.stream === "assistant") {
-    reconcileChatRunStartup(host, { state: "activity", runId: payload.runId, seq: payload.seq });
+    if ((payload.data.text || payload.data.delta) && payload.data.phase !== "commentary") {
+      reconcileChatRunStartup(host, {
+        state: "status",
+        runId: payload.runId,
+        phase: "answer",
+        seq: payload.seq,
+      });
+    } else {
+      // Reconnect snapshots retain the assistant sequence without copying its text.
+      reconcileChatRunStartup(host, { state: "activity", runId: payload.runId, seq: payload.seq });
+    }
     return true;
   }
   if (payload.stream === "compaction") {
@@ -396,12 +453,9 @@ export function handleStreamStatus(host: ToolStreamHost, payload: AgentEventPayl
       return true;
     }
     handleLifecycleCompactionEvent(host, payload);
-    handleLifecycleFallbackEvent(host, payload);
-    return true;
+  } else if (payload.stream !== "fallback") {
+    return false;
   }
-  if (payload.stream === "fallback") {
-    handleLifecycleFallbackEvent(host, payload);
-    return true;
-  }
-  return false;
+  handleLifecycleFallbackEvent(host, payload);
+  return true;
 }

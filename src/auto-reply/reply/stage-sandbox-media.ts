@@ -1,4 +1,3 @@
-// Stages inbound media into sandbox workspaces before agent execution.
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -8,7 +7,7 @@ import { normalizeOptionalString } from "@openclaw/normalization-core/string-coe
 import { sliceUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { assertSandboxPath } from "../../agents/sandbox-paths.js";
-import { ensureSandboxWorkspaceForSession, resolveSandboxContext } from "../../agents/sandbox.js";
+import { prepareSandboxWorkspaceForSession, resolveSandboxContext } from "../../agents/sandbox.js";
 import { resolveSandboxConfigForAgent } from "../../agents/sandbox/config.js";
 import { slugifySessionKey } from "../../agents/sandbox/shared.js";
 import { getAgentWorkspaceAccess } from "../../agents/workspace-access.js";
@@ -37,7 +36,6 @@ import type { SkillSnapshot } from "../../skills/types.js";
 import { CONFIG_DIR } from "../../utils.js";
 import type { RuntimeMsgContext as MsgContext, TemplateContext } from "../templating.js";
 
-/** Maximum size of one file copied into an agent sandbox or staging workspace. */
 export const SANDBOX_MEDIA_MAX_BYTES = STAGED_INPUT_MAX_BYTES;
 const SCP_STDERR_TAIL_CHARS = 16_384;
 
@@ -59,6 +57,7 @@ export async function stageSandboxMedia(params: {
   skillsSnapshot?: SkillSnapshot;
   remoteMediaMode?: "sandbox-or-cache" | "cache";
   abortSignal?: AbortSignal;
+  awaitSessionDiffBaseline?: () => Promise<void>;
 }): Promise<StageSandboxMediaResult> {
   const { ctx, sessionCtx, cfg, sessionKey, workspaceDir, abortSignal } = params;
   abortSignal?.throwIfAborted();
@@ -83,6 +82,8 @@ export async function stageSandboxMedia(params: {
   const forceRemoteCache =
     ctx.MediaRemoteHost &&
     (remoteWorkspace?.prepareTurnAttachments || params.remoteMediaMode === "cache");
+  await params.awaitSessionDiffBaseline?.();
+  abortSignal?.throwIfAborted();
   const sandboxParams = {
     config: cfg,
     agentId: params.agentId,
@@ -98,9 +99,15 @@ export async function stageSandboxMedia(params: {
     ).backend === "ssh"
       ? await resolveSandboxContext(sandboxParams)
       : null;
-  const sandbox = forceRemoteCache
-    ? null
-    : (sshSandbox ?? (await ensureSandboxWorkspaceForSession(sandboxParams)));
+  using sandboxLifetime = { [Symbol.dispose]: () => sshSandbox?.[Symbol.dispose]?.() };
+  void sandboxLifetime;
+  using preparedWorkspace =
+    forceRemoteCache || sshSandbox ? null : await prepareSandboxWorkspaceForSession(sandboxParams);
+  const sandbox = sshSandbox ?? preparedWorkspace?.workspace;
+  const assertCurrent = () => {
+    abortSignal?.throwIfAborted();
+    preparedWorkspace?.assertCurrent();
+  };
   const remoteBridge = sshSandbox?.fsBridge;
   if (sshSandbox && !remoteBridge) {
     throw new Error("SSH sandbox has no filesystem bridge for inbound media staging");
@@ -118,9 +125,13 @@ export async function stageSandboxMedia(params: {
     return EMPTY_STAGE_RESULT;
   }
 
-  if (!remoteBridge) {
+  if (!sandbox) {
+    abortSignal?.throwIfAborted();
     await fs.mkdir(effectiveWorkspaceDir, { recursive: true });
   }
+  const destination = remoteBridge
+    ? { bridge: remoteBridge }
+    : { root: await fsRoot(effectiveWorkspaceDir, { assertBeforeMutation: assertCurrent }) };
   const remoteAttachmentRoots = ctx.MediaRemoteHost
     ? (resolveChannelRemoteInboundAttachmentRoots({ cfg, ctx }) ?? [])
     : [];
@@ -133,12 +144,12 @@ export async function stageSandboxMedia(params: {
   const prepareDestination = async () => {
     if (!stagingReady) {
       // Keep the privacy marker ahead of file publication, after source validation.
-      if (remoteBridge) {
-        if (!remoteBridge.createFileExclusive) {
+      if (destination.bridge) {
+        if (!destination.bridge.createFileExclusive) {
           throw new Error("SSH sandbox filesystem does not support exclusive input staging");
         }
         abortSignal?.throwIfAborted();
-        const created = await remoteBridge.createFileExclusive({
+        const created = await destination.bridge.createFileExclusive({
           filePath: `${inputDirectory}/.gitignore`,
           data: STAGED_INPUT_GITIGNORE,
           signal: abortSignal,
@@ -147,7 +158,7 @@ export async function stageSandboxMedia(params: {
           throw new Error("Input staging directory is not owned by OpenClaw");
         }
       } else {
-        await ensureStagedInputDirectory(effectiveWorkspaceDir, inputDirectory, abortSignal);
+        await ensureStagedInputDirectory(destination.root, inputDirectory, abortSignal);
       }
       stagingReady = true;
     }
@@ -175,18 +186,19 @@ export async function stageSandboxMedia(params: {
     const dest = path.join(effectiveWorkspaceDir, relativeDest);
     let downloadedMediaUri: string | undefined;
     const stageSource = async (sourcePath: string) => {
-      if (remoteBridge) {
-        const { buffer } = await readLocalFileSafely({
-          filePath: sourcePath,
-          maxBytes: SANDBOX_MEDIA_MAX_BYTES,
-        });
-        abortSignal?.throwIfAborted();
-        await prepareDestination();
-        abortSignal?.throwIfAborted();
-        if (!remoteBridge.createFileExclusive) {
+      const { buffer } = await readLocalFileSafely({
+        filePath: sourcePath,
+        maxBytes: SANDBOX_MEDIA_MAX_BYTES,
+      });
+      // A completed read must not start a new copy after cancellation.
+      abortSignal?.throwIfAborted();
+      await prepareDestination();
+      abortSignal?.throwIfAborted();
+      if (destination.bridge) {
+        if (!destination.bridge.createFileExclusive) {
           throw new Error("SSH sandbox filesystem does not support exclusive input staging");
         }
-        const created = await remoteBridge.createFileExclusive({
+        const created = await destination.bridge.createFileExclusive({
           filePath: relativeDest,
           data: buffer,
           signal: abortSignal,
@@ -209,16 +221,7 @@ export async function stageSandboxMedia(params: {
           downloadedMediaUri = buildInboundMediaUriFromPath(saved.path);
         }
       } else {
-        const root = await fsRoot(effectiveWorkspaceDir);
-        const { buffer } = await readLocalFileSafely({
-          filePath: sourcePath,
-          maxBytes: SANDBOX_MEDIA_MAX_BYTES,
-        });
-        // A completed read must not start a new copy after cancellation.
-        abortSignal?.throwIfAborted();
-        await prepareDestination();
-        abortSignal?.throwIfAborted();
-        await root.create(relativeDest, buffer);
+        await destination.root.create(relativeDest, buffer);
       }
     };
 
@@ -246,7 +249,6 @@ export async function stageSandboxMedia(params: {
       continue;
     }
 
-    // For sandbox use relative path, for remote cache use absolute path
     const stagedPath = sandbox ? relativeDest : dest;
     staged.set(entry.index, stagedPath);
     const originalUrl = media[entry.index]?.url;
@@ -327,15 +329,12 @@ async function isUrlAliasForStagedSource(params: {
   if (!urlSource) {
     return false;
   }
-  const [sourceIdentity, urlIdentity] = await Promise.all([
-    resolveLocalSourceIdentity(params.source),
-    resolveLocalSourceIdentity(urlSource),
-  ]);
+  const [sourceIdentity, urlIdentity] = await Promise.all(
+    [params.source, urlSource].map((source) =>
+      fs.realpath(source).catch(() => path.resolve(source)),
+    ),
+  );
   return sourceIdentity === urlIdentity;
-}
-
-async function resolveLocalSourceIdentity(sourcePath: string): Promise<string> {
-  return await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
 }
 
 async function resolveStageableMediaSource(value: string): Promise<string | null> {

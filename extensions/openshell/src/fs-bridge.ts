@@ -91,37 +91,33 @@ class OpenShellFsBridge implements SandboxFsBridge {
   }
 
   async writeFile(params: Parameters<SandboxFsBridge["writeFile"]>[0]): Promise<void> {
-    const target = this.resolveTarget(params);
-    const hostPath = target.hostPath;
-    this.ensureWritable(target, "write files");
-    const buffer = Buffer.isBuffer(params.data)
-      ? params.data
-      : Buffer.from(params.data, params.encoding ?? "utf8");
-    const root = await fsRoot(target.mountHostRoot);
-    await root.write(relativeToRoot(target, hostPath), buffer, {
-      mkdir: params.mkdir,
-      mutationSymlinks: "reject",
-    });
-    await this.backend.syncLocalPathToRemote(hostPath, target.containerPath);
+    await this.writeLocalFile(params, "write");
   }
 
   async createFileExclusive(
     params: Parameters<NonNullable<SandboxFsBridge["createFileExclusive"]>>[0],
   ): Promise<"created" | "exists"> {
+    return this.writeLocalFile(params, "create");
+  }
+
+  private async writeLocalFile(
+    params: Parameters<SandboxFsBridge["writeFile"]>[0],
+    method: "write" | "create",
+  ): Promise<"created" | "exists"> {
     const target = this.resolveTarget(params);
     const hostPath = target.hostPath;
-    this.ensureWritable(target, "create files");
+    this.ensureWritable(target, method === "create" ? "create files" : "write files");
     const buffer = Buffer.isBuffer(params.data)
       ? params.data
       : Buffer.from(params.data, params.encoding ?? "utf8");
     const root = await fsRoot(target.mountHostRoot);
     try {
-      await root.create(relativeToRoot(target, hostPath), buffer, {
-        mkdir: params.mkdir !== false,
+      await root[method](relativeToRoot(target, hostPath), buffer, {
+        mkdir: method === "create" ? params.mkdir !== false : params.mkdir,
         mutationSymlinks: "reject",
       });
     } catch (error) {
-      if (error instanceof FsSafeError && error.code === "already-exists") {
+      if (method === "create" && error instanceof FsSafeError && error.code === "already-exists") {
         return "exists";
       }
       throw error;
@@ -175,15 +171,7 @@ class OpenShellFsBridge implements SandboxFsBridge {
       target: to,
       allowFinalSymlinkForUnlink: false,
     });
-    await assertRenameSourceSupported(from.hostPath);
-    if (from.mountHostRoot !== to.mountHostRoot) {
-      throw new Error("OpenShell cross-root mirror renames require pinned fs-safe support");
-    }
-    await assertSameDeviceRenameSupported({
-      fromHostPath: from.hostPath,
-      root: from.mountHostRoot,
-      toHostPath: to.hostPath,
-    });
+    await assertRenameSupported(from, to);
     await this.backend.renameRemotePath(from.containerPath, to.containerPath, params.signal);
     const root = await fsRoot(from.mountHostRoot);
     const fromRelativePath = relativeToRoot(from, from.hostPath);
@@ -362,47 +350,26 @@ class OpenShellFsBridge implements SandboxFsBridge {
 
     // Resolve protected host aliases before the writable workspace that contains
     // them; virtual mount shadows still resolve through the container table below.
-    for (const mount of readOnlyMounts) {
+    for (const mount of [
+      ...readOnlyMounts,
+      { hostPath: workspaceRoot, containerPath: workspaceContainerRoot },
+      ...(hasAgentMount ? [{ hostPath: agentRoot, containerPath: agentContainerRoot }] : []),
+    ]) {
       if (isPathInside(mount.hostPath, hostPath)) {
         const relative = path
           .relative(mount.hostPath, hostPath)
           .split(path.sep)
           .join(path.posix.sep);
-        return expectResolvedContainerTarget(
-          resolveContainerTarget(path.posix.join(mount.containerPath, relative)),
-          input,
-        );
+        const target = resolveContainerTarget(path.posix.join(mount.containerPath, relative));
+        if (!target) {
+          throw new Error(`Sandbox path escapes allowed mounts; cannot access: ${input}`);
+        }
+        return target;
       }
-    }
-
-    if (isPathInside(workspaceRoot, hostPath)) {
-      const relative = path.relative(workspaceRoot, hostPath).split(path.sep).join(path.posix.sep);
-      return expectResolvedContainerTarget(
-        resolveContainerTarget(path.posix.join(workspaceContainerRoot, relative)),
-        input,
-      );
-    }
-
-    if (hasAgentMount && isPathInside(agentRoot, hostPath)) {
-      const relative = path.relative(agentRoot, hostPath).split(path.sep).join(path.posix.sep);
-      return expectResolvedContainerTarget(
-        resolveContainerTarget(path.posix.join(agentContainerRoot, relative)),
-        input,
-      );
     }
 
     throw new Error(`Path escapes sandbox root (${workspaceRoot}): ${params.filePath}`);
   }
-}
-
-function expectResolvedContainerTarget(
-  target: ResolvedMountPath | undefined,
-  input: string,
-): ResolvedMountPath {
-  if (!target) {
-    throw new Error(`Sandbox path escapes allowed mounts; cannot access: ${input}`);
-  }
-  return target;
 }
 
 async function removeLocalRootPath(params: {
@@ -445,8 +412,11 @@ function relativeToRoot(target: ResolvedMountPath, hostPath: string): string {
   return relativePath ? `.${path.sep}${relativePath}` : "";
 }
 
-async function assertRenameSourceSupported(fromHostPath: string): Promise<void> {
-  const stats = await fsPromises.lstat(fromHostPath);
+async function assertRenameSupported(
+  from: ResolvedMountPath,
+  to: ResolvedMountPath,
+): Promise<void> {
+  const stats = await fsPromises.lstat(from.hostPath);
   if (stats.isSymbolicLink()) {
     throw new Error("Sandbox symlink rename sources are not supported by the local mirror bridge");
   }
@@ -455,19 +425,14 @@ async function assertRenameSourceSupported(fromHostPath: string): Promise<void> 
       "Sandbox hardlinked rename sources are not supported by the local mirror bridge",
     );
   }
-}
-
-async function assertSameDeviceRenameSupported(params: {
-  fromHostPath: string;
-  root: string;
-  toHostPath: string;
-}): Promise<void> {
-  const sourceStats = await fsPromises.lstat(params.fromHostPath);
+  if (from.mountHostRoot !== to.mountHostRoot) {
+    throw new Error("OpenShell cross-root mirror renames require pinned fs-safe support");
+  }
   const destinationParentStats = await nearestExistingDirectoryStats({
-    root: params.root,
-    targetPath: path.dirname(params.toHostPath),
+    root: from.mountHostRoot,
+    targetPath: path.dirname(to.hostPath),
   });
-  if (sourceStats.dev !== destinationParentStats.dev) {
+  if (stats.dev !== destinationParentStats.dev) {
     throw new Error("OpenShell cross-device mirror renames require pinned fs-safe support");
   }
 }

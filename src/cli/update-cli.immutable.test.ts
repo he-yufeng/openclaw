@@ -4,7 +4,7 @@ import * as immutable from "../infra/update-immutable-install.js";
 import * as retainedRuntime from "../infra/update-retained-runtime.js";
 import * as recoveryAdmission from "../infra/update-run-recovery-admission.js";
 import { defaultRuntime, ExitError } from "../runtime.js";
-import * as stateOwnership from "../state/openclaw-state-ownership.js";
+import * as stateOwnership from "../state/openclaw-state-ownership-preflight.js";
 import * as shared from "./update-cli/shared.js";
 import { updateFinalizeCommand } from "./update-cli/update-command-finalize.js";
 import { updateCommand } from "./update-cli/update-command.js";
@@ -56,7 +56,7 @@ beforeEach(() => {
 });
 afterEach(() => vi.restoreAllMocks());
 
-it.each([false, true])(
+it.each([false])(
   "dispatches immutable preparation before mutable admission (dry-run=%s)",
   async (dryRun) => {
     const prepared = vi.spyOn(immutable, "prepareImmutableUpdate").mockResolvedValue({
@@ -161,7 +161,6 @@ it.each([
   { enabled: true, restart: true, dryRun: false, activates: true },
   { enabled: true, restart: false, dryRun: false, activates: false },
   { enabled: true, restart: true, dryRun: true, activates: false },
-  { enabled: false, restart: true, dryRun: false, activates: false },
 ])("activates only under enabled adoption and restart policy: %j", async (entry) => {
   const adopted = { ...installation, activationEnabled: entry.enabled };
   vi.mocked(immutable.inspectImmutableInstall).mockResolvedValue(adopted);

@@ -61,19 +61,17 @@ export async function listAllCodexAppServerModels(
   const maxPages = normalizeMaxPages(options.maxPages);
   return await withCodexAppServerModelRequest(options, async (request) => {
     const models: CodexAppServerModel[] = [];
-    let cursor = options.cursor;
     let nextCursor: string | undefined;
     for (let page = 0; page < maxPages; page += 1) {
       const result = await requestModelListPage(request, {
         ...options,
-        cursor,
+        cursor: page === 0 ? options.cursor : nextCursor,
       });
       models.push(...result.models);
       nextCursor = result.nextCursor;
       if (!nextCursor) {
         return { models };
       }
-      cursor = nextCursor;
     }
     return { models, nextCursor, truncated: true };
   });
@@ -127,7 +125,7 @@ async function requestModelListPage(
 export function readModelListResult(value: unknown): CodexAppServerModelListResult {
   const response = assertCodexModelListResponse(value);
   const models = response.data.map(readCodexModel);
-  const nextCursor = response.nextCursor ?? undefined;
+  const nextCursor = response.nextCursor;
   return { models, ...(nextCursor ? { nextCursor } : {}) };
 }
 
@@ -149,7 +147,7 @@ function readCodexModel(value: CodexModel): CodexAppServerModel {
     ...(description ? { description } : {}),
     hidden: value.hidden,
     isDefault: value.isDefault,
-    inputModalities: value.inputModalities,
+    inputModalities: value.inputModalities ?? ["text", "image"],
     serviceTiers: normalizeUniqueTrimmedStringList(
       (value.serviceTiers ?? []).map((tier) => tier.id),
     ),

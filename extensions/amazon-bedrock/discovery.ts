@@ -1,8 +1,4 @@
 import type { BedrockClient, ListInferenceProfilesCommandOutput } from "@aws-sdk/client-bedrock";
-import {
-  isFutureDateTimestampMs,
-  resolveExpiresAtMsFromDurationSeconds,
-} from "openclaw/plugin-sdk/number-runtime";
 import { resolveAwsSdkEnvVarName } from "openclaw/plugin-sdk/provider-auth-runtime";
 import { LiveModelCatalogHttpError } from "openclaw/plugin-sdk/provider-catalog-live-runtime";
 import type {
@@ -198,8 +194,6 @@ export async function discoverBedrockModels(params: {
   region: string;
   discoveryMode?: "strict";
   config?: BedrockDiscoveryConfig;
-  now?: () => number;
-  clientFactory?: (region: string) => BedrockClient;
 }): Promise<ModelDefinitionConfig[]> {
   const refreshIntervalSeconds = Math.max(
     0,
@@ -220,19 +214,18 @@ export async function discoverBedrockModels(params: {
     defaultContextWindow,
     defaultMaxTokens,
   });
-  const now = params.now?.() ?? Date.now();
+  const now = Date.now();
 
   if (refreshIntervalSeconds > 0) {
     const cached = discoveryCache.get(cacheKey);
-    if (cached && isFutureDateTimestampMs(cached.expiresAt, { nowMs: now })) {
+    if (cached && cached.expiresAt > now) {
       return cached.result;
     }
     discoveryCache.delete(cacheKey);
   }
 
   const sdk = await loadBedrockControlPlaneSdk();
-  const clientFactory = params.clientFactory ?? ((region: string) => sdk.createClient(region));
-  const client = clientFactory(params.region);
+  const client = sdk.createClient(params.region);
 
   const discoveryPromise = (async () => {
     try {
@@ -262,9 +255,7 @@ export async function discoverBedrockModels(params: {
           continue;
         }
         if (providerFilter.length > 0) {
-          const providerName =
-            summary.providerName ??
-            (typeof summary.modelId === "string" ? summary.modelId.split(".")[0] : undefined);
+          const providerName = summary.providerName ?? summary.modelId.split(".")[0];
           const provider = normalizeOptionalLowercaseString(providerName);
           if (!provider || !providerFilter.includes(provider)) {
             continue;
@@ -406,13 +397,10 @@ export async function discoverBedrockModels(params: {
   });
 
   if (refreshIntervalSeconds > 0) {
-    const expiresAt = resolveExpiresAtMsFromDurationSeconds(refreshIntervalSeconds, { nowMs: now });
-    if (expiresAt !== undefined) {
-      discoveryCache.set(cacheKey, {
-        expiresAt,
-        result: discoveryPromise,
-      });
-    }
+    discoveryCache.set(cacheKey, {
+      expiresAt: now + refreshIntervalSeconds * 1000,
+      result: discoveryPromise,
+    });
   }
 
   return discoveryPromise;
@@ -423,7 +411,6 @@ export async function resolveImplicitBedrockProvider(params: {
   pluginConfig?: { discovery?: BedrockDiscoveryConfig };
   discoveryMode?: "strict";
   env?: NodeJS.ProcessEnv;
-  clientFactory?: (region: string) => BedrockClient;
 }): Promise<ModelProviderConfig | null> {
   const env = params.env ?? process.env;
   const discoveryConfig = params.pluginConfig?.discovery;
@@ -445,7 +432,6 @@ export async function resolveImplicitBedrockProvider(params: {
     region,
     discoveryMode: params.discoveryMode,
     config: discoveryConfig,
-    clientFactory: params.clientFactory,
   });
   if (models.length === 0 && params.discoveryMode !== "strict") {
     return null;

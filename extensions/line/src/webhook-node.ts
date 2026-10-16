@@ -29,8 +29,6 @@ async function readLineWebhookRequestBody(
   });
 }
 
-type ReadBodyFn = (req: IncomingMessage, maxBytes: number, timeoutMs: number) => Promise<string>;
-
 /**
  * Answer a body-limit failure through the connection owner.
  *
@@ -77,7 +75,7 @@ function sendLineWebhookJson(
 export function createLineNodeWebhookHandler(params: {
   getTargets: () => readonly LineWebhookTarget[];
   runtime: RuntimeEnv;
-  readBody?: ReadBodyFn;
+  readBody?: typeof readLineWebhookRequestBody;
 }): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   const readBody = params.readBody ?? readLineWebhookRequestBody;
 
@@ -150,7 +148,6 @@ export function createLineNodeWebhookHandler(params: {
       }
 
       if (body.events && body.events.length > 0) {
-        logVerbose(`line: received ${body.events.length} webhook events`);
         // Only the admission owner can distinguish queued events from ignored standby deliveries.
         if ((await match.target.bot.handleWebhook(body)) === "durable") {
           res.setHeader("x-openclaw-delivery-accepted", "durable");

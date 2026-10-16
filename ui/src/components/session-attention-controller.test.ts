@@ -1,5 +1,5 @@
-import type { ReactiveController } from "lit";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SolidController } from "../lib/reactive/solid-controller-host.ts";
 import { isSessionSnoozed } from "../lib/sessions/session-snooze.ts";
 import { SessionAttentionController } from "./session-attention-controller.ts";
 
@@ -13,8 +13,8 @@ function setup(snoozedUntil: number) {
   const host = {
     isConnected: true,
     sessionAttentionContext: undefined,
-    addController: (_controller: ReactiveController) => {},
-    removeController: (_controller: ReactiveController) => {},
+    addController: (_controller: SolidController) => {},
+    removeController: (_controller: SolidController) => {},
     updateComplete: Promise.resolve(true),
     requestUpdate: vi.fn(() => {
       visible = !isSessionSnoozed(row, Date.now());

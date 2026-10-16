@@ -14,6 +14,10 @@ import { setMcpCodeModeGuestResultFromAgentResult } from "./mcp-content.js";
 import { captureAgentPluginRuntimeRefresh } from "./plugin-runtime-refresh.js";
 import type { AgentToolResult } from "./runtime/index.js";
 import {
+  attachInternalToolResultContentSource,
+  copyInternalToolResultState,
+} from "./runtime/internal-hooks.js";
+import {
   captureToolOutputSelection,
   readToolOutputSchemaVariants,
   type ToolOutputSelection,
@@ -27,6 +31,7 @@ import {
   isTrustedToolExecutionPreflightError,
   protectNetworkToolExecutionError,
 } from "./tool-result-error.js";
+import { runWithToolResultDelivery } from "./tool-result-limits.js";
 import {
   compactToolSearchCatalogEntry,
   prepareToolSearchCatalogExecutionTool,
@@ -38,8 +43,8 @@ import {
   renderToolSearchControlText,
   serializeToolSearchControlResult,
 } from "./tool-search-control-result.js";
-import { getTextLexicalIndex } from "./tool-search-index.js";
-import { readParameterText, scoreLexical, tokenizeQuery } from "./tool-search-ranking.js";
+import { getToolSearchLexicalIndex } from "./tool-search-index.js";
+import { scoreLexical, tokenizeQuery } from "./tool-search-ranking.js";
 import {
   formatCatalogInputError,
   formatCatalogOutputError,
@@ -74,59 +79,34 @@ function describeEntry(entry: ToolSearchCatalogEntry) {
   };
 }
 
-/**
- * Text indexed for one catalog entry. Parameter names and their descriptions are
- * included because they often carry the only words a task shares with a tool:
- * "post a message to a channel" reaches a tool whose description says only
- * "Send a message" through its `channel` parameter. Codex and the Claude API
- * tool-search tools index argument metadata for the same reason.
- */
-function toolSearchEntryText(entry: ToolSearchCatalogEntry): string {
-  // Only first-party schemas are walked. MCP and client parameters are untrusted
-  // and deliberately never traversed: compactToolSearchCatalogEntry reports them
-  // as "unknown" for the same reason, and a client may hand us a lazy object that
-  // throws on property access.
-  const parameters = entry.source === "openclaw" ? readParameterText(entry.parameters) : "";
-  return [entry.name, entry.id, entry.label ?? "", entry.description, parameters]
-    .filter(Boolean)
-    .join(" ");
-}
-
 function findEntry(
   catalog: ToolSearchCatalogSession,
   id: string,
   options?: CatalogVisibilityOptions & ToolLookupErrorOptions,
+  match: "id-or-name" | "exact-id" = "id-or-name",
 ): ToolSearchCatalogEntry {
   const needle = id.trim();
-  const entries = visibleCatalogEntries(catalog, options);
+  const entries = match === "exact-id" ? catalog.entries : visibleCatalogEntries(catalog, options);
   const exactIdEntry = entries.find((candidate) => candidate.id === needle);
   if (exactIdEntry) {
     return exactIdEntry;
   }
-  const namedEntries = entries.filter((candidate) => candidate.name === needle);
+  const namedEntries =
+    match === "exact-id" ? [] : entries.filter((candidate) => candidate.name === needle);
   if (namedEntries.length > 1) {
     throw new ToolInputError(`Ambiguous tool name: ${needle}; use an exact tool id.`);
   }
   const namedEntry = namedEntries[0];
   if (!namedEntry) {
-    throw new ToolInputError(formatUnknownToolIdError(needle, entries, options));
-  }
-  return namedEntry;
-}
-
-function findEntryByExactId(
-  catalog: ToolSearchCatalogSession,
-  id: string,
-  errorOptions: ToolLookupErrorOptions = {},
-): ToolSearchCatalogEntry {
-  const needle = id.trim();
-  const entry = catalog.entries.find((candidate) => candidate.id === needle);
-  if (!entry) {
     throw new ToolInputError(
-      formatUnknownToolIdError(needle, catalog.entries, { ...errorOptions, exactIdOnly: true }),
+      formatUnknownToolIdError(
+        needle,
+        entries,
+        match === "exact-id" ? { ...options, exactIdOnly: true } : options,
+      ),
     );
   }
-  return entry;
+  return namedEntry;
 }
 
 type CatalogSchemaName = "inputSchema" | "outputSchema";
@@ -152,12 +132,6 @@ async function validateCatalogSchemaValue(
   }
   try {
     if (schemaName === "outputSchema") {
-      if (
-        outputSelection &&
-        readToolOutputSchemaVariants(schema)?.inputProperty !== outputSelection.inputProperty
-      ) {
-        throw new Error("Tool output discriminator changed during execution.");
-      }
       schema = selectToolOutputSchema(
         schema,
         outputSelection ? { [outputSelection.inputProperty]: outputSelection.value } : undefined,
@@ -279,7 +253,7 @@ export class ToolSearchRuntime {
     if (limit === 1 && exactMatches.length === 1) {
       return exactMatches.slice(0, limit).map(compactEntry);
     }
-    const index = getTextLexicalIndex(entries.map(toolSearchEntryText));
+    const index = getToolSearchLexicalIndex(catalog.entries, entries);
     // Resolve shared positions only against this search's effective catalog.
     const hits = scoreLexical(index, tokenizeQuery(query));
     const exactMatchSet = new Set(exactMatches);
@@ -343,17 +317,44 @@ export class ToolSearchRuntime {
   callExactId = async (id: string, input?: unknown, options?: ToolSearchExactCallOptions) => {
     const catalog = resolveCatalog(this.ctx);
     return await this.callEntry(
-      findEntryByExactId(catalog, id, { ...options, codeModeSkills: this.ctx.codeModeSkills }),
+      findEntry(catalog, id, { ...options, codeModeSkills: this.ctx.codeModeSkills }, "exact-id"),
       input,
       options,
     );
   };
 
-  callValue = async (id: string, input?: unknown, options?: ToolSearchCallOptions) =>
-    projectToolResultValue((await this.call(id, input, options)).result);
+  callValue = async (id: string, input?: unknown, options?: ToolSearchCallOptions) => {
+    const catalog = resolveCatalog(this.ctx);
+    return projectToolResultValue(
+      (
+        await this.callEntry(
+          findEntry(catalog, id, { ...options, codeModeSkills: this.ctx.codeModeSkills }),
+          input,
+          options,
+          true,
+        )
+      ).result,
+    );
+  };
 
-  callExactValue = async (id: string, input?: unknown, options?: ToolSearchExactCallOptions) =>
-    projectToolResultValue((await this.callExactId(id, input, options)).result);
+  callExactValue = async (id: string, input?: unknown, options?: ToolSearchExactCallOptions) => {
+    const catalog = resolveCatalog(this.ctx);
+    return projectToolResultValue(
+      (
+        await this.callEntry(
+          findEntry(
+            catalog,
+            id,
+            { ...options, codeModeSkills: this.ctx.codeModeSkills },
+            "exact-id",
+          ),
+          input,
+          options,
+          true,
+        )
+      ).result,
+    );
+  };
 
   observeNetworkContent(parentToolCallId: string): void {
     const state = this.networkInvocations.get(parentToolCallId) ?? { active: 0, observed: false };
@@ -380,7 +381,7 @@ export class ToolSearchRuntime {
   isReplaySafeExactId = (id: string): boolean => {
     let entry: ToolSearchCatalogEntry;
     try {
-      entry = findEntryByExactId(resolveCatalog(this.ctx), id);
+      entry = findEntry(resolveCatalog(this.ctx), id, undefined, "exact-id");
     } catch {
       return false;
     }
@@ -403,13 +404,16 @@ export class ToolSearchRuntime {
     entry: ToolSearchCatalogEntry,
     input?: unknown,
     options?: ToolSearchCallOptions,
+    fullValue = false,
   ) =>
     runScheduledToolSearchCall({
       ctx: this.ctx,
       entry,
       signal: options?.signal,
       execute: (currentEntry, signal) =>
-        this.executeEntry(resolveCatalog(this.ctx), currentEntry, input, { ...options, signal }),
+        runWithToolResultDelivery(fullValue, () =>
+          this.executeEntry(resolveCatalog(this.ctx), currentEntry, input, { ...options, signal }),
+        ),
     });
 
   private readonly executeEntry = async (
@@ -590,19 +594,25 @@ export function formatToolSearchControlResult<T>(
     parentToolCallId?: string;
     terminalBatchStatus?: "waiting" | "completed" | "failed";
     compact?: boolean;
+    images?: Extract<AgentToolResult<unknown>["content"][number], { type: "image" }>[];
   } = {},
 ): AgentToolResult<T> {
   const serialized = serializeToolSearchControlResult(payload, options.compact);
-  const { text } = renderToolSearchControlText(
-    serialized,
-    runtime?.hasNetworkContent(options.parentToolCallId) ?? false,
-  );
+  const networkContent = runtime?.hasNetworkContent(options.parentToolCallId) ?? false;
+  const { text } = renderToolSearchControlText(serialized, networkContent);
   const result = textResult(text, payload);
+  if (networkContent) {
+    // The control tool has no static source; finalization reads this per-call fact.
+    attachInternalToolResultContentSource(result, "network");
+  }
+  if (options.images?.length) {
+    result.content.push(...options.images);
+  }
   const terminal =
     options.terminalBatchStatus !== "waiting" &&
     runtime?.takeTerminalTargetBatch(options.parentToolCallId) === true;
   // A failed guest cannot revoke an already completed tool's explicit terminal outcome.
-  return terminal ? { ...result, terminate: true } : result;
+  return terminal ? copyInternalToolResultState(result, { ...result, terminate: true }) : result;
 }
 
 /** Keep dynamic failures rejected without exposing network-controlled error text. */

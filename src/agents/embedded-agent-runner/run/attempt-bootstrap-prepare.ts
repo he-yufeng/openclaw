@@ -58,31 +58,29 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
   });
   const resolveWorkspaceBootstrapFiles = (workspaceDir: string) =>
     resolveBootstrapFilesForRun({
-      workspaceDir,
+      bootstrapUserProfileId: attempt.bootstrapUserProfileId,
       config: attempt.config,
       sessionKey: attempt.sessionKey,
       sessionId: attempt.sessionId,
-      bootstrapUserProfileId: attempt.bootstrapUserProfileId,
       chatType: attempt.chatType,
+      workspaceDir,
       agentId: params.setup.sessionAgentId,
       warn: bootstrapWarn,
       contextMode: attempt.bootstrapContextMode,
       runKind: attempt.bootstrapContextRunKind,
     });
   let completedBootstrapTurn: boolean | undefined;
-  const hasCompletedBootstrapTurnForAttempt = async () => {
-    completedBootstrapTurn ??= await hasCompletedBootstrapTurn(attempt.sessionTarget);
-    return completedBootstrapTurn;
-  };
+  const hasCompletedBootstrapTurnForAttempt = async () =>
+    (completedBootstrapTurn ??= await hasCompletedBootstrapTurn(attempt.sessionTarget));
   const resolveBootstrapRouting = (bootstrapFiles?: readonly WorkspaceBootstrapFile[]) =>
     resolveWorkspaceBootstrapRouting({
-      isWorkspaceBootstrapPending,
-      bootstrapFiles,
       bootstrapContextRunKind: attempt.bootstrapContextRunKind,
       trigger: attempt.trigger,
       sessionKey: attempt.sessionKey,
-      isPrimaryRun: isPrimaryBootstrapRun(attempt.sessionKey),
       isCanonicalWorkspace: attempt.isCanonicalWorkspace,
+      isWorkspaceBootstrapPending,
+      bootstrapFiles,
+      isPrimaryRun: isPrimaryBootstrapRun(attempt.sessionKey),
       effectiveWorkspace: params.setup.effectiveWorkspace,
       resolvedWorkspace: bootstrapWorkspaceDir,
       hasBootstrapFileAccess: params.hasReadTool,
@@ -118,6 +116,7 @@ export async function prepareEmbeddedAttemptBootstrap(params: {
     bootstrapContextMode: attempt.bootstrapContextMode,
     bootstrapContextRunKind: attempt.bootstrapContextRunKind ?? "default",
     bootstrapMode,
+    deliversCompleteWorkspaceContext: bootstrapRouting.deliversCompleteWorkspaceContext,
     hasCompletedBootstrapTurn: hasCompletedBootstrapTurnForAttempt,
     resolveBootstrapContextForRun: async () => {
       const bootstrapFiles =

@@ -23,7 +23,7 @@ import {
   resolveWhatsAppCommandAuthorized,
   resolveWhatsAppInboundPolicy,
 } from "../../inbound-policy.js";
-import { requireWhatsAppInboundAdmission } from "../../inbound/admission.js";
+import type { WhatsAppInboundAdmission } from "../../inbound/admission.js";
 import { resolveWhatsAppIngressLifecycle } from "../../inbound/ingress-lifecycle.js";
 import type { AdmittedWebInboundMessage } from "../../inbound/types.js";
 import { newConnectionId } from "../../reconnect.js";
@@ -34,7 +34,6 @@ import {
 } from "../../system-prompt.js";
 import { deliverWebReply } from "../deliver-reply.js";
 import { whatsappInboundLog } from "../loggers.js";
-import { elide } from "../util.js";
 import { maybeSendAckReaction } from "./ack-reaction.js";
 import { hasWhatsAppAudioBody, transcribeWhatsAppAudioMessage } from "./audio-preflight.js";
 import {
@@ -59,7 +58,7 @@ import {
   logVerbose,
   normalizeE164,
   resolveChannelContextVisibilityMode,
-  resolveInboundSessionEnvelopeContext,
+  resolveInboundSessionEnvelopeContextAsync,
   resolvePinnedMainDmOwnerFromAllowlist,
   isControlCommandMessage,
   shouldComputeCommandAuthorized,
@@ -80,9 +79,7 @@ const WHATSAPP_MESSAGE_RECEIVED_HOOK_LIMITS = {
   timeoutMs: 2_000,
 };
 
-function mapWhatsAppIngressToTurnAdmission(
-  ingress: ReturnType<typeof requireWhatsAppInboundAdmission>["ingress"],
-) {
+function mapWhatsAppIngressToTurnAdmission(ingress: WhatsAppInboundAdmission["ingress"]) {
   const reason = ingress.reasonCode;
   if (ingress.admission === "dispatch") {
     return { kind: "dispatch" as const, reason };
@@ -177,7 +174,7 @@ export async function processMessage(params: {
   buildContext?: typeof buildChannelInboundEventContext;
   dispatchReplyFromConfig?: NonNullable<ChannelInboundTurnPlan["dispatchReplyFromConfig"]>;
 }) {
-  const admission = requireWhatsAppInboundAdmission(params.msg);
+  const admission = params.msg.admission;
   if (admission.ingress.admission !== "dispatch" && admission.ingress.admission !== "observe") {
     return false;
   }
@@ -195,11 +192,12 @@ export async function processMessage(params: {
     channel: "whatsapp",
     accountId: account.accountId,
   });
-  const { storePath, envelopeOptions, previousTimestamp } = resolveInboundSessionEnvelopeContext({
-    cfg: params.cfg,
-    agentId: params.route.agentId,
-    sessionKey: params.route.sessionKey,
-  });
+  const { storePath, envelopeOptions, previousTimestamp } =
+    await resolveInboundSessionEnvelopeContextAsync({
+      cfg: params.cfg,
+      agentId: params.route.agentId,
+      sessionKey: params.route.sessionKey,
+    });
   // A caller's null result is a completed preflight, so broadcast agents must not retry it.
   let audioTranscript: string | undefined = params.preflightAudioTranscript ?? undefined;
   if (
@@ -311,7 +309,6 @@ export async function processMessage(params: {
       agentId: params.route.agentId,
       sessionKey: params.route.sessionKey,
       verbose: params.verbose,
-      info: params.replyLogger.info.bind(params.replyLogger),
       warn: params.replyLogger.warn.bind(params.replyLogger),
     });
   }
@@ -323,7 +320,7 @@ export async function processMessage(params: {
       correlationId,
       from: conversationId,
       to: params.msg.platform.recipientJid,
-      body: elide(combinedBody, 240),
+      bodyLength: combinedBody.length,
       mediaType: params.msg.payload.media?.type ?? null,
       mediaPath: params.msg.payload.media?.path ?? null,
     },
@@ -334,9 +331,6 @@ export async function processMessage(params: {
   whatsappInboundLog.info(
     `Inbound message ${conversationId} -> ${params.msg.platform.recipientJid} (${conversationKind}${kindLabel}, ${combinedBody.length} chars)`,
   );
-  if (shouldLogVerbose()) {
-    whatsappInboundLog.debug(`Inbound body: ${elide(combinedBody, 400)}`);
-  }
 
   const sender = getSenderIdentity(params.msg);
   const commandBody = params.msg.payload.commandBody ?? params.msg.payload.body;

@@ -66,6 +66,42 @@ describe("GatewayBrowserClient shared-auth handshake", () => {
     vi.unstubAllGlobals();
   });
 
+  it("publishes negotiated scopes without a device token and retires them on disconnect", async () => {
+    client = new GatewayBrowserClient({ url: "ws://scopes.example.test" });
+    const { ws, connectFrame } = await startConnect(client);
+    const auth = { role: "operator", scopes: ["operator.sessions.read"] };
+    ws.emitMessage({
+      type: "res",
+      id: connectFrame.id,
+      ok: true,
+      payload: {
+        type: "hello-ok",
+        protocol: PROTOCOL_VERSION,
+        auth,
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.auth).toEqual(auth);
+    ws.emitClose(1006, "disconnected");
+    expect(client.auth).toBeNull();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const next = await startConnect(client);
+    next.ws.emitMessage({
+      type: "res",
+      id: next.connectFrame.id,
+      ok: true,
+      payload: {
+        type: "hello-ok",
+        protocol: PROTOCOL_VERSION,
+        auth: { role: "operator", scopes: ["operator.admin"] },
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.auth?.scopes).toEqual(["operator.admin"]);
+    client.stop();
+    expect(client.auth).toBeNull();
+  });
+
   it.each(["rejected", "expired"])(
     "waits on the exact pairing request and stops reconnecting when %s",
     async (decision) => {
@@ -117,7 +153,6 @@ describe("GatewayBrowserClient shared-auth handshake", () => {
       ws.emitClose(1008, `pairing ${decision}`);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(wsInstances).toHaveLength(1);
-      expect(client.pairingRetryPaused).toBe(true);
       expect(client.needsWakeReconnect).toBe(false);
       expect(onClose).toHaveBeenLastCalledWith(
         expect.objectContaining({
@@ -161,6 +196,7 @@ describe("GatewayBrowserClient shared-auth handshake", () => {
       GATEWAY_CLIENT_CAPS.SESSION_SCOPED_EVENTS,
       GATEWAY_CLIENT_CAPS.INLINE_WIDGETS,
       GATEWAY_CLIENT_CAPS.MODEL_SELECTION_POLICY,
+      GATEWAY_CLIENT_CAPS.MODEL_WAIT_STATUS,
       GATEWAY_CLIENT_CAPS.UI_COMMANDS,
       GATEWAY_CLIENT_CAPS.ULTRAFAST,
       GATEWAY_CLIENT_CAPS.USAGE_REFRESHING,

@@ -19,7 +19,7 @@ import {
 } from "../shared/path-binding.js";
 import { createTarArchive } from "./dir-fetch-archive.js";
 import {
-  classifyFsSafeReadError,
+  createReadErrorClassifier,
   readAbsolutePath,
   resolveBoundReadDirectory,
   statRequiredDirectory,
@@ -34,26 +34,7 @@ type DirFetchParams = {
   expectedBinding?: unknown;
 };
 
-type DirFetchErrCode =
-  | "INVALID_PATH"
-  | "NOT_FOUND"
-  | "IS_FILE"
-  | "TREE_TOO_LARGE"
-  | "SYMLINK_REDIRECT"
-  | "CANONICAL_PATH_CHANGED"
-  | "READ_ERROR";
-
-function classifyFsError(err: unknown): DirFetchErrCode {
-  const safeCode = classifyFsSafeReadError(err);
-  if (safeCode) {
-    return safeCode;
-  }
-  const code = (err as { code?: string } | null)?.code;
-  if (code === "ENOENT") {
-    return "NOT_FOUND";
-  }
-  return "READ_ERROR";
-}
+const classifyFsError = createReadErrorClassifier({ ENOENT: "NOT_FOUND" } as const);
 
 async function preflightDu(dirPath: string, maxBytes: number): Promise<boolean> {
   // du -sk gives size in 1KB blocks (512-byte blocks on macOS with -k)
@@ -195,7 +176,7 @@ export async function handleDirFetch(params: DirFetchParams) {
     return {
       ok: false as const,
       code: "CANONICAL_PATH_CHANGED",
-      message: "canonical path differs from the authorized target",
+      message: "resolved path differs from the authorized target",
       canonicalPath: canonical,
     };
   }

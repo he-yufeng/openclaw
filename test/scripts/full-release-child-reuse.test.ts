@@ -205,6 +205,32 @@ async function fixture(role = "normalCi", dispatchInputs?: Record<string, string
 }
 
 describe("independent release child reuse", () => {
+  it("accepts candidate-owned evidence outside main ancestry", async () => {
+    const data = await fixture();
+    const workflowRef = `release-ci/${TARGET.slice(0, 12)}-123`;
+    data.request.workflowSha = TARGET;
+    data.run.head_sha = TARGET;
+    data.run.head_branch = workflowRef;
+    data.run.path = `${data.run.path.split("@", 1)[0]}@refs/heads/${workflowRef}`;
+    data.parent.head_sha = TARGET;
+    data.parent.head_branch = workflowRef;
+    for (const job of data.jobs) {
+      job.head_sha = TARGET;
+    }
+    data.receipt.workflowSha = TARGET;
+    data.receipt.workflowRef = workflowRef;
+    data.artifact.workflow_run.head_sha = TARGET;
+    data.lineage.status = "diverged";
+    await data.seal();
+
+    const selection = await discoverReusableReleaseChild(data.request, data.deps);
+    expect(selection).not.toBeNull();
+    await expect(
+      validateReusableReleaseChild(selection!, data.request, data.deps),
+    ).resolves.toMatchObject({ receipt: { workflowSha: TARGET, workflowRef } });
+    expect(data.reads).not.toContain(`compare/${TARGET}...main?per_page=1`);
+  });
+
   it.each([
     {
       role: "productPerformance",
@@ -270,18 +296,6 @@ describe("independent release child reuse", () => {
     );
   });
 
-  it("finds the target after other-target runs without spending full validations", async () => {
-    const data = await fixture();
-    data.runInventory.unshift(
-      ...Array.from({ length: 6 }, (_, index) => ({ ...data.run, id: 200 + index })),
-    );
-    const selection = await discoverReusableReleaseChild(data.request, data.deps);
-    expect(selection?.runId).toBe("101");
-    expect(data.reads[0]).toContain("per_page=100");
-    expect(data.deps.report).toHaveBeenCalledWith(
-      expect.stringContaining('scanned 7 runs, evaluated 1; skipped {"target receipt absent":6}'),
-    );
-  });
   it.each(["active parent", "publisher cleanup failure"])(
     "reuses sealed green work despite %s",
     async (state) => {

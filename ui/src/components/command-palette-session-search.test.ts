@@ -11,7 +11,7 @@ import {
   findPaletteOption,
   mountPalette,
 } from "./command-palette.test-support.ts";
-import "./command-palette.ts";
+import "./command-palette.tsx";
 
 describe("CommandPalette session search", () => {
   let restoreDialogPolyfill: () => void;
@@ -107,6 +107,7 @@ describe("CommandPalette session search", () => {
         excludeSubagents: true,
         excludeCron: true,
         excludeSystem: true,
+        excludeDock: true,
       },
     });
     expect(palette.querySelector('[role="listbox"]')?.getAttribute("aria-busy")).toBe("false");

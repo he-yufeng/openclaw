@@ -21,7 +21,7 @@ import { FsSafeError, openLocalFileSafely, type OpenResult } from "../infra/fs-s
 import type { SsrFPolicy } from "../infra/net/ssrf.js";
 import { buildRandomTempFilePath } from "../infra/temp-download.js";
 import {
-  readRemoteMediaBuffer,
+  readRemoteMediaBufferWithHeaders,
   type MediaFetchRetryOptions,
   MediaFetchError,
 } from "../media/fetch.js";
@@ -193,7 +193,7 @@ export class MediaAttachmentCache {
     }
 
     try {
-      const fetched = await readRemoteMediaBuffer({
+      const fetched = await readRemoteMediaBufferWithHeaders({
         url,
         timeoutMs: params.timeoutMs,
         maxBytes: params.maxBytes,
@@ -206,7 +206,7 @@ export class MediaAttachmentCache {
         // Channel-declared MIME leads; the transport Content-Type stays a
         // secondary hint so byte detection can refine stale declarations.
         declaredMime: concreteMime(entry.attachment.mime),
-        additionalMimeHints: [fetched.contentType],
+        additionalMimeHints: [fetched.contentType, fetched.headerContentType],
       });
       entry.bufferResult = {
         buffer: fetched.buffer,
@@ -341,11 +341,7 @@ export class MediaAttachmentCache {
   }
 
   /** Returns a local path for providers that cannot accept buffers, creating a temp file if needed. */
-  async getPath(params: {
-    attachmentIndex: number;
-    maxBytes: number;
-    timeoutMs: number;
-  }): Promise<string> {
+  async getPath(params: Parameters<MediaAttachmentCache["getBuffer"]>[0]): Promise<string> {
     const entry = await this.ensureEntry(params.attachmentIndex);
     const local = await this.withLocalFile(entry, async () => {
       await (await this.prepareLocalFile(entry))?.handle.close().catch(() => {});

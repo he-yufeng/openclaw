@@ -53,14 +53,6 @@ const laneSchedule: readonly RequestPriority[] = [
   "background",
 ];
 
-function createLaneQueues<TData>(): LaneQueues<TData> {
-  return {
-    critical: [],
-    standard: [],
-    background: [],
-  };
-}
-
 function countPending<TData>(bucket: BucketState<TData>): number {
   return requestPriorities.reduce((count, lane) => count + bucket.pending[lane].length, 0);
 }
@@ -135,21 +127,12 @@ export class RestScheduler<TData> {
     }
     const bucket: BucketState<TData> = {
       active: 0,
-      pending: createLaneQueues(),
+      pending: { critical: [], standard: [], background: [] },
       resetAt: 0,
       routeKeys: new Set([key]),
     };
     this.buckets.set(key, bucket);
     return bucket;
-  }
-
-  private hasBucketReference(key: string): boolean {
-    for (const bucketKey of this.routeBuckets.values()) {
-      if (bucketKey === key) {
-        return true;
-      }
-    }
-    return false;
   }
 
   private isBucketRateLimited(bucket: BucketState<TData>, now = Date.now()): boolean {
@@ -231,12 +214,11 @@ export class RestScheduler<TData> {
   }
 
   private drainQueues(): void {
-    let nextDelayMs = Number.POSITIVE_INFINITY;
     while (this.activeWorkers < MAX_CONCURRENT_WORKERS) {
       const next = this.takeNextQueuedRequest();
       if (!next.queued) {
-        if (next.waitMs !== undefined) {
-          nextDelayMs = Math.min(nextDelayMs, next.waitMs);
+        if (next.waitMs !== undefined && Number.isFinite(next.waitMs)) {
+          this.scheduleDrain(next.waitMs);
         }
         break;
       }
@@ -247,9 +229,6 @@ export class RestScheduler<TData> {
       bucket.active += 1;
       this.activeWorkers += 1;
       void this.runQueuedRequest(queued, bucket);
-    }
-    if (Number.isFinite(nextDelayMs)) {
-      this.scheduleDrain(nextDelayMs);
     }
   }
 
@@ -274,10 +253,7 @@ export class RestScheduler<TData> {
       for (const bucket of buckets) {
         const queue = bucket.pending[lane];
         this.dropStaleHeadRequests(queue, lane, now);
-        if (queue.length === 0) {
-          continue;
-        }
-        if (bucket.active > 0) {
+        if (queue.length === 0 || bucket.active > 0) {
           continue;
         }
         const waitMs = this.getBucketWaitMs(bucket, now);
@@ -327,12 +303,9 @@ export class RestScheduler<TData> {
       for (const routeKey of bucket.routeKeys) {
         if (this.routeBuckets.get(routeKey) === key) {
           this.routeBuckets.delete(routeKey);
-          bucket.routeKeys.delete(routeKey);
         }
       }
-      if (this.routeBuckets.get(key) !== key && !this.hasBucketReference(key)) {
-        this.buckets.delete(key);
-      }
+      this.buckets.delete(key);
     }
   }
 
@@ -395,6 +368,6 @@ export class RestScheduler<TData> {
 
 function isGlobalRateLimit(parsed: unknown): boolean {
   return parsed && typeof parsed === "object" && "global" in parsed
-    ? Boolean((parsed as { global?: unknown }).global)
+    ? Boolean(parsed.global)
     : false;
 }

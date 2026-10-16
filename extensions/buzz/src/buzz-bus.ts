@@ -267,7 +267,6 @@ export async function startBuzzBus(options: {
             },
             result: () => {},
             onTimeout: reportFatalError,
-            checkAbortAfterSubscribe: true,
           });
         } catch (error) {
           signal.throwIfAborted();
@@ -502,9 +501,9 @@ export async function startBuzzBus(options: {
         onFatalError: reportFatalError,
         signal,
       })
-        .then((result) => {
-          if (!signal.aborted && result.status === "published") {
-            options.onProfilePublished?.(result.eventId);
+        .then((eventId) => {
+          if (!signal.aborted && eventId !== undefined) {
+            options.onProfilePublished?.(eventId);
           }
         })
         .catch((error: unknown) => {

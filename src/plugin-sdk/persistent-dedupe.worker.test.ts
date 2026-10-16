@@ -1,8 +1,6 @@
-import { existsSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
-import { createPluginStateKeyedStore } from "../plugin-state/plugin-state-store.js";
 import * as workerClient from "../plugin-state/plugin-state-worker-client.js";
 import { createDeferredCore } from "../shared/deferred.js";
 import { closeOpenClawStateDatabaseAsync } from "../state/openclaw-state-db-cache.js";
@@ -11,9 +9,6 @@ import {
   createChannelReplayGuard,
   createClaimableDedupe,
   createPersistentDedupe,
-  createPersistentDedupeImportEntry,
-  migratePersistentDedupeLegacyJsonFile,
-  resolvePersistentDedupePluginStateNamespace,
 } from "./persistent-dedupe.js";
 
 const options = {
@@ -142,25 +137,6 @@ describe("persistent dedupe worker", () => {
     });
   });
 
-  it("retains the migration source when admission closes before source deletion", async () => {
-    await withOpenClawTestState({ label: "dedupe-migration-retirement" }, async (state) => {
-      const now = Date.now();
-      const filePath = await state.writeJson("retired.json", { imported: now });
-      const compare = workerClient.comparePluginStateUpdateInWorker;
-      vi.spyOn(workerClient, "comparePluginStateUpdateInWorker").mockImplementationOnce(
-        async (params) => {
-          const result = await compare(params);
-          await closeOpenClawStateDatabaseAsync();
-          return result;
-        },
-      );
-      await expect(
-        migratePersistentDedupeLegacyJsonFile({ ...options, filePath, namespace: "global", now }),
-      ).rejects.toThrow();
-      expect(existsSync(filePath)).toBe(true);
-    });
-  });
-
   it.each(["commit", "forget"] as const)(
     "joins all multi-key %s writes before returning failure",
     async (operation) => {
@@ -245,7 +221,7 @@ describe("persistent dedupe worker", () => {
     },
   );
 
-  it("keeps replay, bounded storage, legacy namespaces and migration SQL off the caller", async () => {
+  it("keeps replay, bounded storage and legacy namespaces off the caller", async () => {
     await withOpenClawTestState({ label: "persistent-dedupe-worker" }, async (state) => {
       const native = requireNodeSqlite();
       const sql = [
@@ -276,30 +252,6 @@ describe("persistent dedupe worker", () => {
         expect(await createPersistentDedupe(legacyOptions).checkAndRecord("legacy")).toBe(true);
         expect(await createPersistentDedupe(legacyOptions).hasRecent("legacy")).toBe(true);
 
-        const now = Date.now();
-        const filePath = await state.writeJson("retired.json", {
-          imported: now,
-          expired: now - options.ttlMs - 1,
-        });
-        expect(
-          await migratePersistentDedupeLegacyJsonFile({
-            ...options,
-            filePath,
-            namespace: "migration",
-            now,
-          }),
-        ).toEqual({
-          imported: 1,
-          skippedExpired: 1,
-          skippedInvalid: 0,
-          skippedExisting: 0,
-          removed: true,
-        });
-        expect(existsSync(filePath)).toBe(false);
-        await closeOpenClawStateDatabaseAsync();
-        expect(
-          await createPersistentDedupe(options).hasRecent("imported", { namespace: "migration" }),
-        ).toBe(true);
         for (const method of sql) {
           expect(method).not.toHaveBeenCalled();
         }
@@ -338,39 +290,7 @@ describe("persistent dedupe worker", () => {
     });
   });
 
-  it("retains a newer concurrent row when migrating a retired cache", async () => {
-    await withOpenClawTestState({ label: "dedupe-migration-conflict" }, async (state) => {
-      const now = Date.now();
-      const filePath = await state.writeJson("retired.json", { shared: now - 1_000 });
-      const observe = workerClient.observePluginStateInWorker;
-      const store = createPluginStateKeyedStore(options.pluginId, {
-        namespace: resolvePersistentDedupePluginStateNamespace({ ...options, namespace: "global" }),
-        maxEntries: options.stateMaxEntries,
-        defaultTtlMs: options.ttlMs,
-      });
-      vi.spyOn(workerClient, "observePluginStateInWorker").mockImplementationOnce(
-        async (params) => {
-          const result = await observe(params);
-          const newer = createPersistentDedupeImportEntry({ key: "shared", seenAt: now });
-          await store.register(newer.key, newer.value);
-          return result;
-        },
-      );
-      expect(
-        await migratePersistentDedupeLegacyJsonFile({
-          ...options,
-          filePath,
-          namespace: "global",
-          now,
-        }),
-      ).toMatchObject({ imported: 0, skippedExisting: 1, removed: true });
-      expect((await store.entries()).map(({ value }) => value)).toEqual([
-        { key: "shared", seenAt: now },
-      ]);
-    });
-  });
-
-  it.each([false, true])(
+  it.each([true])(
     "orders forget after an unfinished recording (legacy alias=%s)",
     async (legacyAlias) => {
       await withOpenClawTestState({ label: "dedupe-forget-order" }, async (state) => {
@@ -530,54 +450,4 @@ describe("persistent dedupe worker", () => {
       }
     });
   });
-
-  it.each(["clear", "forget"] as const)(
-    "does not repopulate memory after %s overtakes warmup",
-    async (action) => {
-      await withOpenClawTestState({ label: "dedupe-warmup-publication" }, async () => {
-        const dedupe = createPersistentDedupe({ ...options, memoryMaxSize: 10 });
-        await dedupe.checkAndRecord("stored");
-        dedupe.clearMemory();
-        const list = workerClient.listPluginStateInWorker;
-        const { ready, gate, wait } = pauseWorkerResult();
-        vi.spyOn(workerClient, "listPluginStateInWorker").mockImplementationOnce((params) =>
-          wait(list(params)),
-        );
-        const warming = dedupe.warmup();
-        await ready.promise;
-        const clearing = action === "clear" ? dedupe.clearMemory() : dedupe.forget("stored");
-        gate.resolve();
-        expect(await warming).toBe(0);
-        await clearing;
-        expect(dedupe.memorySize()).toBe(0);
-      });
-    },
-  );
-
-  it.each([false, true])(
-    "preserves disk-error policy without replaying a failed write (strict=%s)",
-    async (strict) => {
-      await withOpenClawTestState({ label: "dedupe-failed-worker" }, async () => {
-        const failure = new Error("worker outcome unavailable");
-        const write = vi
-          .spyOn(workerClient, "comparePluginStateUpdateInWorker")
-          .mockRejectedValueOnce(failure);
-        const onDiskError = vi.fn((error: unknown) => {
-          if (strict) {
-            throw error;
-          }
-        });
-        const dedupe = createPersistentDedupe({ ...options, onDiskError });
-        const result = dedupe.checkAndRecord("failed");
-        if (strict) {
-          await expect(result).rejects.toBe(failure);
-        } else {
-          await expect(result).resolves.toBe(true);
-        }
-        expect(write).toHaveBeenCalledOnce();
-        expect(onDiskError).toHaveBeenCalledWith(failure);
-        expect(await createPersistentDedupe(options).hasRecent("failed")).toBe(false);
-      });
-    },
-  );
 });

@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { expectDefined } from "@openclaw/normalization-core";
 import { toErrorObject } from "../infra/errors.js";
+import { assertAppContainerSpawnSupported } from "../infra/windows-appcontainer-spawn.js";
+import { prepareOomScoreAdjustedSpawn } from "./linux-oom-score.js";
 import { getSpawnBroker } from "./spawn-broker/context.js";
 import { brokerSpawnOptions } from "./spawn-broker/host.js";
 import { recordChildProcessSpawn } from "./spawn-diagnostics.js";
@@ -15,6 +17,7 @@ export function spawnProcess(
   options: SpawnOptions,
   initiateSpawn?: SpawnInitiation,
 ): ChildProcess {
+  assertAppContainerSpawnSupported(options.stdio);
   const broker = getSpawnBroker();
   // Anonymous secret pipes and inherited numeric descriptors belong to this process.
   const child =
@@ -23,7 +26,10 @@ export function spawnProcess(
       : initiateSpawn
         ? initiateSpawn(() => spawn(command, args, options))
         : spawn(command, args, options);
-  recordChildProcessSpawn(command, child);
+  if (!options.shell && options.argv0 !== undefined) {
+    prepareOomScoreAdjustedSpawn(command, args, options).afterSpawn?.(child.pid);
+  }
+  recordChildProcessSpawn(command, child, undefined, args);
   return child;
 }
 
@@ -47,30 +53,11 @@ function shouldRetry(err: unknown): boolean {
   return code === "EBADF";
 }
 
-async function spawnAndWaitForSpawn(
-  spawnImpl: NonNullable<SpawnWithFallbackParams["spawnImpl"]>,
-  argv: string[],
-  options: SpawnOptions,
-  initiateSpawn?: SpawnInitiation,
-): Promise<ChildProcess> {
-  const child = spawnImpl(
-    expectDefined(argv[0], "argv entry at 0"),
-    argv.slice(1),
-    options,
-    initiateSpawn,
-  );
-
-  try {
-    await once(child, "spawn");
-  } catch (err) {
-    throw toErrorObject(err, "Non-Error rejection");
-  }
-  return child;
-}
-
 export async function spawnWithFallback(
   params: SpawnWithFallbackParams,
 ): Promise<SpawnWithFallbackResult> {
+  // Custom Windows transports can add launcher IPC even when the target inherits stdio.
+  assertAppContainerSpawnSupported(params.spawnImpl ? undefined : params.options.stdio);
   const spawnImpl = params.spawnImpl ?? spawnProcess;
   const baseOptions = { ...params.options };
   const fallbacks = params.fallbacks ?? [];
@@ -81,12 +68,15 @@ export async function spawnWithFallback(
     // Caller revocation is not a spawn failure and cannot select a fallback.
     params.assertCurrent?.();
     try {
-      const child = await spawnAndWaitForSpawn(
-        spawnImpl,
-        params.argv,
+      const child = spawnImpl(
+        expectDefined(params.argv[0], "argv entry at 0"),
+        params.argv.slice(1),
         attempt,
         params.initiateSpawn,
       );
+      await once(child, "spawn").catch((err: unknown) => {
+        throw toErrorObject(err, "Non-Error rejection");
+      });
       return {
         child,
         usedFallback: index > 0,

@@ -1,7 +1,3 @@
-/**
- * Brave Search HTTP runtime. It resolves credentials, enforces endpoint safety,
- * applies caching, and maps Brave web/LLM-context API responses.
- */
 import { buildTimeoutAbortSignal } from "openclaw/plugin-sdk/extension-shared";
 import {
   assertOkOrThrowProviderError,
@@ -243,7 +239,6 @@ async function runBraveSearch(params: {
   );
 }
 
-/** Execute one Brave Search request using web or LLM-context mode. */
 export async function executeBraveSearch(
   args: Record<string, unknown>,
   searchConfig?: SearchConfigRecord,
@@ -387,7 +382,7 @@ export async function executeBraveSearch(
       apiKey,
       diagnosticsEnabled,
       signal,
-      country: country ?? undefined,
+      country,
       search_lang: normalizedLanguage.search_lang,
       freshness,
       dateAfter,

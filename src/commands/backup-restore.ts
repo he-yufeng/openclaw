@@ -4,6 +4,7 @@ import path from "node:path";
 import { isPathInside } from "@openclaw/fs-safe/path";
 import * as tar from "tar";
 import { readConfigFileSnapshot, resolveStateDir } from "../config/config.js";
+import { assertHomogeneousDatabaseEngines } from "../infra/database-engine/registry.js";
 import { formatDiskSpaceBytes, tryReadDiskSpace } from "../infra/disk-space.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { type RuntimeEnv, writeRuntimeJson } from "../runtime.js";
@@ -27,16 +28,7 @@ const BACKUP_RESTORE_WARNINGS = [
 
 const BACKUP_RESTORE_FREE_SPACE_RESERVE_BYTES = 256 * 1024 * 1024;
 
-type BackupRestoreOptions = {
-  archive: string;
-  target?: string;
-  json?: boolean;
-};
-
-type BackupRestoreResult = Awaited<ReturnType<typeof prepareBackupArchive>>["result"] & {
-  targetPath: string;
-  warnings: string[];
-};
+type BackupRestoreResult = Awaited<ReturnType<typeof backupRestoreCommand>>;
 
 async function assertTargetOutsideLiveState(targetPath: string): Promise<void> {
   const [canonicalTarget, canonicalStateDir] = await Promise.all([
@@ -49,10 +41,11 @@ async function assertTargetOutsideLiveState(targetPath: string): Promise<void> {
     );
   }
   const configSnapshot = await readConfigFileSnapshot({ observe: false });
-  const discoverySnapshot = resolveLegacyConfigSnapshotForBackup(configSnapshot);
+  const discoverySnapshot = await resolveLegacyConfigSnapshotForBackup(configSnapshot);
   if (!discoverySnapshot) {
     return;
   }
+  assertHomogeneousDatabaseEngines(discoverySnapshot.config, "restore");
   const agentRoots = await resolveBackupAgentRoots(discoverySnapshot.config);
   for (const { sourcePath } of agentRoots) {
     if (isPathInside(sourcePath, canonicalTarget)) {
@@ -163,8 +156,8 @@ function formatRestoreResult(result: BackupRestoreResult): string {
 /** Verify first, then extract a whole backup archive into a fresh staging directory. */
 export async function backupRestoreCommand(
   runtime: RuntimeEnv,
-  options: BackupRestoreOptions,
-): Promise<BackupRestoreResult> {
+  options: { archive: string; target?: string; json?: boolean },
+) {
   const targetPath = resolveRequiredBackupPath(options.target, "--target");
   await assertTargetOutsideLiveState(targetPath);
   const {
@@ -208,7 +201,7 @@ export async function backupRestoreCommand(
     });
   }
 
-  const result: BackupRestoreResult = {
+  const result = {
     ...verified,
     targetPath,
     warnings: [

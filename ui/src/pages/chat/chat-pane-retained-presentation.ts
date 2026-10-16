@@ -1,7 +1,7 @@
-import type { ProgressCard } from "@openclaw/gateway-protocol";
-import { html, nothing } from "lit";
+import type { ProgressCard, ProgressCardGetParams } from "@openclaw/gateway-protocol";
+import { createDeferredCore } from "../../../../src/shared/deferred.ts";
 import { gatewayPresentationScope } from "../../app/gateway-presentation-scope.ts";
-import "../../components/modal-dialog.ts";
+import { loadSettings, patchSettings } from "../../app/settings.ts";
 import type { SessionProgressCardRefreshAction } from "../../components/session-progress-card.ts";
 import { t } from "../../i18n/index.ts";
 import { boardProviderCacheKey } from "../../lib/board/provider.ts";
@@ -16,6 +16,7 @@ import {
 } from "../../lib/sessions/session-key.ts";
 import { showToast } from "../../lib/toast.ts";
 import { storeChatComposerMemoryFallback } from "./chat-composer-memory-fallback.ts";
+import { captureChatConnectionOwner } from "./chat-connection-owner.ts";
 import { loadChatBranches, retireChatBranchRequests } from "./chat-history-branches.ts";
 import {
   chatHistoryRequests,
@@ -48,6 +49,7 @@ import {
   resetTranscriptSession,
 } from "./components/chat-thread-interactions.ts";
 import { activeQueuedMessageEdit } from "./queued-message-edit.ts";
+import { cacheChatSessionSnapshot, readChatSessionSnapshot } from "./session-message-cache.ts";
 
 const COMPOSER_PREFILL_ATTENTION_DURATION_MS = 600;
 const COMPOSER_PREFILL_ATTENTION_CLASS = "agent-chat__input--prefill-attention";
@@ -56,29 +58,127 @@ const COMPOSER_PREFILL_ATTENTION_CLASS = "agent-chat__input--prefill-attention";
 export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
   protected readonly activeSessionResources = new ChatPaneActiveResources();
 
-  protected captureProgressCardRefreshAction(): SessionProgressCardRefreshAction | undefined {
+  readProgressCardScope() {
+    const gateway = this.context.gateway;
+    const { client, hello } = gateway.snapshot;
+    const target = this.initialProgressCardTarget();
+    return {
+      store: this.progressCards,
+      target,
+      client,
+      hello,
+      options: {
+        admitAutomaticRead: () => {
+          const current = this.initialProgressCardTarget();
+          return (
+            this.isConnected &&
+            this.context.gateway === gateway &&
+            gateway.snapshot.client === client &&
+            gateway.snapshot.hello === hello &&
+            current?.sessionKey === target?.sessionKey &&
+            current?.agentId === target?.agentId
+          );
+        },
+      },
+    };
+  }
+
+  cacheProgressCard(
+    target: ProgressCardGetParams | undefined,
+    card: ProgressCard | null | undefined,
+  ) {
     const state = this.state;
+    if (!target || card === undefined || !state || !this.ownsChatSnapshot(target)) {
+      return;
+    }
+    const snapshot = readChatSessionSnapshot(state.chatMessagesBySession, state, target);
+    if (snapshot && snapshot.progressCard !== card) {
+      cacheChatSessionSnapshot(state.chatMessagesBySession, state, target, {
+        ...snapshot,
+        progressCard: card,
+      });
+    }
+  }
+  protected captureProgressCardRefreshAction(): SessionProgressCardRefreshAction | undefined {
     const scope = this.captureConnectionScope();
-    if (!state || !scope) {
+    if (!scope) {
       return undefined;
     }
+    const { state } = scope;
     const sessionKey = state.sessionKey;
     const sessionId = state.currentSessionId;
     const agentId = resolveChatAgentId(state);
     return {
-      state: this.progressCard.refreshState,
+      state: this.progressCardSnapshot.refreshState,
       onRefresh: (card) => {
-        const current = this.state;
         if (
-          current &&
           this.isConnectionScopeCurrent(scope) &&
-          current.sessionKey === sessionKey &&
-          current.currentSessionId === sessionId &&
-          resolveChatAgentId(current) === agentId
+          state.sessionKey === sessionKey &&
+          state.currentSessionId === sessionId &&
+          resolveChatAgentId(state) === agentId
         ) {
-          this.progressCard.refresh(card);
+          const target = this.initialProgressCardTarget();
+          if (target) {
+            this.progressCards.refresh(target, card);
+          }
         }
       },
+    };
+  }
+
+  protected captureProgressCardActions(canWrite: boolean) {
+    const state = this.state;
+    if (!state) {
+      return {};
+    }
+    const { sessionKey, currentSessionId } = state;
+    const agentId = resolveChatAgentId(state);
+    const gatewayUrl = state.settings.gatewayUrl;
+    const scope = gatewayPresentationScope(this.context.gateway);
+    const current = () =>
+      this.isConnected &&
+      this.presented &&
+      this.state === state &&
+      state.sessionKey === sessionKey &&
+      state.currentSessionId === currentSessionId &&
+      resolveChatAgentId(state) === agentId &&
+      gatewayPresentationScope(this.context.gateway) === scope;
+    return {
+      onHideTaskProgress: () => {
+        if (!current()) {
+          return;
+        }
+        state.settings = patchSettings({ chatShowTaskProgress: false });
+        showToast({
+          message: t("chat.sessionDetails.progressHidden"),
+          actionLabel: t("common.undo"),
+          onAction: () => {
+            if (
+              loadSettings().gatewayUrl === gatewayUrl &&
+              gatewayPresentationScope(this.context.gateway) === scope
+            ) {
+              patchSettings({ chatShowTaskProgress: true });
+            }
+          },
+        });
+      },
+      onCollapseTaskProgressChange: (collapsed: boolean) => {
+        if (current()) {
+          state.settings = patchSettings({ chatCollapseTaskProgress: collapsed });
+        }
+      },
+      onOpenTaskProgressSettings: () => {
+        if (current()) {
+          this.context.navigate("appearance");
+        }
+      },
+      onClearSavedProgressCard: canWrite
+        ? (card: ProgressCard) => {
+            if (current() && this.progressCardPresentation?.card === card) {
+              this.clearSavedProgressCard(card);
+            }
+          }
+        : undefined,
     };
   }
 
@@ -90,14 +190,14 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       this.state &&
       this.isCurrentSessionArchived(this.state) &&
       this.currentSessionArchived === false &&
-      isThreadPresentationFocused(this.presentationId, this),
+      isThreadPresentationFocused(this.presentationId, this.element),
     );
   }
 
   protected retireArchivedPresentation(): void {
     const archived = this.state ? this.isCurrentSessionArchived(this.state) : false;
     if (archived && this.currentSessionArchived === false) {
-      dismissThreadPortals(this.presentationId, this);
+      dismissThreadPortals(this.presentationId, this.element);
       if (this.archiveFocusOwned) {
         this.querySelector<HTMLElement>(".chat-thread")?.focus({ preventScroll: true });
       }
@@ -135,7 +235,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       agentId: edit.agentId,
       exactKey: true,
     });
-    runSessionNavigationIntent(this, {
+    runSessionNavigationIntent(this.element, {
       agentId: edit.agentId,
       face: "chat",
       sessionKey: edit.sessionKey,
@@ -209,7 +309,8 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
     ) {
       this.retainedProgressCard = undefined;
     }
-    const card = this.progressCard.card;
+    const progress = this.progressCardSnapshot;
+    const card = progress.card;
     const target = this.resolveChatReadTarget();
     if (card && target) {
       this.retainedProgressCard = {
@@ -219,11 +320,11 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
         sessionId: state.currentSessionId,
         agentId,
         card,
-        lifetime: this.progressCard.lifetime,
+        lifetime: progress.lifetime,
         // Global and ordinary sessions can share the progress-card wire key.
         identity: JSON.stringify([target.agentId ?? null, target.sessionKey]),
       };
-    } else if (!this.progressCard.loading) {
+    } else if (!progress.loading) {
       this.retainedProgressCard = undefined;
     }
     // The X only hides this presentation. The Gateway card remains available to
@@ -248,8 +349,12 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
   }
 
   protected readonly clearSavedProgressCard = (card: ProgressCard): void => {
-    void this.progressCard
-      .dismiss(card)
+    const target = this.initialProgressCardTarget();
+    if (!target) {
+      return;
+    }
+    void this.progressCards
+      .dismiss(target, card)
       .catch(() => showToast({ message: t("sessionProgressCard.clearFailed") }));
   };
 
@@ -269,12 +374,12 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
   protected override initialProgressCardTarget() {
     const state = this.state;
     if (
-      !state?.connected ||
+      !state ||
       !this.presented ||
       document.visibilityState === "hidden" ||
       this.isCurrentSessionArchived(state) ||
       parseCatalogSessionKey(state.sessionKey) ||
-      (!this.transcriptReady && !getAcceptedChatHistorySession(state))
+      (!this.transcriptReady && !state.currentSessionId && !getAcceptedChatHistorySession(state))
     ) {
       return undefined;
     }
@@ -292,7 +397,8 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       this.progressPresentationSessionKey = state.sessionKey;
       this.progressPresentationReady = false;
     }
-    if (this.progressPresentationReady) {
+    const progress = this.progressCardSnapshot;
+    if (!progress.loading || this.progressPresentationReady) {
       return false;
     }
     const phase = this.context.gateway.snapshot.phase;
@@ -309,9 +415,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
         (!this.presented ||
           document.visibilityState === "hidden" ||
           (!this.transcriptReady && !getAcceptedChatHistorySession(state)) ||
-          (this.initialProgressCardTarget() &&
-            this.progressCard.loading &&
-            !this.progressCard.error))
+          (this.initialProgressCardTarget() && progress.loading && !progress.error))
       ) {
         return true;
       }
@@ -357,12 +461,8 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
     if (this.resetConfirmation) {
       return this.resetConfirmation.promise;
     }
-    let resolve!: (confirmed: boolean) => void;
-    const promise = new Promise<boolean>((next) => {
-      resolve = next;
-    });
+    const { promise, resolve } = createDeferredCore<boolean>();
     this.resetConfirmation = { scopeKey, promise, resolve };
-    this.resetConfirmationOpen = true;
     return promise;
   }
 
@@ -379,49 +479,14 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       return;
     }
     this.resetConfirmation = undefined;
-    this.resetConfirmationOpen = false;
     pending.resolve(confirmed);
   }
 
   protected renderResetConfirmation() {
-    if (!this.resetConfirmationOpen) {
-      return nothing;
+    if (!this.resetConfirmation) {
+      return null;
     }
-    const title = t("chat.board.resetTitle");
-    const description = t("chat.board.resetDescription");
-    return html`
-      <openclaw-modal-dialog
-        label=${title}
-        description=${description}
-        @modal-cancel=${() => this.settleResetConfirmation(false)}
-      >
-        <div class="exec-approval-card board-reset-confirmation">
-          <div class="exec-approval-header">
-            <div>
-              <div class="exec-approval-title">${title}</div>
-              <div class="exec-approval-sub">${description}</div>
-            </div>
-          </div>
-          <div class="exec-approval-actions">
-            <button
-              class="btn primary"
-              type="button"
-              @click=${() => this.settleResetConfirmation(true)}
-            >
-              ${t("common.confirm")}
-            </button>
-            <button
-              class="btn"
-              type="button"
-              autofocus
-              @click=${() => this.settleResetConfirmation(false)}
-            >
-              ${t("common.cancel")}
-            </button>
-          </div>
-        </div>
-      </openclaw-modal-dialog>
-    `;
+    return { onResolve: (confirmed: boolean) => this.settleResetConfirmation(confirmed) };
   }
 
   protected override activeChanged(active: boolean): void {
@@ -459,7 +524,6 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
       return;
     }
     if (presented) {
-      this.minutePoll.start();
       this.consumeSessionHandoff(this.sessionKey);
       this.activateComposerPresentation();
       this.syncActiveBindings();
@@ -481,20 +545,17 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
           // authoritative start time and activity after a foreground return.
           void loadChatHistory(state, { deferBranches: true });
         }
-      }
-      if (
-        state &&
-        !deferredHydrationActive &&
-        (!areUiSessionKeysEquivalent(state.chatBranchesSessionKey, state.sessionKey) ||
-          state.chatBranchesConnectionEpoch !== state.connectionEpoch)
-      ) {
-        void loadChatBranches(state);
+        if (
+          !areUiSessionKeysEquivalent(state.chatBranchesSessionKey, state.sessionKey) ||
+          state.chatBranchesConnectionEpoch !== state.connectionEpoch
+        ) {
+          void loadChatBranches(state);
+        }
       }
       this.refreshSwarmRoster();
       void this.refreshSessionPullRequests();
       return;
     }
-    this.minutePoll.stop();
     if (this.state) {
       retireChatBranchRequests(this.state);
       // Unwatch can cancel an admitted refresh before sync; a later presentation
@@ -509,8 +570,8 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
     this.clearComposerPrefillAttention();
     this.settleResetConfirmation(false);
     this.cancelHeaderRename();
-    dismissConfirmedActionPopovers(this);
-    resetTranscriptSession(this.presentationId, this);
+    dismissConfirmedActionPopovers(this.element);
+    resetTranscriptSession(this.presentationId, this.element);
     const state = this.state;
     if (state) {
       stopChatRealtimeTalk(state);
@@ -580,8 +641,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
         if (this.state !== state || state.sessionKey !== sessionKey) {
           return;
         }
-        const client = state.client;
-        const connectionEpoch = state.connectionEpoch;
+        const connectionIsCurrent = captureChatConnectionOwner(state);
         const sessions = state.sessions;
         const attachments = state.chatAttachments;
         const mentions = state.chatMentions;
@@ -591,9 +651,7 @@ export abstract class ChatPaneRetainedPresentation extends ChatPaneBoard {
         const isCurrent = () =>
           this.state === state &&
           state.sessionKey === sessionKey &&
-          state.connected &&
-          state.client === client &&
-          state.connectionEpoch === connectionEpoch &&
+          connectionIsCurrent() &&
           state.sessions === sessions &&
           this.isConnected &&
           this.active &&

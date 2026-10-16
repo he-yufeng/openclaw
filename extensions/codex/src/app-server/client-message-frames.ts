@@ -1,4 +1,4 @@
-import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-registration";
 import type { RpcRequest, RpcResponse } from "./protocol.js";
 import type { CodexAppServerTransport } from "./transport.js";
 
@@ -11,7 +11,6 @@ export function createCodexAppServerMessageWriter(options: {
     message: RpcRequest | RpcResponse,
     onError?: (error: Error) => void,
     beforeWrite?: () => void,
-    onWriteResult?: (error?: Error | null) => void,
   ): void => {
     if (options.isClosed()) {
       return;
@@ -19,7 +18,10 @@ export function createCodexAppServerMessageWriter(options: {
     const child = options.getTransport();
     const id = "id" in message ? message.id : undefined;
     const method = "method" in message ? message.method : undefined;
-    const frame = stringifyCodexAppServerMessage(message);
+    const frame =
+      JSON.stringify(message, (_key, value) =>
+        typeof value === "string" ? value.replace(UNPAIRED_SURROGATE_RE, "") : value,
+      ) ?? "null";
     // Reject locally before declaring a possible write. Images count toward the
     // transport frame limit even though Codex's text-input limit excludes them.
     if (child.maxFrameBytes && Buffer.byteLength(frame) > child.maxFrameBytes) {
@@ -32,7 +34,6 @@ export function createCodexAppServerMessageWriter(options: {
       options.onNativeExecution();
     }
     child.stdin.write(`${frame}\n`, (error?: Error | null) => {
-      onWriteResult?.(error);
       if (error) {
         embeddedAgentLog.warn("codex app-server write failed", { error, id, method });
         onError?.(error);
@@ -169,8 +170,7 @@ export function readCodexCatalogDecodeRoute(line: Buffer): CodexCatalogDecodeRou
       for (;;) {
         index = line.indexOf(34, index + 1);
         if (index < 0) {
-          // A raw newline may precede the ID in a result-first envelope. Keep
-          // recovery off-main until the decoded ID can select its projection.
+          // Keep malformed-payload parsing and diagnostics off the main thread.
           return "unresolved";
         }
         let slash = index - 1;
@@ -225,12 +225,4 @@ export function readCodexCatalogDecodeRoute(line: Buffer): CodexCatalogDecodeRou
     }
   }
   return response || route ? "unresolved" : undefined;
-}
-
-function stringifyCodexAppServerMessage(message: RpcRequest | RpcResponse): string {
-  return (
-    JSON.stringify(message, (_key, value) =>
-      typeof value === "string" ? value.replace(UNPAIRED_SURROGATE_RE, "") : value,
-    ) ?? "null"
-  );
 }

@@ -1,27 +1,15 @@
-import {
-  executeSqliteQuerySync,
-  executeSqliteQueryTakeFirstSync,
-  getNodeSqliteKysely,
-} from "../infra/kysely-sync.js";
-import {
-  CLAW_PACKAGE_LIFECYCLE_LEASE_SCOPE,
-  clawPackageLifecycleLeaseKey,
-} from "../state/claw-package-lifecycle-lease-key.js";
+import { executeSqliteQueryTakeFirstSync, getNodeSqliteKysely } from "../infra/kysely-sync.js";
+import { requestSqliteWorkerOperationAdmission } from "../infra/sqlite-worker-operation-admission.js";
 import type { DB } from "../state/openclaw-state-db.generated.js";
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
-import { assertOpenClawStateLeaseWorkerOwnedInTransaction } from "../state/openclaw-state-lease-worker.js";
+import { verifyOpenClawStateLeaseOwnership } from "../state/openclaw-state-lease-storage.js";
 import type { OpenClawStateLeaseIdentity } from "../state/openclaw-state-lease.types.js";
 import type { WorkerOperationHandlers } from "../state/worker-operation-registry.js";
-import { rowToRef, selectMcpRefs } from "./mcp-records.js";
 import type {
   ClawPackageRefStatus,
   PersistedClawPackageRef,
 } from "./package-extension-provenance.js";
 import { updateClawPackageRefStatusInDatabase } from "./package-status.kernel.js";
-import {
-  readClawInstallRecordFromDatabase,
-  readClawOrphanWorkspaceInDatabase,
-} from "./provenance-read.kernel.js";
 
 export const clawProvenanceOperations = {
   "clawProvenance.packageStatus": (
@@ -35,27 +23,16 @@ export const clawProvenanceOperations = {
   ) =>
     runOpenClawStateWriteTransaction(
       ({ db }) => {
+        const assertLease = () =>
+          verifyOpenClawStateLeaseOwnership({
+            ...input.lease,
+            leaseLabel: "Claw package lifecycle",
+            transaction: db,
+          });
+        assertLease();
+        requestSqliteWorkerOperationAdmission({ stage: "transaction", facts: undefined });
+        assertLease();
         const ref = input.ref;
-        const artifact =
-          ref.kind === "plugin"
-            ? { kind: ref.kind, source: ref.source, ref: ref.ref }
-            : {
-                kind: ref.kind,
-                source: ref.source,
-                ref: ref.ref,
-                workspace:
-                  readClawInstallRecordFromDatabase(db, ref.agentId)?.workspace ??
-                  readClawOrphanWorkspaceInDatabase(db, ref.agentId)?.workspace ??
-                  "",
-              };
-        if (
-          (artifact.kind === "skill" && !artifact.workspace) ||
-          input.lease.scope !== CLAW_PACKAGE_LIFECYCLE_LEASE_SCOPE ||
-          input.lease.key !== clawPackageLifecycleLeaseKey(artifact)
-        ) {
-          throw new Error("Claw package claim does not match the held artifact lease");
-        }
-        assertOpenClawStateLeaseWorkerOwnedInTransaction(db, input.lease);
         const row = executeSqliteQueryTakeFirstSync(
           db,
           getNodeSqliteKysely<DB>(db)
@@ -84,39 +61,9 @@ export const clawProvenanceOperations = {
           input.status,
           input.nowMs ?? Date.now(),
         );
-        assertOpenClawStateLeaseWorkerOwnedInTransaction(db, input.lease, "write", "commit");
+        requestSqliteWorkerOperationAdmission({ stage: "commit", facts: undefined });
+        assertLease();
         return result;
-      },
-      { database: open(), ...stateOptions() },
-    ),
-  "clawProvenance.reconcileMcp": (
-    input: { agentId: string; digests: Record<string, string>; nowMs?: number },
-    { open, stateOptions },
-  ) =>
-    runOpenClawStateWriteTransaction(
-      ({ db }) => {
-        const refs = executeSqliteQuerySync(
-          db,
-          selectMcpRefs(db).where("agent_id", "=", input.agentId).orderBy("name"),
-        ).rows.map(rowToRef);
-        for (const ref of refs) {
-          if (ref.status !== "pending" || input.digests[ref.name] !== ref.configDigest) {
-            continue;
-          }
-          const updatedAtMs = input.nowMs ?? Date.now();
-          executeSqliteQuerySync(
-            db,
-            getNodeSqliteKysely<DB>(db)
-              .updateTable("claw_mcp_server_refs")
-              .set({ status: "complete", error: null, updated_at_ms: updatedAtMs })
-              .where("agent_id", "=", ref.agentId)
-              .where("name", "=", ref.name),
-          );
-          ref.status = "complete";
-          ref.updatedAtMs = updatedAtMs;
-          delete ref.error;
-        }
-        return refs;
       },
       { database: open(), ...stateOptions() },
     ),

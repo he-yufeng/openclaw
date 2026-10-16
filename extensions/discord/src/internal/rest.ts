@@ -1,4 +1,3 @@
-import { inspect } from "node:util";
 import { gunzipSync } from "node:zlib";
 import {
   captureChannelReadAuthority,
@@ -20,7 +19,12 @@ import { appendQuery, createRouteKey } from "./rest-routes.js";
 import { RestScheduler, type RequestPriority, type RequestQuery } from "./rest-scheduler.js";
 import { isDiscordRateLimitBody } from "./schemas.js";
 
-export { DiscordError, isUnknownDiscordVoiceStateError, RateLimitError } from "./rest-errors.js";
+export {
+  DiscordError,
+  isUnknownDiscordMessageError,
+  isUnknownDiscordVoiceStateError,
+  RateLimitError,
+} from "./rest-errors.js";
 
 export type RequestClientOptions = {
   baseUrl?: string;
@@ -43,9 +47,11 @@ type RequestDispatchData = {
   effect: ReturnType<typeof captureEffectAuthority>;
 };
 
+export const DISCORD_REST_TIMEOUT_MS = 15_000;
+
 const defaultOptions = {
   baseUrl: "https://discord.com/api",
-  timeout: 15_000,
+  timeout: DISCORD_REST_TIMEOUT_MS,
   queueRequests: true,
 };
 
@@ -68,7 +74,22 @@ async function readResponseBodyText(response: Response, idleTimeoutMs: number): 
     onIdleTimeout: ({ chunkTimeoutMs }) =>
       new Error(`Discord REST response stalled: no data received for ${chunkTimeoutMs}ms`),
   });
-  return decodeResponseBody(buffer);
+  if (!buffer.byteLength) {
+    return "";
+  }
+  if (buffer[0] === GZIP_MAGIC[0] && buffer[1] === GZIP_MAGIC[1]) {
+    try {
+      return gunzipSync(buffer, {
+        maxOutputLength: DISCORD_REST_RESPONSE_BODY_MAX_BYTES,
+      }).toString("utf8");
+    } catch (err: unknown) {
+      if (err instanceof RangeError && "code" in err && err.code === "ERR_BUFFER_TOO_LARGE") {
+        throw createResponseBodyOverflowError("decompressed output");
+      }
+      throw err;
+    }
+  }
+  return buffer.toString("utf8");
 }
 
 function coerceResponseBody(raw: string): unknown {
@@ -80,33 +101,6 @@ function coerceResponseBody(raw: string): unknown {
   } catch {
     return raw;
   }
-}
-
-function decodeResponseBody(buffer: Buffer): string {
-  if (!buffer.byteLength) {
-    return "";
-  }
-  if (buffer[0] === GZIP_MAGIC[0] && buffer[1] === GZIP_MAGIC[1]) {
-    try {
-      return gunzipSync(buffer, {
-        maxOutputLength: DISCORD_REST_RESPONSE_BODY_MAX_BYTES,
-      }).toString("utf8");
-    } catch (err: unknown) {
-      if (isZlibMaxOutputLengthError(err)) {
-        throw createResponseBodyOverflowError("decompressed output");
-      }
-      throw err;
-    }
-  }
-  return buffer.toString("utf8");
-}
-
-function isZlibMaxOutputLengthError(err: unknown): boolean {
-  return (
-    err instanceof RangeError &&
-    "code" in err &&
-    (err as { code?: unknown }).code === "ERR_BUFFER_TOO_LARGE"
-  );
 }
 
 export class RequestClient {
@@ -228,7 +222,14 @@ export class RequestClient {
       const response = this.guardedEndpoint
         ? await effect.run(request)
         : await effect.initiate(request);
-      const text = await readResponseBodyText(response, this.options.timeout);
+      const text = await readResponseBodyText(response, this.options.timeout).catch(
+        (error: unknown) => {
+          if (response.ok) {
+            throw error;
+          }
+          return "";
+        },
+      );
       const parsed = coerceResponseBody(text);
       this.scheduler.recordResponse(routeKey, path, response, parsed);
       if (response.status === 204) {
@@ -247,11 +248,6 @@ export class RequestClient {
         throw new DiscordError(response, parsed);
       }
       return parsed;
-    } catch (error) {
-      if (error instanceof Error) {
-        throw error;
-      }
-      throw new Error(`Discord request failed: ${inspect(error)}`, { cause: error });
     } finally {
       clearTimeout(timeout);
       this.requestControllers.delete(controller);

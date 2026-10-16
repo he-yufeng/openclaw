@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import "../agents/utility-completion.js";
 import { defaultCompleteModel, defaultPrepareModel } from "./session-observer-model.js";
 import {
   createHarness,
@@ -12,16 +13,12 @@ import {
 const runtimeMocks = vi.hoisted(() => ({
   completeDirect: vi.fn(),
   selectModel: vi.fn(),
-  prepareUtility: vi.fn(),
   completeIsolated: vi.fn(),
 }));
 
 vi.mock("../agents/simple-completion-runtime.js", () => ({
   completeWithPreparedSimpleCompletionModel: runtimeMocks.completeDirect,
   resolveSimpleCompletionSelectionForAgent: runtimeMocks.selectModel,
-}));
-vi.mock("../agents/utility-completion.js", () => ({
-  prepareUtilityCompletionForAgent: runtimeMocks.prepareUtility,
 }));
 vi.mock("../agents/isolated-completion.js", () => ({
   runIsolatedCompletion: runtimeMocks.completeIsolated,
@@ -57,15 +54,11 @@ describe("session observer model preparation", () => {
       runtimeMocks.completeDirect
         .mockReset()
         .mockRejectedValue(new Error("HTTP 401 invalid credential"));
-      const { prepareUtilityCompletionForAgent } = await vi.importActual<
-        typeof import("../agents/utility-completion.js")
-      >("../agents/utility-completion.js");
       runtimeMocks.selectModel.mockReturnValue({
         provider,
         modelId: prepared.model,
         agentDir: prepared.agentDir,
       });
-      runtimeMocks.prepareUtility.mockImplementation(prepareUtilityCompletionForAgent);
       const completion = {
         text: JSON.stringify({ headline: "Reviewing the implementation", health: "on-track" }),
         provider: "anthropic",
@@ -98,7 +91,8 @@ describe("session observer model preparation", () => {
       expect(runtimeMocks.completeIsolated).toHaveBeenCalledWith(
         expect.objectContaining({
           ...prepared,
-          timeoutMs: 10_000,
+          purpose: "session-observer",
+          timeoutMs: 30_000,
           abortSignal: expect.any(AbortSignal),
         }),
       );
