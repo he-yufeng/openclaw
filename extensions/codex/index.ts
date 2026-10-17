@@ -185,13 +185,25 @@ export default definePluginEntry({
     // full-table decode. Opened lazily like the sync handle above; a runtime
     // without the async opener leaves recovery stood down.
     let bindingRecoveryStateStore: PluginStateKeyedStore<StoredCodexAppServerBinding> | undefined;
-    const openBindingRecoveryStateStore = () =>
-      (bindingRecoveryStateStore ??=
-        api.runtime.state.openKeyedStore?.<StoredCodexAppServerBinding>({
-          namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
-          maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
-          overflowPolicy: "reject-new",
-        }));
+    let bindingRecoveryStateStoreFailed = false;
+    const openBindingRecoveryStateStore = () => {
+      if (bindingRecoveryStateStoreFailed) {
+        return undefined;
+      }
+      try {
+        return (bindingRecoveryStateStore ??=
+          api.runtime.state.openKeyedStore?.<StoredCodexAppServerBinding>({
+            namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
+            maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
+            overflowPolicy: "reject-new",
+          }));
+      } catch {
+        // A runtime whose keyed-store backend is unavailable or unconfigured
+        // stands recovery down instead of failing the surrounding call.
+        bindingRecoveryStateStoreFailed = true;
+        return undefined;
+      }
+    };
     const lazyBindingRecoveryStateStore: CodexBindingOverflowRecoveryState = {
       get compareAndApply() {
         const store = openBindingRecoveryStateStore();
