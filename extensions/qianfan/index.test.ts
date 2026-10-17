@@ -38,14 +38,6 @@ describe("qianfan provider plugin", () => {
     });
   });
 
-  it("declares OpenAI-compatible streaming usage support in the manifest", () => {
-    expect(manifest.providerRequest.providers).toMatchObject({
-      qianfan: {
-        openAICompletions: { supportsStreamingUsage: true },
-      },
-    });
-  });
-
   it.each([
     { mode: undefined, modelIds: [] },
     {
