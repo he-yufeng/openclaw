@@ -115,7 +115,7 @@ describe("AppSidebar session catalog pagination", () => {
       expect(sidebar.sessionData.loadingMoreSessionCatalogIds.has("codex")).toBe(true);
 
       gateway.publish({ phase: "reconnecting", hello: null });
-      sidebar.sessionData.hostUpdate();
+      sidebar.sessionData.synchronize();
       expect(sidebar.sessionData.loadingMoreSessionCatalogIds.has("codex")).toBe(false);
       await sidebar.updateComplete;
       expect(sidebar.sessionData.sessionCatalogPageDepths.size).toBe(1);
@@ -198,7 +198,7 @@ describe("AppSidebar session catalog pagination", () => {
 
       context.agentSelection.state.selectedId = "research";
       context.agentSelection.state.scopeId = "research";
-      sidebar.requestUpdate();
+      sidebar.invalidate();
       await sidebar.updateComplete;
       await vi.advanceTimersByTimeAsync(200);
       await sidebar.updateComplete;

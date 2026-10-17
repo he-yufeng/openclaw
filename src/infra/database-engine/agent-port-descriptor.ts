@@ -1,12 +1,13 @@
 import { isDeepStrictEqual } from "node:util";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import {
+  memoryStandingIntentSearchSchema,
   memoryTextSearchSchema,
   memoryVectorSearchSchema,
 } from "../../../packages/memory-host-sdk/src/host/memory-search-schema.js";
 import { readTranscriptPayload } from "../../config/sessions/transcript-payload.js";
 import { OPENCLAW_AGENT_SCHEMA_VERSION } from "../../state/openclaw-agent-db-contract.js";
-import { openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
+import { agentEngineSchema, openAgentEngineStore } from "../../state/openclaw-agent-db-engine.js";
 import { runWithAgentDatabaseMaintenanceAuthority } from "../../state/openclaw-agent-db-lease.js";
 import { AGENT_SCHEMA_COMPATIBILITY } from "../../state/openclaw-agent-db-schema-compatibility.js";
 import {
@@ -18,13 +19,22 @@ import {
   readExistingAgentSchemaMeta,
 } from "../../state/openclaw-agent-db-schema-helpers.js";
 import { ensureOpenClawAgentDatabaseSchema } from "../../state/openclaw-agent-db-schema.js";
+import type { DB } from "../../state/openclaw-agent-db.generated.js";
+import { withLegacyAgentPostgresIndexes } from "../../state/openclaw-agent-index-retirement-migration.js";
 import { OPENCLAW_AGENT_SCHEMA_SQL } from "../../state/openclaw-agent-schema.js";
 import { agentTranscriptSearchSchema } from "../../state/openclaw-agent-search-schema.js";
+import { withLegacyAgentPostgresWriteLayout } from "../../state/openclaw-agent-write-layout-migration.js";
 import metadata from "../../state/postgres-schema.generated/agent-port.json" with { type: "json" };
 import { agentPostgresRuntime } from "../../state/postgres-schema.generated/agent-runtime.js";
 import { agentSearchPostgresRuntime } from "../../state/postgres-schema.generated/agent-search-runtime.js";
 import manifest from "../../state/postgres-schema.generated/manifest.json" with { type: "json" };
+import {
+  executeSqliteQuerySync,
+  executeSqliteQueryTakeFirstSync,
+  getNodeSqliteKysely,
+} from "../kysely-sync.js";
 import { openNodeSqliteDatabase } from "../node-sqlite.js";
+import { LEGACY_USAGE_COST_PARTITION_SCOPE } from "../session-cost-usage-partitions.js";
 import { admitSqliteSchema } from "../sqlite-schema-facts.js";
 import { normalizeSchemaSql } from "../sqlite-schema-sql.js";
 import { withEngineStoreAdmission } from "./admission-scope.js";
@@ -65,6 +75,8 @@ const agentSourceSearchPostData: NonNullable<PortDescriptor["postgresSourcePostD
       const body = asOptionalRecord(asOptionalRecord(value?.text)?.body);
       const mode = asOptionalRecord(body?.postgres)?.mode;
       expected = memoryTextSearchSchema(mode === "trigram" ? "trigram" : "unicode61");
+    } else if (name === "memory.standing-intents") {
+      expected = memoryStandingIntentSearchSchema;
     } else if (name === "memory.vector") {
       const chunks = asOptionalRecord(asOptionalRecord(value?.vector)?.chunks);
       const dimensions = asOptionalRecord(chunks?.postgres)?.dimensions;
@@ -99,7 +111,28 @@ const agentSourceSearchPostData: NonNullable<PortDescriptor["postgresSourcePostD
   };
 };
 
-export async function loadAgentPortDescriptor(): Promise<PortDescriptor> {
+export async function loadAgentPortDescriptor(
+  sourceVersion = agentEngineSchema.version,
+): Promise<PortDescriptor> {
+  if (sourceVersion !== agentEngineSchema.version) {
+    const backup = agentEngineSchema.postgresMigrations?.find(
+      (step) => step.version === sourceVersion + 1,
+    )?.backup;
+    if (backup?.version === sourceVersion && backup.id === "agent") {
+      return backup;
+    }
+    // v27→29 changes only indexes in PostgreSQL. Pin the shared table catalog
+    // so a later column change needs its own predecessor descriptor.
+    if (
+      backup ||
+      OPENCLAW_AGENT_SCHEMA_VERSION !== 29 ||
+      (sourceVersion !== 27 && sourceVersion !== 28)
+    ) {
+      throw new DatabasePortDataError(
+        `Missing agent PostgreSQL backup descriptor for version ${sourceVersion}`,
+      );
+    }
+  }
   const catalog = agentPostgresRuntime.expectedCatalog;
   const columns = catalog.filter(
     (fact): fact is typeof fact & { value: PortTable["columns"][number] } => fact.kind === "column",
@@ -107,7 +140,7 @@ export async function loadAgentPortDescriptor(): Promise<PortDescriptor> {
   const keys = catalog.filter(
     (fact): fact is typeof fact & { value: string[] } => fact.kind === "primaryKey",
   );
-  return {
+  const descriptor: PortDescriptor = {
     id: "agent",
     version: OPENCLAW_AGENT_SCHEMA_VERSION,
     minimumPostgresVersion: manifest.minimumPostgresVersion,
@@ -214,11 +247,20 @@ export async function loadAgentPortDescriptor(): Promise<PortDescriptor> {
         version < 23 ? "legacy" : "current",
         true,
       );
+      const hasRetiredUsagePartitions = executeSqliteQueryTakeFirstSync(
+        db,
+        getNodeSqliteKysely<Pick<DB, "cache_entries">>(db)
+          .selectFrom("cache_entries")
+          .select("scope")
+          .where("scope", "=", LEGACY_USAGE_COST_PARTITION_SCOPE)
+          .limit(1),
+      );
       return {
         version,
         migrationRequired:
           version !== OPENCLAW_AGENT_SCHEMA_VERSION ||
           needsIndexRepair ||
+          Boolean(hasRetiredUsagePartitions) ||
           hasPendingCurrentVersionAgentDatabaseMigration(db),
         pendingColumns: {},
       };
@@ -240,7 +282,16 @@ export async function loadAgentPortDescriptor(): Promise<PortDescriptor> {
               renew: assertCurrent,
             },
             file,
-            async () => ensureOpenClawAgentDatabaseSchema(db, { agentId, register: false }),
+            async () => {
+              ensureOpenClawAgentDatabaseSchema(db, { agentId, register: false });
+              // Retired partitions are rebuilt from retained transcripts; their NUL keys cannot port.
+              executeSqliteQuerySync(
+                db,
+                getNodeSqliteKysely<Pick<DB, "cache_entries">>(db)
+                  .deleteFrom("cache_entries")
+                  .where("scope", "=", LEGACY_USAGE_COST_PARTITION_SCOPE),
+              );
+            },
           ),
       );
     },
@@ -271,4 +322,33 @@ export async function loadAgentPortDescriptor(): Promise<PortDescriptor> {
       );
     },
   };
+  return sourceVersion === agentEngineSchema.version
+    ? descriptor
+    : {
+        ...descriptor,
+        version: sourceVersion,
+        sqlite: getOpenClawAgentMigrationSchema(sourceVersion).replace(
+          /^INSERT OR IGNORE INTO[^;]+;/gm,
+          "",
+        ),
+        postData:
+          sourceVersion < 28
+            ? withLegacyAgentPostgresWriteLayout(
+                withLegacyAgentPostgresIndexes(descriptor.postData),
+              )
+            : withLegacyAgentPostgresIndexes(descriptor.postData),
+        expectedCatalog: catalog.map((fact) =>
+          fact.kind === "indexes" &&
+          (fact.table === "session_nodes" || fact.table === "session_reactions")
+            ? { table: fact.table, kind: fact.kind, value: Number(fact.value) + 1 }
+            : sourceVersion < 28 &&
+                fact.table === "transcript_event_identities" &&
+                fact.kind === "indexes"
+              ? { table: fact.table, kind: fact.kind, value: 5 }
+              : fact,
+        ),
+        inspectSqliteSource: undefined,
+        migrateSqliteSource: undefined,
+        admit: undefined,
+      };
 }

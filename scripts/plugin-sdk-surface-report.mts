@@ -280,7 +280,11 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // approved +18 exports / +6 callables scope (2026-09-26, #157148 and #157225).
       // +1: approved boot-selected family lookup on the database-engine runtime.
       // +1: shared auth-patch application replaces manual plugin config merging.
-      3792,
+      // +6: packaged Settings placement, snapshot, components, context, view, and
+      // DoctorMemoryStatusPayload for the plugin-owned Memory overview.
+      // +2: MemorySearchResponse and AgentsWorkspaceGetResult type-only contracts
+      // for the plugin-owned indexed Memory search presentation.
+      3800,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(

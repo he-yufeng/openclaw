@@ -6,7 +6,6 @@ import { availableLinkReaders } from "../../app/link-reader-routing.ts";
 import { isDesktopPanelAvailable } from "../../app/panel-availability.ts";
 import { latestBrowserTabCards } from "../../lib/chat/browser-tab-preview.ts";
 import { storedChatOutboxScopeKey } from "../../lib/chat/outbox-store.ts";
-import { projectOwner } from "../../lib/reactive/projection.ts";
 import { scopedAgentParamsForSession } from "../../lib/sessions/index.ts";
 import { resolveUiConversationIdentity } from "../../lib/sessions/session-key.ts";
 import { resolveSessionWorkspace } from "../../lib/sessions/workspace.ts";
@@ -54,12 +53,14 @@ type ChatPaneLayoutRenderParams = {
 export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRender {
   private toolIcons?: PluginToolIcons;
 
-  mountToolIcons(): void {
-    const source = projectOwner(this, () => ({
-      context: this.context,
-      session: this.state && !this.catalogHost ? this.resolveChatReadTarget() : undefined,
-    }));
-    this.toolIcons = createChatToolIcons(source.read);
+  mountToolIcons(revision: () => unknown): void {
+    this.toolIcons = createChatToolIcons(() => {
+      revision();
+      return {
+        context: this.context,
+        session: this.state && !this.catalogHost ? this.resolveChatReadTarget() : undefined,
+      };
+    });
   }
   private desktopFocus: {
     key: string;
@@ -137,9 +138,9 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
             },
           };
     const latestBrowserTabs = latestBrowserTabCards(chatProps.messages, chatProps.toolMessages);
-    const panePresentation = { owner: this, isPresented: () => this.presented };
+    const panePresentation = { owner: this.element, isPresented: () => this.presented };
     const slotPresentation = (slot: SidebarSlotId, mode: "visible" | "active" = "visible") => ({
-      owner: this,
+      owner: this.element,
       isPresented: () =>
         this.presented &&
         (mode === "active" ? this.active : this.visuallyPresented) &&
@@ -162,10 +163,13 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
       onOpenWorkspace: () => openPanelSlot("workspace"),
       onOpenSubagent: ownsSubagentsPanel ? (key) => this.showSubagents(key) : undefined,
       onOpenSubagents: ownsSubagentsPanel ? (focus) => this.showSubagents(null, focus) : undefined,
+      onOpenProcesses: ownsSubagentsPanel
+        ? () => this.requestBackgroundPanel("processes", "open")
+        : undefined,
       composerRecovery: recovery,
       pluginToolIcons: this.toolIcons,
       presented: {
-        owner: this,
+        owner: this.element,
         isPresented: () => (this.active || Boolean(this.onBackToSubagents)) && this.presented,
       },
       progressCardVisibility: panePresentation,
@@ -202,7 +206,7 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
         }
       : null;
     const discussion = this.buildSessionDiscussionPanel(state, state.sessionKey.trim());
-    const discussionState = this.sessionDiscussionStates.get(state.sessionKey.trim());
+    const discussionState = this.sessionDiscussion.snapshot.states.get(state.sessionKey.trim());
     const discussionAvailable = discussionState === "available" || discussionState === "open";
     const desktopAvailable = isDesktopPanelAvailable(this.context.gateway.snapshot);
     const companionSessionKey = state.sessionKey;
@@ -283,7 +287,7 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
         const href = buildControlUiFocusPath(target, state.basePath);
         if (this.desktopFocus === desktopFocus && desktopFocus.href !== href) {
           desktopFocus.href = href;
-          this.requestUpdate();
+          this.invalidate();
         }
       },
       dashboard: !this.compact ? this.renderBoardPanel(board, sidebarLayout) : null,
@@ -318,7 +322,7 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
       layout: savedLayout,
       closePanelSlot,
       openPanelSlot,
-      forgetDiscussionUrl: () => this.sessionDiscussionOpenUrls.delete(state.sessionKey.trim()),
+      forgetDiscussionUrl: () => this.sessionDiscussion.forgetOpenUrl(state.sessionKey.trim()),
       resizePanel: (columnId, size) => this.commitSidebarPanelResize(savedLayout, columnId, size),
       setPanelOpen: (open) => this.setChatSidePanelOpen(open, savedLayout),
     });
@@ -349,7 +353,7 @@ export abstract class ChatPaneLayoutRender extends ChatPaneBrowserAnnotationRend
             sessionKey: state.sessionKey,
             agentId: currentAgentId,
             presentation: {
-              owner: this,
+              owner: this.element,
               isPresented: () => this.visuallyPresented,
               preview: () => !this.presented && this.connectionGeneration === connectionGeneration,
             },

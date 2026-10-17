@@ -36,7 +36,6 @@ import type {
   ProviderFailureReason,
   UnavailableReason,
 } from "./types.js";
-import { validateDecisionResultV2 } from "./validation-v2.js";
 import { DecisionContractError, validateDecisionResult } from "./validation.js";
 
 type Options = DecisionEvaluateOptionsV2;
@@ -352,7 +351,9 @@ export class DecisionProviderHost {
     if (health.openUntil > performance.now() || health.trial) {
       return this.unavailable("circuit-open");
     }
-    if (this.pending.size >= MAX_CONCURRENT) {
+    // Optional work leaves the last physical slot for requested evaluations.
+    const limit = options.priority === "optional" ? MAX_CONCURRENT - 1 : MAX_CONCURRENT;
+    if (this.pending.size >= limit) {
       return this.unavailable("overloaded");
     }
     const halfOpen = health.openUntil > 0;
@@ -504,13 +505,12 @@ export class DecisionProviderHost {
         return stopped;
       }
       if (outcome?.status === "ok") {
-        // Reuse the validated snapshot for usage and return projection as well.
+        // The prepared V2 adapter already validates against route capabilities.
         const nativeResult = outcome.result;
-        const valid =
-          provider.contractVersion === 1
-            ? offeredV1 && validateDecisionResult(offeredV1, nativeResult)
-            : offeredV2 && validateDecisionResultV2(offeredV2, nativeResult);
-        if (!valid) {
+        if (
+          provider.contractVersion === 1 &&
+          (!offeredV1 || !validateDecisionResult(offeredV1, nativeResult))
+        ) {
           this.fail(health, "invalid-response");
           return this.unavailable("invalid-response");
         }

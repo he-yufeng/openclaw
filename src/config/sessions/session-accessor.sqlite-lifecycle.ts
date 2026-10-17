@@ -62,11 +62,10 @@ import {
   runExclusiveSqliteSessionReclamation,
   resolveSessionReclamationDatabaseOptions,
 } from "./session-accessor.sqlite-reclamation.js";
-import { prepareSessionEntryReplacementDatabase } from "./session-accessor.sqlite-replacement-worker.js";
 import {
   captureLifecycleDatabaseScope,
+  withPreparedSqliteScope,
   resolveSqliteAgentId,
-  resolveSqliteScope,
   resolveSqliteStoreScope,
   resolveSqliteTranscriptArchiveDirectory,
   runExclusiveSqliteSessionWrite,
@@ -118,18 +117,21 @@ export async function resetSessionEntryLifecycle(
     return memory;
   }
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
-  const resolved = captureLifecycleDatabaseScope(
-    resolveSqliteStoreScope(params.storePath, { agentId }),
+  return withPreparedSqliteScope(
+    { agentId, sessionKey: "", storePath: params.storePath },
+    (prepared) => {
+      const resolved = captureLifecycleDatabaseScope(prepared);
+      const databaseOptions = { ...toDatabaseOptions(resolved), path: resolved.path };
+      if (isMainThread && supportsOpenClawAgentDatabaseExecution(databaseOptions)) {
+        return withCommittedHistoryMaintenance(
+          { agentId: resolved.agentId, env: resolved.env, storePath: params.storePath },
+          (_recordCommit, markCommitted) =>
+            resetSessionEntryInWorker(params, databaseOptions, resolved.agentId, markCommitted),
+        );
+      }
+      return resetSessionEntryLifecycleForMaintenance(params, resolved);
+    },
   );
-  const databaseOptions = { ...toDatabaseOptions(resolved), path: resolved.path };
-  if (isMainThread && supportsOpenClawAgentDatabaseExecution(databaseOptions)) {
-    return withCommittedHistoryMaintenance(
-      { agentId: resolved.agentId, env: resolved.env, storePath: params.storePath },
-      (_recordCommit, markCommitted) =>
-        resetSessionEntryInWorker(params, databaseOptions, resolved.agentId, markCommitted),
-    );
-  }
-  return resetSessionEntryLifecycleForMaintenance(params, resolved);
 }
 
 async function resetSessionEntryLifecycleForMaintenance(
@@ -243,21 +245,22 @@ async function deleteSqliteSessionEntryLifecycleInternal(
   expectedPluginOwnerId?: string,
 ): Promise<DeleteSessionEntryLifecycleResult> {
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
-  const resolved = captureLifecycleDatabaseScope(
-    resolveSqliteScope({ agentId, env: params.env, sessionKey: "", storePath: params.storePath }),
-  );
-  return await withCommittedHistoryMaintenance(
-    { ...params, env: resolved.env },
-    async (recordCommit, markCommitted) =>
-      deleteSqliteSessionEntryLifecycleLocked(
-        resolved,
-        params,
-        allowLockedEntryRemoval,
-        expectedPluginOwnerId,
-        recordCommit,
-        markCommitted,
-      ),
-  );
+  const target = { agentId, env: params.env, sessionKey: "", storePath: params.storePath };
+  return withPreparedSqliteScope(target, (prepared) => {
+    const resolved = captureLifecycleDatabaseScope(prepared);
+    return withCommittedHistoryMaintenance(
+      { ...params, env: resolved.env },
+      async (recordCommit, markCommitted) =>
+        deleteSqliteSessionEntryLifecycleLocked(
+          resolved,
+          params,
+          allowLockedEntryRemoval,
+          expectedPluginOwnerId,
+          recordCommit,
+          markCommitted,
+        ),
+    );
+  });
 }
 
 const DELETE_EXPECTED_ENTRY_MISMATCH = Symbol("delete-expected-entry-mismatch");
@@ -320,13 +323,6 @@ async function deleteSqliteSessionEntryLifecycleLocked(
       : undefined;
   try {
     return await withSqliteTranscriptArchiveSession(databaseOptions, async () => {
-      if (reclamationOptions && !metadataTarget) {
-        await prepareSessionEntryReplacementDatabase(
-          reclamationOptions,
-          assertSourceCurrent,
-          execution,
-        );
-      }
       const {
         commitGuard: _commitGuard,
         env: _env,
@@ -523,8 +519,15 @@ async function deleteSqliteSessionEntryLifecycleLocked(
             const onWorkerResult = (_result: unknown, databaseIdentity: string | symbol) => {
               committedDatabaseIdentity = databaseIdentity;
             };
+            // Empty state needs no reclamation connection; the writer still validates its snapshots.
             const reclaimed =
-              metadataTarget && execution
+              execution &&
+              materializedPlans.every(
+                ({ snapshot }) =>
+                  snapshot.lastSeq === null &&
+                  snapshot.trajectoryLastSeq === null &&
+                  snapshot.acpParentStreamEventCount === 0,
+              )
                 ? await deleteSessionEntryInWorker(
                     reclamationPlan,
                     execution,

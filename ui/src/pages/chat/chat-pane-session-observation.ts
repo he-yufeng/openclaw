@@ -139,9 +139,9 @@ function applyObservedChatSessionRow(
   if (row.providerReview) {
     holdProviderReviewQueuedInputs(state, row.key, row.agentId ?? selectedAgentId);
     if (
-      state.realtimeTalkSession ||
-      state.realtimeTalkActive ||
-      state.realtimeTalkUseSystemDefault
+      state.realtimeTalk.snapshot.realtimeTalkSession ||
+      state.realtimeTalk.snapshot.realtimeTalkActive ||
+      state.realtimeTalk.snapshot.realtimeTalkUseSystemDefault
     ) {
       stopChatRealtimeTalk(state, { preserveConversation: true });
     }
@@ -231,7 +231,7 @@ export abstract class ChatPaneSessionObservation extends ChatPaneSessionCreation
         if (!current()) {
           return;
         }
-        this.requestUpdate();
+        this.invalidate();
         if (
           !notification?.eventPending &&
           binding.observation &&
@@ -333,7 +333,7 @@ export abstract class ChatPaneSessionObservation extends ChatPaneSessionCreation
             state.pendingAbort = null;
           }
           if (applyObservedChatSessionRow(state, row, binding.observation?.sessionId)) {
-            this.requestUpdate();
+            this.invalidate();
           }
           this.synchronizeParentSessionObservation();
           if (state.pendingAbort) {
@@ -359,7 +359,7 @@ export abstract class ChatPaneSessionObservation extends ChatPaneSessionCreation
               return;
             }
             this.activeSessionResources.reconcileObservation({
-              requestUpdate: () => this.requestUpdate(),
+              requestUpdate: () => this.invalidate(),
               updated: () => this.updateComplete,
             });
           }
