@@ -281,12 +281,28 @@ describe("Bedrock tool-free tool history", () => {
       tools: [],
     }) as never;
 
-  it.each([{ toolChoice: undefined }, { toolChoice: "none" as const }])(
+  it.each([
+    { toolChoice: undefined, tools: [] },
+    // toolChoice "none" with tools present: proves the none branch alone
+    // suppresses toolConfig and forces text replay, not the empty-tools branch.
+    {
+      toolChoice: "none" as const,
+      tools: [
+        {
+          name: "message",
+          description: "Send a message",
+          parameters: { type: "object", properties: {} },
+        },
+      ],
+    },
+  ])(
     "represents completed tool history as text when the request omits toolConfig ($toolChoice)",
-    async ({ toolChoice }) => {
+    async ({ toolChoice, tools }) => {
+      const context = settledTurnContext() as { tools: unknown[] };
+      context.tools = tools;
       const input = await captureCommandInput(
         bedrockModel({}),
-        settledTurnContext(),
+        context as never,
         toolChoice === undefined ? {} : { toolChoice },
       );
       expect(input.toolConfig).toBeUndefined();
