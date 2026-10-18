@@ -418,6 +418,26 @@ describe("plugin contract boundary invariants", () => {
     expect(missingGuards).toStrictEqual([]);
   });
 
+  it("keeps the codex binding-overflow recovery adapter forwarding every required capability", () => {
+    // withCodexBindingOverflowRecovery stands down unless the registered
+    // adapter exposes all four capabilities; a missing getter silently
+    // disables overflow recovery on every mutation.
+    const source = readRepoSource("extensions/codex/index.ts");
+    const adapterStart = source.indexOf("const lazyBindingRecoveryStateStore");
+    expect(adapterStart).toBeGreaterThanOrEqual(0);
+    const adapterEnd = source.indexOf("};", adapterStart);
+    expect(adapterEnd).toBeGreaterThan(adapterStart);
+    const adapterBody = source.slice(adapterStart, adapterEnd);
+    const requiredGetters = [
+      "get compareAndApply(",
+      "get entriesInKeyRange(",
+      "get observe(",
+      "get withCurrent(",
+    ];
+    const missing = requiredGetters.filter((getter) => !adapterBody.includes(getter));
+    expect(missing).toStrictEqual([]);
+  });
+
   it("keeps long-lived bundled hook handlers off startup-only registration gates", () => {
     const offenders = Object.entries(BUNDLED_STARTUP_GATED_HOOK_FORBIDDEN_SNIPPETS).flatMap(
       ([file, forbiddenSnippets]) => {

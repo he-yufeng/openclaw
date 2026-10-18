@@ -217,6 +217,13 @@ export default definePluginEntry({
         const store = openBindingRecoveryStateStore();
         return store?.observe?.bind(store);
       },
+      // The wrapper refuses to arm recovery without an authority-bound write
+      // path; omitting this getter silently disabled it on every mutation,
+      // even on a fully capable host.
+      get withCurrent() {
+        const store = openBindingRecoveryStateStore();
+        return store?.withCurrent?.bind(store);
+      },
     };
     const bindingStore = createLazyCodexAppServerBindingStore(
       lazyBindingStateStore,

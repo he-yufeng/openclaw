@@ -330,6 +330,58 @@ describe("Codex app-server binding overflow recovery", () => {
     }
   });
 
+  it("stands down when only withCurrent is missing from the recovery adapter", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const state = createCodexSqliteTestBindingStateStore({
+        namespace: "app-server-thread-bindings-overflow-no-withcurrent-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new",
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      });
+      const recoveryStore =
+        createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
+          namespace: "app-server-thread-bindings-overflow-no-withcurrent-test",
+          maxEntries: 2,
+          overflowPolicy: "reject-new",
+          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+        });
+      // The production lazy adapter omits withCurrent when the worker-backed
+      // store lacks it; recovery must stand down rather than run unfenced
+      // deletes. (The adapter forwards withCurrent since #125913's review.)
+      const store = withCodexBindingOverflowRecovery(
+        createCodexAppServerBindingStore(state),
+        {
+          observe: recoveryStore.observe?.bind(recoveryStore),
+          compareAndApply: recoveryStore.compareAndApply?.bind(recoveryStore),
+          entriesInKeyRange: recoveryStore.entriesInKeyRange?.bind(recoveryStore),
+          withCurrent: undefined,
+        },
+      );
+      await store.mutate(
+        { kind: "conversation", bindingId: "live" },
+        { kind: "set", binding: { threadId: "thread-live", cwd: "/repo" } },
+      );
+      // Fill the second row with a disposable entry: if the wrapper ignored
+      // the missing withCurrent and ran unfenced recovery, it would shed this
+      // row and the insert would resolve instead of rejecting.
+      state.register("session:main:disposable", {
+        version: 1,
+        state: "cleared",
+        sessionId: "disposable-session",
+      });
+      await expect(
+        store.mutate(
+          { kind: "conversation", bindingId: "incoming" },
+          { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
+        ),
+      ).rejects.toThrow(/reached its 2-row limit/);
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("recovers through the production lazy binding store composition", async () => {
     const stateDir = createOverflowStateDir();
     try {
