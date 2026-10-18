@@ -195,6 +195,7 @@ export const databaseWorkerExtensionTestFiles = [
   "extensions/codex/src/app-server/transcript-mirror.admission.test.ts",
   "extensions/codex/src/app-server/session-binding.test.ts",
   "extensions/codex/src/app-server/session-binding-overflow.test.ts",
+  "extensions/codex/src/app-server/session-binding-overflow.registered-path.test.ts",
   "extensions/codex/src/app-server/session-binding.reads.test.ts",
   "extensions/codex/src/app-server/native-subagent-submission-store.test.ts",
   "extensions/codex/src/commands.native-subagent-retention.test.ts",
