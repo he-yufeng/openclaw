@@ -8,14 +8,9 @@ import { isMemoryOriginEligibleForAutomaticInjection } from "../memory-host-sdk/
 import { classifyActiveMemoryWorkspacePaths } from "../plugins/memory-runtime.js";
 import { resolveUserPath } from "../utils.js";
 import { resolveAgentConfig, resolveDefaultAgentId } from "./agent-scope.js";
-import { getOrLoadBootstrapFiles } from "./bootstrap-cache.js";
 import { applyBootstrapHookOverrides } from "./bootstrap-hooks.js";
 import type { BootstrapContextRunKind } from "./bootstrap-mode.js";
-import {
-  buildBootstrapContextFiles,
-  resolveBootstrapMaxChars,
-  resolveBootstrapTotalMaxChars,
-} from "./embedded-agent-helpers.js";
+import { buildBootstrapContextForFiles } from "./embedded-agent-helpers/bootstrap.js";
 import type { EmbeddedContextFile } from "./embedded-agent-helpers/context-file.js";
 import type { AgentRunSessionTarget } from "./run-session-target.types.js";
 import { getAgentWorkspaceAccess } from "./workspace-access.js";
@@ -102,14 +97,14 @@ export function makeBootstrapWarn(params: {
   sessionLabel: string;
   workspaceDir?: string;
   warn?: (message: string) => void;
-}): ((message: string) => void) | undefined {
+}): ((message: string, dedupeKey?: string) => void) | undefined {
   const warn = params.warn;
   if (!warn) {
     return undefined;
   }
   const workspacePrefix = params.workspaceDir ?? "";
-  return (message: string) => {
-    const key = `${workspacePrefix}\u0000${params.sessionLabel}\u0000${message}`;
+  return (message: string, dedupeKey?: string) => {
+    const key = dedupeKey ?? `${workspacePrefix}\u0000${params.sessionLabel}\u0000${message}`;
     if (!rememberBootstrapWarning(key)) {
       return;
     }
@@ -322,20 +317,13 @@ async function resolveBootstrapFiles(
     params.workspaceDir,
     params.readOnlyState,
   );
-  const sharedFiles = params.sessionKey
-    ? await getOrLoadBootstrapFiles({
-        workspaceDir: params.workspaceDir,
-        sessionKey: params.sessionKey,
-      })
-    : await loadWorkspaceBootstrapFiles(params.workspaceDir);
-  // Personal context is refreshed independently; never write it into the shared session snapshot.
+  const rawFiles = await loadWorkspaceBootstrapFiles(params.workspaceDir);
   const personalFile = await loadPersonalUserBootstrapFile(
     params.workspaceDir,
     params.bootstrapUserProfileId,
     params.warn,
   );
-  const userIndex = sharedFiles.findIndex((file) => file.name === DEFAULT_USER_FILENAME);
-  const rawFiles = [...sharedFiles];
+  const userIndex = rawFiles.findIndex((file) => file.name === DEFAULT_USER_FILENAME);
   if (personalFile) {
     rawFiles.splice(userIndex < 0 ? rawFiles.length : userIndex + 1, 0, personalFile);
   }
@@ -420,20 +408,4 @@ export async function resolveBootstrapContextWithProjectedHookFiles(
   );
   const contextFiles = buildBootstrapContextForFiles(bootstrapFiles, params);
   return { bootstrapFiles, contextFiles };
-}
-
-/** Builds bounded context files from already-resolved bootstrap file metadata. */
-export function buildBootstrapContextForFiles(
-  bootstrapFiles: WorkspaceBootstrapFile[],
-  params: {
-    config?: OpenClawConfig;
-    agentId?: string | null;
-    warn?: (message: string) => void;
-  },
-): EmbeddedContextFile[] {
-  return buildBootstrapContextFiles(bootstrapFiles, {
-    maxChars: resolveBootstrapMaxChars(params.config, params.agentId),
-    totalMaxChars: resolveBootstrapTotalMaxChars(params.config, params.agentId),
-    warn: params.warn,
-  });
 }

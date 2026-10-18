@@ -1,3 +1,4 @@
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { steerActiveSessionWithOptionalDeliveryWait } from "../agents/embedded-agent-runner/run/attempt-queue-message.js";
 import {
   abortEmbeddedAgentRun,
@@ -7,12 +8,14 @@ import {
 import { createEmbeddedRunHandle } from "../agents/embedded-agent-runner/runs.test-support.js";
 import { guardSessionManager } from "../agents/session-tool-result-guard-wrapper.js";
 import { persistAgentSessionMessage } from "../agents/sessions/agent-session-transcript.js";
+import type { AgentSessionEvent } from "../agents/sessions/agent-session-types.js";
 import { registerQueuedUserMessageRetirement } from "../agents/sessions/queued-user-message-retirement.js";
 import { SessionManager } from "../agents/sessions/session-manager.js";
 import { setSteeringMessageIdentity } from "../agents/sessions/steering-message-identity.js";
 import { withoutGatewayToolCallerIdentity } from "../agents/tools/gateway-caller-context.js";
 import { withPersonalToolTurn } from "../auto-reply/reply/personal-tool-turn.test-support.js";
 import type { CliDeps } from "../cli/deps.types.js";
+import { setRuntimeConfigSnapshot } from "../config/runtime-snapshot.js";
 import { resolveSessionStorePathCore } from "../config/sessions/paths.js";
 import {
   appendTranscriptMessage,
@@ -21,6 +24,7 @@ import {
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { clearAgentRunContext, registerAgentRunContext } from "../infra/agent-run-registry.js";
 import { LegacyPluginSdkResourceHost } from "../plugins/legacy-sdk-resource-host.js";
+import { getPluginRuntimeGatewayRequestScope } from "../plugins/runtime/gateway-request-scope.js";
 import { attachRuntimeUserTurnTranscriptContext } from "../sessions/user-turn-transcript-runtime-context.js";
 import type {
   PersistedUserTurnMessage,
@@ -45,18 +49,20 @@ export async function seedSessionToolsFixtureSession({
   sessionKey,
   sessionId,
   creatorId = "other-person",
+  visibility = "shared",
 }: {
   agentId?: string;
   sessionKey: string;
   sessionId: string;
   creatorId?: string;
+  visibility?: "shared" | "draft";
 }) {
   await upsertSessionEntryCore(
     { agentId, sessionKey },
     {
       sessionId,
       updatedAt: 1,
-      visibility: "shared",
+      visibility,
       createdVia: "operator",
       createdActor: { type: "human", source: "profile", id: creatorId },
     },
@@ -79,6 +85,7 @@ export function withSessionToolsFixture(run: (cfg: OpenClawConfig) => Promise<vo
       tools: { sessions: { visibility: "all" } },
     };
     await state.writeConfig(cfg);
+    setRuntimeConfigSnapshot(cfg);
     for (const [agentId, sessionKey, sessionId] of [
       ["main", REQUESTER, "session-tools-requester-id"],
       ["main", TARGET, TARGET_ID],
@@ -90,8 +97,13 @@ export function withSessionToolsFixture(run: (cfg: OpenClawConfig) => Promise<vo
     const resources = new LegacyPluginSdkResourceHost();
     try {
       await resources.run(() =>
-        withLocalGatewayRequestScope({ deps: {} as CliDeps, getRuntimeConfig: () => cfg }, () =>
-          run(cfg),
+        withLocalGatewayRequestScope(
+          { deps: {} as CliDeps, getRuntimeConfig: () => cfg },
+          async () => {
+            // Fixture startup must finish before a tool's request deadline begins.
+            await getPluginRuntimeGatewayRequestScope()?.context?.ensureSessionRowProjection?.();
+            return run(cfg);
+          },
         ),
       );
     } finally {
@@ -111,10 +123,7 @@ export function withParticipantSessionToolsFixture(
   return withSessionToolsFixture(async (cfg) => {
     const person = (name: string) => {
       const client = roleClient("write", `${name.toLowerCase()}-participant`);
-      const profileId = client.authenticatedUserProfile?.profileId;
-      if (!profileId) {
-        throw new Error("expected participant profile");
-      }
+      const { profileId } = expectDefined(client.authenticatedUserProfile, "participant profile");
       return {
         profileId,
         senderId: `${name.toLowerCase()}-sender`,
@@ -128,16 +137,12 @@ export function withParticipantSessionToolsFixture(
       [PARTICIPANT_DRAFT, PARTICIPANT_DRAFT_ID, "draft", "Alice's distinctive draft marker"],
       [PARTICIPANT_SHARED, "participant-shared-id", "shared", "Shared participant marker"],
     ] as const) {
-      await upsertSessionEntryCore(
-        { agentId: "main", sessionKey },
-        {
-          sessionId,
-          updatedAt: 1,
-          visibility,
-          createdVia: "operator",
-          createdActor: { type: "human", source: "profile", id: alice.profileId },
-        },
-      );
+      await seedSessionToolsFixtureSession({
+        sessionKey,
+        sessionId,
+        visibility,
+        creatorId: alice.profileId,
+      });
       await appendTranscriptMessage(
         { agentId: "main", sessionKey, sessionId },
         { message: { role: "user", content: marker } },
@@ -195,9 +200,9 @@ export async function withDelayedSessionToolsSteering(
     message: PersistedUserTurnMessage;
     recorder: UserTurnTranscriptRecorder;
   }> = [];
-  const listeners = new Set<(event: unknown) => void>();
+  const listeners = new Set<(event: AgentSessionEvent) => unknown>();
   const settled = createDeferredCore();
-  const emit = (event: unknown) => {
+  const emit = (event: AgentSessionEvent) => {
     for (const listener of listeners) {
       listener(event);
     }
@@ -254,9 +259,11 @@ export async function withDelayedSessionToolsSteering(
         },
       ),
   };
-  withoutGatewayToolCallerIdentity(() =>
-    setActiveEmbeddedRun(target.sessionId, handle, target.sessionKey, undefined, target.agentId),
-  );
+  const activate = (next: typeof handle, agentId?: string) =>
+    withoutGatewayToolCallerIdentity(() =>
+      setActiveEmbeddedRun(target.sessionId, next, target.sessionKey, undefined, agentId),
+    );
+  activate(handle, target.agentId);
   const cancel = async () => {
     if (listeners.size === 0) {
       return;
@@ -274,9 +281,7 @@ export async function withDelayedSessionToolsSteering(
       replace: () => {
         const next = createEmbeddedRunHandle({ runId: "participant-steering-replacement" });
         replacement = next;
-        withoutGatewayToolCallerIdentity(() =>
-          setActiveEmbeddedRun(target.sessionId, next, target.sessionKey),
-        );
+        activate(next);
       },
       commit: async () => {
         const entry = queued[0];

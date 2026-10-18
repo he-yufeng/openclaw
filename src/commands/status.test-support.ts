@@ -2,21 +2,19 @@
 import os from "node:os";
 import path from "node:path";
 import type { HeartbeatEventPayload } from "../infra/heartbeat-events.js";
-import { isBetaTag } from "../infra/update-channels.js";
 import type { PluginCompatibilityNotice } from "../plugins/status.js";
 import type { MemoryPluginStatus } from "../status/memory-plugin.js";
 import type { StatusSummary } from "../status/summary.js";
-import { VERSION } from "../version.js";
 import { buildStatusOverviewSurfaceRows } from "./status-all/format.js";
 import type { buildStatusCommandOverviewRows } from "./status-overview-rows.ts";
 import type { StatusOverviewSurface } from "./status-overview-surface.ts";
 import type { AgentLocalStatus } from "./status.agent-local.js";
-import type { buildStatusCommandReportData } from "./status.command-report-data.ts";
+import type { buildStatusCommandReportLines } from "./status.command-report.ts";
 import type { StatusScanResult } from "./status.scan-result.ts";
 import type { MemoryStatusSnapshot } from "./status.scan.shared.js";
 
 type StatusCommandOverviewRowsParams = Parameters<typeof buildStatusCommandOverviewRows>[0];
-type StatusCommandReportDataParams = Parameters<typeof buildStatusCommandReportData>[0];
+type StatusCommandReportDataParams = Parameters<typeof buildStatusCommandReportLines>[0];
 
 const STATUS_TEST_STATE_DIR = path.join(os.tmpdir(), `openclaw-status-test-${process.pid}-absent`);
 
@@ -25,7 +23,7 @@ export const baseStatusCfg = {
   gateway: { bind: "loopback" },
 } as const;
 
-export const baseStatusUpdate = {
+const baseStatusUpdate = {
   installKind: "git",
   git: {
     branch: "main",
@@ -39,17 +37,11 @@ export const baseStatusUpdate = {
   registry: { latestVersion: "2026.4.10" },
 } as never;
 
-export const baseStatusExpectedUpdateChannelInfo = isBetaTag(VERSION)
-  ? {
-      channel: "beta",
-      source: "installed-version",
-      label: "beta (installed version)",
-    }
-  : {
-      channel: "stable",
-      source: "config",
-      label: "stable (config)",
-    };
+export const baseStatusExpectedUpdateChannelInfo = {
+  channel: "stable",
+  source: "config",
+  label: "stable (config)",
+} as const;
 
 export const baseStatusExpectedUpdateChannelLabel = baseStatusExpectedUpdateChannelInfo.label;
 
@@ -68,7 +60,7 @@ export const baseStatusGatewaySnapshot = {
   gatewaySelf: { host: "gateway", version: "1.2.3" },
 } as const;
 
-export const baseStatusOverviewScanFields = {
+const baseStatusOverviewScanFields = {
   cfg: baseStatusCfg,
   update: baseStatusUpdate,
   tailscaleMode: "serve",

@@ -61,16 +61,7 @@ export class WorkerLiveEventClient {
       this.degradePreviews();
       return false;
     }
-    try {
-      this.buffered.push({
-        seq: this.nextSeqValue,
-        runId,
-        event: structuredClone(event),
-      });
-    } catch {
-      this.degradePreviews();
-      return false;
-    }
+    this.buffered.push({ seq: this.nextSeqValue, runId, event });
     this.nextSeqValue += 1;
     this.pump();
     return true;
@@ -88,7 +79,7 @@ export class WorkerLiveEventClient {
     this.buffered.push({
       seq: this.nextSeqValue,
       runId,
-      event: structuredClone(event),
+      event,
       ...(terminalResyncFromSeq === undefined ? {} : { resyncFromSeq: terminalResyncFromSeq }),
       completion,
     });
@@ -146,7 +137,7 @@ export class WorkerLiveEventClient {
       if (generation !== this.replayGeneration || !this.buffered.includes(entry)) {
         return;
       }
-      const response = await this.connection.requestLiveEvent({
+      const response = await this.connection.rpc.request("live-event", {
         runEpoch: this.options.runEpoch,
         lastAckedSeq: entry.resyncFromSeq ?? this.ackedSeqValue,
         seq: sentSeq,
