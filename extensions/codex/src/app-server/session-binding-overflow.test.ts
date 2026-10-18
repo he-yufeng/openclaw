@@ -516,6 +516,88 @@ describe("Codex app-server binding overflow recovery", () => {
     }
   });
 
+  it("recovers a fresh session's lease admission when the namespace is full", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-lease-test",
+        2,
+        stateDir,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      // A fresh session acquires its lease before any mutate; the lease
+      // insert itself overflows, so recovery must fire at admission.
+      let runCalls = 0;
+      const result = await store.withLease(
+        { kind: "conversation", bindingId: "fresh" },
+        async () => {
+          runCalls += 1;
+          return "started";
+        },
+      );
+      expect(result).toBe("started");
+      expect(runCalls).toBe(1);
+      expect(state.lookup("session:main:abandoned")).toBeUndefined();
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("never re-runs the lease callback when a row-limit error escapes from inside it", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      // One free row: acquisition succeeds without a sweep, so anything the
+      // sweep touches after `run` starts shows up on the disposable row.
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-lease-no-retry-test",
+        3,
+        stateDir,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      // A row-limit-shaped failure raised by the caller's own work is not an
+      // acquisition failure: retrying would double-start the session.
+      const inner = Object.assign(
+        new Error("namespace codex.bindings reached its 3-row limit"),
+        { code: "PLUGIN_STATE_LIMIT_EXCEEDED" },
+      );
+      let runCalls = 0;
+      await expect(
+        store.withLease({ kind: "conversation", bindingId: "fresh" }, async () => {
+          runCalls += 1;
+          throw inner;
+        }),
+      ).rejects.toBe(inner);
+      expect(runCalls).toBe(1);
+      // No recovery ran for a post-acquisition failure: the disposable row
+      // survives and no second acquisition was attempted.
+      expect(state.lookup("session:main:abandoned")).toBeDefined();
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("recovers through the production lazy binding store composition", async () => {
     const stateDir = createOverflowStateDir();
     try {

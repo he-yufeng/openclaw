@@ -286,5 +286,45 @@ export function withCodexBindingOverflowRecovery(
       }
     }
   };
-  return { ...store, mutate: guardedMutate };
+  // Lease admission is the other insert path: a fresh session's withLease
+  // writes its cleared lease row before the thread-start callback can reach
+  // mutate, so at capacity the failure surfaces here first. Retry only while
+  // the caller's work has not started — once `run` executes, re-entering
+  // withLease would double-start the session.
+  const guardedWithLease: CodexAppServerBindingStore["withLease"] = async (
+    identity,
+    run,
+    options,
+  ) => {
+    let evictions = 0;
+    let runStarted = false;
+    const guardedRun = async () => {
+      runStarted = true;
+      return await run();
+    };
+    while (true) {
+      try {
+        return await store.withLease(identity, guardedRun, options);
+      } catch (error) {
+        if (
+          runStarted ||
+          !isCodexBindingRowLimitError(error) ||
+          evictions >= bounds.evictionAttempts
+        ) {
+          throw error;
+        }
+        if (
+          (await evictDisposableBindingRows(
+            bindingStoreKey(identity),
+            options?.assertCurrent,
+            options?.authority,
+          )) === 0
+        ) {
+          throw error;
+        }
+        evictions += 1;
+      }
+    }
+  };
+  return { ...store, mutate: guardedMutate, withLease: guardedWithLease };
 }
