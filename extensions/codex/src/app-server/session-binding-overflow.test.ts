@@ -15,6 +15,8 @@ import { createLazyCodexAppServerBindingStore } from "./session-binding-store.js
 import {
   bindingStoreKey,
   createCodexAppServerBindingStore,
+  type CodexAppServerBindingStore,
+  type CodexBindingAuthority,
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
 import { createCodexSqliteTestBindingStateStore } from "./session-binding.sqlite.test-helpers.js";
@@ -376,6 +378,138 @@ describe("Codex app-server binding overflow recovery", () => {
           { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
         ),
       ).rejects.toThrow(/reached its 2-row limit/);
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps cleared rows that carry a task-import receipt when the namespace overflows", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-receipt-test",
+        2,
+        stateDir,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      // Clear, reset, and lease release deliberately retain this marker
+      // without expiry so Doctor never re-imports a handled legacy task;
+      // recovery must keep the row even when it is the only candidate.
+      state.register("session:main:imported", {
+        version: 1,
+        state: "cleared",
+        sessionId: "imported-session",
+        nativeSubagentTaskImport: { version: 1, taskIds: ["legacy-running"] },
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).rejects.toThrow(/reached its 2-row limit/);
+
+      expect(state.lookup("session:main:imported")).toMatchObject({
+        nativeSubagentTaskImport: { version: 1, taskIds: ["legacy-running"] },
+      });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("carries full session authority into the retried insert and the recovery delete", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const options = {
+        namespace: "app-server-thread-bindings-overflow-authority-forward-test",
+        maxEntries: 2,
+        overflowPolicy: "reject-new" as const,
+        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+      };
+      const state = createCodexSqliteTestBindingStateStore(options);
+      const base = createCodexAppServerBindingStore(state);
+      const mutateAuthorities: unknown[] = [];
+      const recordingBase: CodexAppServerBindingStore = {
+        ...base,
+        mutate: (identity, mutation, assertCurrent, authority) => {
+          mutateAuthorities.push(authority);
+          return base.mutate(identity, mutation, assertCurrent, authority);
+        },
+      };
+      const baseRecovery = createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>(
+        "codex",
+        options,
+      );
+      let withCurrentArg: unknown;
+      const recovery = {
+        entriesInKeyRange: baseRecovery.entriesInKeyRange?.bind(baseRecovery),
+        compareAndApply: baseRecovery.compareAndApply?.bind(baseRecovery),
+        observe: baseRecovery.observe?.bind(baseRecovery),
+        withCurrent: (
+          writerAuthority: Parameters<NonNullable<typeof baseRecovery.withCurrent>>[0],
+        ) => {
+          withCurrentArg = writerAuthority;
+          return baseRecovery.withCurrent!(writerAuthority);
+        },
+      };
+      const store = withCodexBindingOverflowRecovery(recordingBase, recovery);
+
+      // The wrapper only reads prepareMutation off the authority; a minimal
+      // stand-in pins exactly what the recovery delete forwards.
+      const sessionEntryCurrent = { sources: [], assertCurrent: () => {} };
+      let prepareCalls = 0;
+      const authority = {
+        prepareMutation: async () => {
+          prepareCalls += 1;
+          return { assertCurrent: () => {}, sessionEntryCurrent };
+        },
+      } as unknown as CodexBindingAuthority;
+      const assertCurrent = () => {};
+
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(
+        live,
+        { kind: "set", binding: { threadId: "thread-live", cwd: "/repo" } },
+        assertCurrent,
+        authority,
+      );
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(
+          incoming,
+          { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
+          assertCurrent,
+          authority,
+        ),
+      ).resolves.toBe(true);
+
+      // Every attempt, not just the first, forwards the caller's authority.
+      expect(mutateAuthorities).toHaveLength(3);
+      expect(mutateAuthorities.every((a) => a === authority)).toBe(true);
+      // The lifecycle prepares the authority once per mutation attempt and
+      // the sweep prepares it once more for its delete: exactly one prepare
+      // beyond the mutate count proves both paths carry it.
+      expect(prepareCalls).toBe(mutateAuthorities.length + 1);
+      const writerAuthority = withCurrentArg as {
+        assertCurrent?: unknown;
+        sessionEntryCurrent?: unknown;
+      };
+      expect(typeof writerAuthority.assertCurrent).toBe("function");
+      expect(writerAuthority.sessionEntryCurrent).toBe(sessionEntryCurrent);
+      expect(state.lookup("session:main:abandoned")).toBeUndefined();
     } finally {
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });

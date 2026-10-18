@@ -5,7 +5,7 @@ import {
   readStoredCodexAppServerBinding,
   type StoredCodexAppServerBinding,
 } from "./session-binding-record.js";
-import type { CodexAppServerBindingStore } from "./session-binding.js";
+import type { CodexAppServerBindingStore, CodexBindingAuthority } from "./session-binding.js";
 
 // Overflow retries per insert. Each retry means a just-freed row was claimed
 // by a racing insert; past a few, fail with the limit error instead of
@@ -107,6 +107,13 @@ function isDisposableBindingRow(
   if (raw.retired !== undefined) {
     return false;
   }
+  // Task-import receipts are durable by design: clear, reset, and lease
+  // release all retain the marker without expiry, and Doctor consults it to
+  // avoid re-importing an already handled legacy task. Any marker shape,
+  // including an unknown version, keeps the row.
+  if (raw.nativeSubagentTaskImport !== undefined) {
+    return false;
+  }
   const lease = readRawLeaseProtection(value);
   return lease.kind === "none" || (lease.kind === "valid" && lease.expiresAt <= now);
 }
@@ -142,7 +149,35 @@ export function withCodexBindingOverflowRecovery(
   const evictDisposableBindingRows = async (
     insertKey: string,
     assertCurrent: (() => void) | undefined,
+    authority: CodexBindingAuthority | undefined,
   ): Promise<number> => {
+    // Prepared on the first delete, not at sweep start: preparation itself
+    // asserts caller authority, and a pass that sheds nothing must not pay
+    // for it. The prepared session-entry restrictions then ride into the
+    // worker's write admission, so a delete is fenced on the same checks the
+    // caller's own mutation would carry.
+    let deleteWriter: ReturnType<typeof withCurrent> | undefined;
+    let deleteWriterPrepared = false;
+    const recoveryWriter = async () => {
+      if (!deleteWriterPrepared) {
+        deleteWriterPrepared = true;
+        if (authority) {
+          const prepared = await authority.prepareMutation();
+          deleteWriter = withCurrent({
+            assertCurrent: () => {
+              assertCurrent?.();
+              prepared.assertCurrent();
+            },
+            ...(prepared.sessionEntryCurrent
+              ? { sessionEntryCurrent: prepared.sessionEntryCurrent }
+              : {}),
+          });
+        } else if (assertCurrent) {
+          deleteWriter = withCurrent({ assertCurrent });
+        }
+      }
+      return deleteWriter;
+    };
     const now = Date.now();
     let shed = 0;
     let pages = 0;
@@ -195,7 +230,7 @@ export function withCodexBindingOverflowRecovery(
         // says nothing about the caller: fence every delete on live authority,
         // locally before dispatch and again at the worker's write admission.
         assertCurrent?.();
-        const writer = assertCurrent ? withCurrent({ assertCurrent }) : undefined;
+        const writer = await recoveryWriter();
         const result = await (writer?.compareAndApply ?? compareAndApply)(
           entry.key,
           observation.comparison,
@@ -226,18 +261,25 @@ export function withCodexBindingOverflowRecovery(
     identity,
     mutation,
     assertCurrent,
+    authority,
   ) => {
     let evictions = 0;
     while (true) {
       try {
-        return await store.mutate(identity, mutation, assertCurrent);
+        // The fourth argument carries prepared session lineage into the
+        // worker's admission checks; dropping it here would strip those
+        // checks from every mutation whenever recovery is enabled.
+        return await store.mutate(identity, mutation, assertCurrent, authority);
       } catch (error) {
         if (!isCodexBindingRowLimitError(error) || evictions >= bounds.evictionAttempts) {
           throw error;
         }
         // The failed insert owns no row yet, so the sweep skips nothing by
         // key; the skip only guards a concurrent insert claiming it mid-retry.
-        if ((await evictDisposableBindingRows(bindingStoreKey(identity), assertCurrent)) === 0) {
+        if (
+          (await evictDisposableBindingRows(bindingStoreKey(identity), assertCurrent, authority)) ===
+          0
+        ) {
           throw error;
         }
         evictions += 1;
