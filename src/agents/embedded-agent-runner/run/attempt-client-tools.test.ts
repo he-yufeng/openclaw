@@ -237,9 +237,8 @@ describe("prepareEmbeddedAttemptClientTools", () => {
     async (executionPath) => {
       const previousMode = isEmbeddedMode();
       const previousBroker = getEmbeddedPluginApprovalBroker();
-      const broker = new EmbeddedPluginApprovalBroker();
       const requested = createDeferredCore();
-      broker.subscribe((event) => {
+      const broker = new EmbeddedPluginApprovalBroker((event) => {
         if (event.event === "plugin.approval.requested") {
           requested.resolve();
         }
@@ -328,6 +327,45 @@ describe("prepareEmbeddedAttemptClientTools", () => {
 
     expect(result.trustedLocalMediaToolNames).toBe(trustedLocalMediaToolNames);
     expect(result.trustedLocalMediaToolNames).toEqual(new Set());
+  });
+
+  it("rebuilds pinned tools from the refreshed catalog", async () => {
+    const executorOf = (name: string, generation: string) =>
+      Object.assign(createStubTool(name), {
+        execute: async () => jsonResult({ generation }),
+      });
+    const effectiveTools = [executorOf("read", "before"), executorOf("gateway", "before")];
+    const pinned = new Set<string>();
+    const result = prepare({
+      effectiveTools,
+      clientTools: [],
+      pinTools: (tools) => {
+        for (const tool of tools) {
+          pinned.add(tool.name);
+        }
+        return [
+          ...tools,
+          ...[...pinned]
+            .filter((name) => !tools.some((tool) => tool.name === name))
+            .map((name) => executorOf(name, "gated")),
+        ];
+      },
+    });
+
+    effectiveTools.splice(0, effectiveTools.length, executorOf("read", "after"));
+    result.refreshTools();
+
+    const run = async (name: string) => {
+      const tool = wrapToolDefinition(
+        expectDefined(
+          result.allCustomTools.find((entry) => entry.name === name),
+          name,
+        ),
+      );
+      return (await tool.execute("call", {})).details;
+    };
+    expect(await run("read")).toEqual({ generation: "after" });
+    expect(await run("gateway")).toEqual({ generation: "gated" });
   });
 
   it.each(["code-mode", "tool-search"] as const)("hides client tools behind %s catalog", (mode) => {

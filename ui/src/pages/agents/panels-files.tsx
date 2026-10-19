@@ -4,17 +4,19 @@ import type { OpenClawModalDialog } from "../../components/modal-dialog.ts";
 import { HubTabs } from "../../components/solid/hub-tabs.tsx";
 import { Icon } from "../../components/solid/icon.tsx";
 import { MarkdownHtml } from "../../components/solid/markdown-html.tsx";
-import "../../components/modal-dialog.ts";
 import { SettingsEmpty, SettingsSection } from "../../components/solid/settings-ui.tsx";
+import "../../components/modal-dialog.ts";
+import { registerSettingsEnglish } from "../../i18n/locales/en-settings.ts";
 import "../../components/tooltip.ts";
 import { formatBytes } from "../../lib/agents/display.ts";
 import { formatRelativeTimestamp } from "../../lib/format.ts";
 import { pathDisplayName } from "../../lib/path-display.ts";
-import { t } from "../../lib/reactive/i18n.ts";
+import { registerEnglishCatalog, t } from "../../lib/reactive/i18n.ts";
 import { AgentFilePreview } from "./agent-file-preview.tsx";
-import { AgentFileError } from "./file-conflict-callout.tsx";
 import { hasAgentFileContent, type AgentFilesViewState } from "./files.ts";
 import { AgentPanelAction } from "./panel-ui.tsx";
+
+registerEnglishCatalog(registerSettingsEnglish);
 
 function getExtensionLabel(fileName: string) {
   const ext = fileName.split(".").pop()?.trim().toLowerCase();
@@ -109,14 +111,38 @@ export function AgentFiles(
 
   return (
     <>
-      <AgentFileError
-        error={params.agentFilesError}
-        conflictName={conflictName()}
-        busy={params.agentFilesLoading || params.agentFileSaving}
-        canWrite={params.canWrite}
-        onReload={params.onFileReload}
-        onOverwrite={params.onFileOverwrite}
-      />
+      <Show
+        when={conflictName()}
+        fallback={
+          <Show when={params.agentFilesError}>
+            <div class="callout danger">{params.agentFilesError}</div>
+          </Show>
+        }
+      >
+        {(name) => (
+          <div class="callout danger">
+            <span>{params.agentFilesError ?? t("agents.files.conflictHint")}</span>
+            <div class="agent-file-actions">
+              <button
+                class="btn btn--sm"
+                type="button"
+                disabled={params.agentFilesLoading || params.agentFileSaving}
+                onClick={() => params.onFileReload(name())}
+              >
+                {t("common.reload")}
+              </button>
+              <button
+                class="btn btn--sm"
+                type="button"
+                disabled={params.agentFilesLoading || params.agentFileSaving || !params.canWrite}
+                onClick={() => params.onFileOverwrite(name())}
+              >
+                {t("agents.files.overwrite")}
+              </button>
+            </div>
+          </div>
+        )}
+      </Show>
       <SettingsSection
         title={t("agents.files.coreFilesTitle")}
         description={

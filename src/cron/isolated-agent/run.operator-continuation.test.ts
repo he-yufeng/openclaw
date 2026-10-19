@@ -9,6 +9,10 @@ import { applyEmbeddedAttemptToolsAllow } from "../../agents/embedded-agent-runn
 import type { RunEmbeddedAgentParams } from "../../agents/embedded-agent-runner/run/params.js";
 import { markRestartAbortedMainSessions } from "../../agents/main-session-recovery/main-session-restart-recovery-marking.js";
 import { recoverStore } from "../../agents/main-session-recovery/main-session-restart-recovery-store.js";
+import {
+  createRestartRecoveryRequesterSource,
+  readRestartRecoveryRequesterSource,
+} from "../../agents/requester-run-recovery-source.js";
 import { createAgentRunRestartAbortError } from "../../agents/run-termination.js";
 import { createEmbeddedAgentRunnerOpenAiConfig } from "../../agents/test-helpers/embedded-agent-runner-e2e-fixtures.js";
 import { AUTOMATIONS_TOOL_NAME } from "../../agents/tools/automations-tool-name.js";
@@ -309,6 +313,19 @@ describe("same-conversation scheduled operator continuation", () => {
       delete entry.restartRecoverySourceIngress;
       delete entry.restartRecoveryOperatorSource;
       await accessor.replaceSessionEntry(recovery.target, entry);
+    } else if (restarting) {
+      // A prior human admission can leave requester facts beside its operator source.
+      await accessor.replaceSessionEntry(recovery.target, {
+        ...recovery.entry,
+        restartRecoveryRequesterSource: expectDefined(
+          createRestartRecoveryRequesterSource({
+            ...recovery.target,
+            entry: recovery.entry,
+            requesterOrigin: { sessionKey: SESSION, operatorProfileId: profile.id },
+          }),
+          "prior human requester source",
+        ),
+      });
     }
     // No operator request, original admitted run or human follow-up survives this point.
     const job = expectDefined((await fixture.read())[0], "durably stored continuation");
@@ -421,7 +438,7 @@ describe("same-conversation scheduled operator continuation", () => {
         params.preparedRunAdmission,
         "scheduled admission",
       ).admit("gateway", params.runId);
-      if (restarting) {
+      if (restarting && entered === 1) {
         expect(params.toolsAllow).toEqual(["github_publish"]);
         const recorder = expectDefined(params.userTurnTranscriptRecorder, "cron transcript owner");
         expect(await recorder.persistApproved()).toBeDefined();
@@ -627,6 +644,11 @@ describe("same-conversation scheduled operator continuation", () => {
             expect(interrupted.restartRecoveryDeliverySourceRunId).toBe(
               scenario === "restart" ? interruptedRunId : recovery.target.sourceRunId,
             );
+            if (scenario !== "restart") {
+              expect(
+                readRestartRecoveryRequesterSource({ ...recovery.target, entry: interrupted }),
+              ).toMatchObject({ sessionKey: SESSION, operatorProfileId: profile.id });
+            }
             expect(interrupted.restartRecoveryRuns).toContainEqual({
               runId: interruptedRunId,
               lifecycleGeneration: getAgentEventLifecycleGeneration(),
@@ -644,6 +666,8 @@ describe("same-conversation scheduled operator continuation", () => {
       if (restarting) {
         await shutdownReleased;
         expect(state.lastRunStatus, state.lastError).toBe("error");
+        expect(execution.getJob(job.id)?.enabled).toBe(true);
+        expect(state.nextRunAtMs).toEqual(expect.any(Number));
         expect(entered).toBe(1);
         expect(writes).toEqual([]);
         expect(job.operatorSource).toBeDefined();
@@ -673,28 +697,27 @@ describe("same-conversation scheduled operator continuation", () => {
         expect(saved.abortedLastRun).toBe(false);
         expect(saved.lifecycleRunId).toBeUndefined();
         expect(saved.activeWriterRunId).toBeUndefined();
-        if (scenario === "restart") {
-          expect(saved.status).toBe("interrupted");
-          expect(hasMainSessionRecoveryClaim(saved)).toBe(false);
-          expect(resolveSessionWorkStartBlock(SESSION, saved)).toBeUndefined();
-        } else {
-          // The old source does not identify the interrupted cron run. Keep its
-          // unresolved custody visible instead of dropping an unrelated fence.
-          expect(saved).toMatchObject({
-            status: "failed",
-            restartRecoveryDeliverySourceRunId: recovery.target.sourceRunId,
-            mainRestartRecovery: {
-              tombstone: { reason: "delegated recovery sender authority is unavailable" },
-            },
-          });
-          expect(saved.restartRecoveryRuns?.some((run) => run.runId === interruptedRunId)).toBe(
-            true,
-          );
-          expect(resolveSessionWorkStartBlock(SESSION, saved)?.reason).toBe("restart_tombstone");
-        }
+        expect(saved.status).toBe("interrupted");
+        expect(hasMainSessionRecoveryClaim(saved)).toBe(false);
+        expect(resolveSessionWorkStartBlock(SESSION, saved)).toBeUndefined();
         expect(
           isSessionControllerWorkActive(recovery.target.storePath, [SESSION, SESSION_ID]),
         ).toBe(false);
+        execution.stop();
+        await execution.waitForIdle();
+        await execution.start();
+        clock.setTime(expectDefined(execution.getJob(job.id)?.state.nextRunAtMs, "restart retry"));
+        await onTimer(schedulerState);
+        await execution.waitForIdle();
+        expect(entered).toBe(2);
+        expect(writes).toEqual([{ sha: "a".repeat(40), merge_method: "merge" }]);
+        expect(execution.getJob(job.id)?.state.lastRunStatus).toBe("ok");
+        execution.stop();
+        await execution.waitForIdle();
+        await execution.start();
+        await onTimer(schedulerState);
+        await execution.waitForIdle();
+        expect(entered).toBe(2);
         return;
       }
       if (scenario === "role revoked" || scenario === "session replaced") {

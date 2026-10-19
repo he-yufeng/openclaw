@@ -7,6 +7,7 @@ import { Menu, type MenuEntry, type MenuHandle } from "../../../components/solid
 import { canSubmitBeforeChatHistory } from "../../../lib/chat/commands.ts";
 import type { ControlUiFollowUpMode } from "../../../lib/chat/follow-up-mode.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
+import { nativeListener } from "../../../lib/solid-native-listener.ts";
 import type { ComposerDictationOwner } from "../composer-dictation.ts";
 import type { ComposerTalkCapabilityStatus } from "../composer-microphone-picker.ts";
 import {
@@ -17,7 +18,7 @@ import {
 import type { RealtimeTalkLevelSignal } from "../talk/level.ts";
 import type { RealtimeTalkStatus } from "../talk/session.ts";
 import { ComposerContent } from "./chat-composer-content.tsx";
-import { ChatVoiceStatus, MicrophoneActivity, voiceStatusLabel } from "./chat-voice-activity.tsx";
+import { MicrophoneActivity, voiceStatusLabel } from "./chat-voice-activity.tsx";
 
 export type ChatRunControlsProps = Omit<
   ComposerVoiceButtonProps,
@@ -316,23 +317,20 @@ export function renderComposerVoiceButtonSolid(props: ComposerVoiceButtonProps) 
   const arming = () => props.readDictation?.()?.arming === true;
   const finalizing = () => props.readDictation?.()?.finalizing === true;
   const holding = () => props.readDictation?.()?.locksComposer === true;
-  const startsDictationDirectly = createMemo(
-    () => props.readDictation !== undefined && props.onToggleVoice === undefined,
-  );
-  const label = createMemo(() =>
+  const startsDictationDirectly = () =>
+    props.readDictation !== undefined && props.onToggleVoice === undefined;
+  const label = () =>
     active()
       ? t("chat.composer.dictationStopAndKeep")
-      : (props.idleLabel ?? t("chat.composer.startVoiceInput")),
-  );
-  const tooltip = createMemo(() =>
+      : (props.idleLabel ?? t("chat.composer.startVoiceInput"));
+  const tooltip = () =>
     props.readDictation && !startsDictationDirectly() && !(active() || finalizing())
       ? [props.submitDisabledReason, t("chat.composer.voiceGestureHint")]
           .filter(Boolean)
           .join(" · ")
       : active()
         ? label()
-        : (props.submitDisabledReason ?? label()),
-  );
+        : (props.submitDisabledReason ?? label());
   // This shape owns pointer capture. Keep it stable while dictation rerenders,
   // or replacing the button releases capture and cancels the active hold.
   return (
@@ -403,8 +401,7 @@ export function renderComposerVoiceButtonSolid(props: ComposerVoiceButtonProps) 
 
 function primaryPointerDownRef(read: () => ((event: PointerEvent) => void) | undefined) {
   // Preserve input focus before native tooltip listeners run at the target.
-  return (button: HTMLButtonElement) =>
-    button.addEventListener("pointerdown", (event) => read()?.(event), true);
+  return nativeListener("pointerdown", (event) => read()?.(event), true);
 }
 
 export function ComposerDictationSendAction(props: {
@@ -447,44 +444,6 @@ export function ComposerDictationSendAction(props: {
   );
 }
 
-export function ComposerDictationStatus(props: {
-  readDictation: () => ComposerDictationOwner | undefined;
-}) {
-  const content = createMemo(() => {
-    const dictation = props.readDictation();
-    if (!dictation?.active) {
-      return null;
-    }
-    if (dictation.connecting) {
-      return (
-        <ChatVoiceStatus status="connecting" detail={t("chat.composer.microphoneAccessPending")} />
-      );
-    }
-    return (
-      <div class="agent-chat__composer-status-stack">
-        <div
-          class={[
-            "agent-chat__dictation-status",
-            { "agent-chat__dictation-status--finalizing": dictation.finalizing },
-          ]}
-        >
-          <span
-            class={[
-              "agent-chat__dictation-phase",
-              { "agent-chat__dictation-phase--listening": !dictation.finalizing },
-            ]}
-          >
-            {dictation.finalizing
-              ? t("chat.composer.dictationFinalizing")
-              : t("chat.composer.dictationListening")}
-          </span>
-        </div>
-      </div>
-    );
-  });
-  return <>{content()}</>;
-}
-
 export function renderChatAbortActionSolid(
   props: Pick<ChatRunControlsProps, "canAbort" | "onAbort" | "onPrimaryActionPointerDown">,
 ) {
@@ -512,16 +471,15 @@ export function renderChatPrimaryActionsSolid(props: ChatRunControlsProps) {
   const microphonePicker = (
     <Show when={props.microphonePicker}>{(picker) => <MicrophonePicker {...picker()} />}</Show>
   );
-  const hasComposedContent = createMemo(() => Boolean(props.draft.trim() || props.hasAttachments));
-  const labels = createMemo(() =>
+  const hasComposedContent = () => Boolean(props.draft.trim() || props.hasAttachments);
+  const labels = () =>
     props.suggestionComposer
       ? (["chat.sessionSuggestions.suggest", "chat.sessionSuggestions.suggestMessage"] as const)
       : !props.canAbort || props.followUpMode === undefined || props.followUpMode === "interrupt"
         ? (["chat.runControls.send", "chat.runControls.sendMessage"] as const)
         : props.followUpMode === "steer"
           ? (["chat.queue.steer", "chat.followUpModeSteer"] as const)
-          : (["chat.runControls.queue", "chat.runControls.queueMessage"] as const),
-  );
+          : (["chat.runControls.queue", "chat.runControls.queueMessage"] as const);
   const label = () => props.submissionLabel ?? t(labels()[0]);
   const description = () => props.submissionLabel ?? t(labels()[1]);
   const alternateLabel = () =>
@@ -541,9 +499,8 @@ export function renderChatPrimaryActionsSolid(props: ChatRunControlsProps) {
       : hasComposedContent()
         ? null
         : t("chat.composer.emptyHint"));
-  const hasSendableContent = createMemo(
-    () => hasComposedContent() && props.canSend && !props.sending && !sendDisabledReason(),
-  );
+  const hasSendableContent = () =>
+    hasComposedContent() && props.canSend && !props.sending && !sendDisabledReason();
   const showShortcutTooltip = () =>
     !props.preparingAttachments && sendStatus() == null && alternateAvailable();
   const SendAction = () => (
