@@ -67,6 +67,7 @@ export interface ProcessSession {
   notifyDeliveryContext?: DeliveryContext;
   notifyFromConversationTurn?: boolean;
   notifySessionTarget?: SessionEventTarget;
+  assertExitNotificationAcceptanceCurrent?: () => void;
   persistExitNotification?: () => Promise<void>;
   exitNotificationPersistence?: Promise<void>;
   clearExitNotification?: () => Promise<void>;
@@ -437,7 +438,7 @@ function moveToFinished(session: ProcessSession) {
   if (stdin) {
     if (typeof stdin.destroy === "function") {
       stdin.destroy();
-    } else if (typeof stdin.end === "function") {
+    } else {
       stdin.end();
     }
     delete session.stdin;

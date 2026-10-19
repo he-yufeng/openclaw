@@ -1,10 +1,12 @@
 import { coerceErrorMessage } from "@openclaw/normalization-core/error-coercion";
+import { prepareGoalContinuationContext } from "../../auto-reply/reply/goal-continuation-return.js";
 import type { ThinkLevel, VerboseLevel } from "../../auto-reply/thinking.js";
 import { isSessionWorkStartInvalidatedError } from "../../config/sessions/lifecycle.js";
 import {
   isMainRestartRecoveryCandidate,
   normalizeMainSessionRecoveryRunFences,
 } from "../../config/sessions/restart-recovery-state.js";
+import { applySessionEntryOperation } from "../../config/sessions/session-accessor.sqlite-entry.js";
 import type { InternalSessionEntry, SessionEntry } from "../../config/sessions/types.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { assertAgentRunLifecycleGenerationCurrent } from "../../infra/agent-events.js";
@@ -12,7 +14,6 @@ import { registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { PluginMetadataSnapshot } from "../../plugins/plugin-metadata-snapshot.types.js";
 import { isSubagentCoordinationInputProvenance } from "../../sessions/input-provenance.js";
-import { applyVerboseOverride } from "../../sessions/level-overrides.js";
 import { ensureSessionDiffBaseline } from "../../sessions/session-diff-baseline.js";
 import { recordSessionHumanDirectMessage } from "../../sessions/session-state-events.js";
 import { resolveEffectiveAgentSkillFilter } from "../../skills/discovery/agent-filter.js";
@@ -24,7 +25,6 @@ import {
 } from "../agent-command-restart-recovery.js";
 import { resolveAgentWorkspaceDir } from "../agent-scope-config.js";
 import { createRestartRecoveryOperatorSource } from "../operator-run-recovery-source.js";
-import { persistAgentSession } from "./attempt-execution.shared.js";
 import { prepareCommandConversationContext } from "./conversation-context.js";
 import { resolveAgentRunContext } from "./run-context.js";
 import { loadExecDefaultsRuntime, loadSkillsRuntime } from "./runtime-loaders.js";
@@ -86,7 +86,6 @@ export function prepareCommandSessionRecoveryEntry(
       lastInteractionAt: isSessionRollover ? now : entry.lastInteractionAt,
       ...buildCurrentRunRestartRecoveryClaim({
         deliveryContext: params.deliveryContext,
-        deliveryMediaUrls: opts.internalDeliveryMediaUrls,
         disableMessageTool: opts.disableMessageTool,
         entry,
         forceRestartSafeTools: opts.forceRestartSafeTools,
@@ -100,7 +99,6 @@ export function prepareCommandSessionRecoveryEntry(
               sourceIngress: sourceOptions.sourceIngress ?? operatorSource.snapshot.sourceIngress,
             }
           : {}),
-        suppressTextDelivery: opts.internalDeliverySuppressText,
       }),
     },
   };
@@ -230,29 +228,39 @@ export async function prepareEmbeddedSessionState(params: {
       updatedAt: now,
       sessionStartedAt: now,
     };
-    const next: SessionEntry = {
-      ...entry,
+    const patch: Partial<SessionEntry> = {
       sessionId: params.sessionId,
       updatedAt: now,
-      sessionStartedAt: entry.sessionStartedAt ?? now,
+      ...(entry.sessionStartedAt === undefined ? { sessionStartedAt: now } : {}),
     };
     if (updateSkills) {
-      next.skillsSnapshot = skillsSnapshot;
+      patch.skillsSnapshot = skillsSnapshot;
     }
     // Persist non-model-dependent state first; thinking waits for runtime validation.
     if (touchSession) {
-      next.lastInteractionAt = now;
-      next.agentStatus = undefined;
-      applyVerboseOverride(next, params.verboseOverride);
+      patch.lastInteractionAt = now;
+      patch.agentStatus = undefined;
+      if (params.verboseOverride !== undefined) {
+        patch.verboseLevel = params.verboseOverride;
+      }
     }
-    sessionEntry = await persistAgentSession({
-      agentId: params.sessionAgentId,
-      sessionStore,
-      sessionKey,
-      storePath: params.storePath,
-      initialEntry: entry,
-      entry: next,
-    });
+    let published = false;
+    const persisted = await applySessionEntryOperation(
+      { agentId: params.sessionAgentId, sessionKey, storePath: params.storePath },
+      { kind: "fields", expected: { sessionId: entry.sessionId }, patch },
+      {
+        onCommitted: (current) => {
+          published = true;
+          sessionStore[sessionKey] = current;
+        },
+      },
+    );
+    sessionEntry = persisted ?? undefined;
+    if (!sessionEntry) {
+      delete sessionStore[sessionKey];
+    } else if (!published) {
+      sessionStore[sessionKey] = sessionEntry;
+    }
   }
   if (params.sessionKey && !params.isSubagentLaneTurn) {
     const assertSignalCurrent = () => {
@@ -278,13 +286,15 @@ export async function prepareEmbeddedSessionState(params: {
   }
 
   const runContext = resolveAgentRunContext(params.opts);
+  const opts = await prepareCommandConversationContext({ ...params, sessionEntry, runContext });
+  prepareGoalContinuationContext({ runId: params.runId, sessionKey, sessionEntry });
   return {
     sessionEntry,
     requestedThinkLevel,
     resolvedVerboseLevel,
     skillsSnapshot,
     runContext,
-    opts: await prepareCommandConversationContext({ ...params, sessionEntry, runContext }),
+    opts,
   };
 }
 
