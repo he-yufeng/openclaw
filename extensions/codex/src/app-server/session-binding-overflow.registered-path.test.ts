@@ -71,10 +71,21 @@ async function withRegisteredCodexBindingStore(
   run: (ctx: {
     bindingStore: CodexAppServerBindingStore;
     syncBindingStore: PluginStateSyncKeyedStore<StoredCodexAppServerBinding>;
+    revokedError?: Error;
   }) => Promise<void>,
-  hooks?: { onRecoveryPage?: () => void },
+  options?: { revokeAtWorkerAdmission?: boolean },
 ) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-binding-entry-"));
+  // Revocation rig: the sweep is the only pager on this namespace, so a page
+  // followed by an observe marks the exact window between the failed capacity
+  // insert and the recovery delete. The revocation lands there; the delete's
+  // authority-bound store then refuses at its first post-open admission,
+  // which is the worker's final admission gate.
+  let paged = false;
+  let revoked = false;
+  const revokedError = options?.revokeAtWorkerAdmission
+    ? new Error("session authority revoked")
+    : undefined;
   try {
     const withFixtureEnv = <T extends object>(options: T) => ({
       ...options,
@@ -82,42 +93,55 @@ async function withRegisteredCodexBindingStore(
     });
     const runtime = createPluginRuntimeMock({
       state: {
-        openKeyedStore: (options) =>
-          createPluginStateKeyedStoreForTests(
-            "codex",
-            withFixtureEnv(clampBindingCapacity(options)),
-          ),
         // Mirrors the production openKeyedStoreV2: the authority folds into
         // the store's admission checks at open time.
         openKeyedStoreV2: <T>(
-          options: OpenAsyncKeyedStoreOptions,
+          storeOptions: OpenAsyncKeyedStoreOptions,
           authority?: PluginStateActionAuthority,
         ) => {
+          // Per store instance: the factory runs assertCurrent once at open,
+          // every operation admission re-runs it. A revocation armed after
+          // open therefore only fails admissions, never the open itself.
+          let opened = false;
           const store = createPluginStateKeyedStoreV2ForTests<T>(
             "codex",
-            withFixtureEnv(clampBindingCapacity(options)),
+            withFixtureEnv(clampBindingCapacity(storeOptions)),
             {
-              assertCurrent: () => authority?.assertCurrent(),
+              assertCurrent: () => {
+                if (!opened) {
+                  opened = true;
+                } else if (revoked) {
+                  throw revokedError;
+                }
+                authority?.assertCurrent();
+              },
               sessionEntryCurrent: authority?.sessionEntryCurrent,
             },
           );
-          // Only the recovery sweep pages the namespace, so the hook fires
-          // exactly between the failed capacity insert and the delete.
-          if (options?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE && hooks?.onRecoveryPage) {
+          if (storeOptions?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE && revokedError) {
             const page = store.entriesInKeyRange?.bind(store);
             if (page) {
               store.entriesInKeyRange = (range) => {
-                hooks.onRecoveryPage!();
+                paged = true;
                 return page(range);
+              };
+            }
+            const observe = store.observe?.bind(store);
+            if (observe) {
+              store.observe = (key) => {
+                if (paged) {
+                  revoked = true;
+                }
+                return observe(key);
               };
             }
           }
           return store;
         },
-        openSyncKeyedStore: (options) =>
+        openSyncKeyedStore: (syncOptions) =>
           createPluginStateSyncKeyedStoreForTests(
             "codex",
-            withFixtureEnv(clampBindingCapacity(options)),
+            withFixtureEnv(clampBindingCapacity(syncOptions)),
           ),
       },
     });
@@ -151,6 +175,7 @@ async function withRegisteredCodexBindingStore(
     await run({
       bindingStore: bindingStore!,
       syncBindingStore,
+      revokedError,
     });
   } finally {
     // Close the worker and cached database handles before removing the
@@ -217,21 +242,15 @@ describe("Codex binding overflow recovery through the registered plugin path", (
     });
   });
 
-  it("reaches the delete and revokes it at admission when authority lapses mid-recovery", async () => {
-    let revoked = false;
+  it("rejects a queued delete at final worker admission when authority lapses mid-recovery", async () => {
     await withRegisteredCodexBindingStore(
-      async ({ bindingStore, syncBindingStore }) => {
+      async ({ bindingStore, syncBindingStore, revokedError }) => {
         fillToCapacity(syncBindingStore);
 
-        // A real prepared authority whose liveness reads a flag. Acquisition
-        // passes while current; the recovery sweep's first page flip marks the
-        // lapse, so the delete's authority-bound store refuses to open.
-        const revokedError = new Error("session authority revoked");
-        const authority = createNativeSessionBindingScope(() => {
-          if (revoked) {
-            throw revokedError;
-          }
-        });
+        // The caller's authority is current at lease admission; the lapse
+        // lands while the sweep pages and observes, so the delete is already
+        // queued when the admission gate refuses it.
+        const authority = createNativeSessionBindingScope(() => {});
         let runCalls = 0;
         await expect(
           bindingStore.withLease(
@@ -247,7 +266,7 @@ describe("Codex binding overflow recovery through the registered plugin path", (
         // Zero deletes: the disposable row survives the refused admission.
         expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
       },
-      { onRecoveryPage: () => (revoked = true) },
+      { revokeAtWorkerAdmission: true },
     );
   });
 });

@@ -52,6 +52,10 @@ function createOverflowStateDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-codex-binding-overflow-"));
 }
 
+// Recovery sheds rows only under caller authority; tests that exercise the
+// sweep pass this no-op liveness closure as the caller's assertCurrent.
+const assertCallerPresent = () => {};
+
 afterEach(() => {
   resetPluginStateStoreForTests();
 });
@@ -79,15 +83,55 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
 
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
       expect(store.read(live)).toMatchObject({ threadId: "thread-live" });
       expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
+    } finally {
+      resetPluginStateStoreForTests();
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sheds nothing for a caller carrying no authority, even with a disposable row", async () => {
+    const stateDir = createOverflowStateDir();
+    try {
+      const { state, store } = createRecoveringBindingStore(
+        "app-server-thread-bindings-overflow-no-authority-test",
+        2,
+        stateDir,
+      );
+      const live = { kind: "conversation" as const, bindingId: "live" };
+      await store.mutate(live, {
+        kind: "set",
+        binding: { threadId: "thread-live", cwd: "/repo" },
+      });
+      state.register("session:main:abandoned", {
+        version: 1,
+        state: "cleared",
+        sessionId: "abandoned-session",
+      });
+
+      // Bare caller: no assertCurrent, no authority. Plugin-runtime liveness
+      // alone does not authorize deleting a shared row for this caller, so
+      // the sweep sheds nothing and the row-limit error propagates.
+      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
+      await expect(
+        store.mutate(incoming, {
+          kind: "set",
+          binding: { threadId: "thread-incoming", cwd: "/repo" },
+        }),
+      ).rejects.toThrow(/reached its 2-row limit/);
+      expect(state.lookup("session:main:abandoned")).toBeDefined();
     } finally {
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });
@@ -121,10 +165,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 2-row limit/);
 
       expect(state.lookup(bindingStoreKey(retiredIdentity))).toMatchObject({
@@ -161,10 +209,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 2-row limit/);
 
       expect(state.lookup("conversation:leased-active")).toMatchObject({ lease: liveLease });
@@ -197,10 +249,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
 
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
@@ -236,10 +292,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
 
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
@@ -273,10 +333,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 2-row limit/);
 
       expect(state.lookup("conversation:lease-wrong-type")).toMatchObject({
@@ -285,99 +349,6 @@ describe("Codex app-server binding overflow recovery", () => {
       expect(state.lookup("conversation:retired-marker-other")).toMatchObject({
         state: "cleared",
       });
-    } finally {
-      resetPluginStateStoreForTests();
-      fs.rmSync(stateDir, { recursive: true, force: true });
-    }
-  });
-
-  it("fails closed when the host has no ranged listing", async () => {
-    const stateDir = createOverflowStateDir();
-    try {
-      const state = createCodexSqliteTestBindingStateStore({
-        namespace: "app-server-thread-bindings-overflow-norange-test",
-        maxEntries: 2,
-        overflowPolicy: "reject-new",
-        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-      });
-      // Older hosts lack entriesInKeyRange; the wrapper must stand down
-      // instead of falling back to a whole-table scan on the caller's thread.
-      const store = withCodexBindingOverflowRecovery(createCodexAppServerBindingStore(state), {
-        observe: undefined,
-        compareAndApply: undefined,
-        entriesInKeyRange: undefined,
-      });
-      const live = { kind: "conversation" as const, bindingId: "live" };
-      await store.mutate(live, {
-        kind: "set",
-        binding: { threadId: "thread-live", cwd: "/repo" },
-      });
-      state.register("session:main:abandoned", {
-        version: 1,
-        state: "cleared",
-        sessionId: "abandoned-session",
-      });
-
-      const incoming = { kind: "conversation" as const, bindingId: "incoming" };
-      await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
-      ).rejects.toThrow(/reached its 2-row limit/);
-      expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
-    } finally {
-      resetPluginStateStoreForTests();
-      fs.rmSync(stateDir, { recursive: true, force: true });
-    }
-  });
-
-  it("stands down when only withCurrent is missing from the recovery adapter", async () => {
-    const stateDir = createOverflowStateDir();
-    try {
-      const state = createCodexSqliteTestBindingStateStore({
-        namespace: "app-server-thread-bindings-overflow-no-withcurrent-test",
-        maxEntries: 2,
-        overflowPolicy: "reject-new",
-        env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-      });
-      const recoveryStore =
-        createPluginStateKeyedStoreForTests<StoredCodexAppServerBinding>("codex", {
-          namespace: "app-server-thread-bindings-overflow-no-withcurrent-test",
-          maxEntries: 2,
-          overflowPolicy: "reject-new",
-          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
-        });
-      // The production lazy adapter omits withCurrent when the worker-backed
-      // store lacks it; recovery must stand down rather than run unfenced
-      // deletes. (The adapter forwards withCurrent since #125913's review.)
-      const store = withCodexBindingOverflowRecovery(
-        createCodexAppServerBindingStore(state),
-        {
-          observe: recoveryStore.observe?.bind(recoveryStore),
-          compareAndApply: recoveryStore.compareAndApply?.bind(recoveryStore),
-          entriesInKeyRange: recoveryStore.entriesInKeyRange?.bind(recoveryStore),
-          withCurrent: undefined,
-        },
-      );
-      await store.mutate(
-        { kind: "conversation", bindingId: "live" },
-        { kind: "set", binding: { threadId: "thread-live", cwd: "/repo" } },
-      );
-      // Fill the second row with a disposable entry: if the wrapper ignored
-      // the missing withCurrent and ran unfenced recovery, it would shed this
-      // row and the insert would resolve instead of rejecting.
-      state.register("session:main:disposable", {
-        version: 1,
-        state: "cleared",
-        sessionId: "disposable-session",
-      });
-      await expect(
-        store.mutate(
-          { kind: "conversation", bindingId: "incoming" },
-          { kind: "set", binding: { threadId: "thread-incoming", cwd: "/repo" } },
-        ),
-      ).rejects.toThrow(/reached its 2-row limit/);
     } finally {
       resetPluginStateStoreForTests();
       fs.rmSync(stateDir, { recursive: true, force: true });
@@ -409,10 +380,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 2-row limit/);
 
       expect(state.lookup("session:main:imported")).toMatchObject({
@@ -544,6 +519,7 @@ describe("Codex app-server binding overflow recovery", () => {
           runCalls += 1;
           return "started";
         },
+        { assertCurrent: assertCallerPresent },
       );
       expect(result).toBe("started");
       expect(runCalls).toBe(1);
@@ -577,16 +553,18 @@ describe("Codex app-server binding overflow recovery", () => {
 
       // A row-limit-shaped failure raised by the caller's own work is not an
       // acquisition failure: retrying would double-start the session.
-      const inner = Object.assign(
-        new Error("namespace codex.bindings reached its 3-row limit"),
-        { code: "PLUGIN_STATE_LIMIT_EXCEEDED" },
-      );
+      const inner = Object.assign(new Error("namespace codex.bindings reached its 3-row limit"), {
+        code: "PLUGIN_STATE_LIMIT_EXCEEDED",
+      });
       let runCalls = 0;
       await expect(
-        store.withLease({ kind: "conversation", bindingId: "fresh" }, async () => {
-          runCalls += 1;
-          throw inner;
-        }),
+        store.withLease(
+          { kind: "conversation", bindingId: "fresh" },
+          async () => {
+            runCalls += 1;
+            throw inner;
+          },
+        ),
       ).rejects.toBe(inner);
       expect(runCalls).toBe(1);
       // No recovery ran for a post-acquisition failure: the disposable row
@@ -626,10 +604,14 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
 
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
@@ -801,18 +783,26 @@ describe("Codex app-server binding overflow recovery", () => {
 
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 7-row limit/);
       expect(state.lookup("session:main:abandoned")).toMatchObject({ state: "cleared" });
 
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
       expect(state.lookup("session:main:abandoned")).toBeUndefined();
       for (let i = 0; i < 6; i++) {
@@ -849,10 +839,14 @@ describe("Codex app-server binding overflow recovery", () => {
       // and the insert still fails.
       const incoming = { kind: "conversation" as const, bindingId: "incoming" };
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).rejects.toThrow(/reached its 2-row limit/);
 
       // Once the leases lapse, a fresh pass must reconsider those rows instead
@@ -863,10 +857,14 @@ describe("Codex app-server binding overflow recovery", () => {
         lease: { token: "owner-token", expiresAt: Date.now() - 1_000 },
       });
       await expect(
-        store.mutate(incoming, {
-          kind: "set",
-          binding: { threadId: "thread-incoming", cwd: "/repo" },
-        }),
+        store.mutate(
+          incoming,
+          {
+            kind: "set",
+            binding: { threadId: "thread-incoming", cwd: "/repo" },
+          },
+          assertCallerPresent,
+        ),
       ).resolves.toBe(true);
       expect(store.read(incoming)).toMatchObject({ threadId: "thread-incoming" });
     } finally {

@@ -35,9 +35,15 @@ const DEFAULT_RECOVERY_BOUNDS: CodexBindingOverflowRecoveryBounds = {
   shedPerCall: BINDING_OVERFLOW_SHED_PER_CALL,
 };
 
-export type CodexBindingOverflowRecoveryState = Pick<
-  PluginStateKeyedStore<StoredCodexAppServerBinding>,
-  "compareAndApply" | "entriesInKeyRange" | "observe" | "withCurrent"
+// All four capabilities are required: bundled plugins target the current
+// host, which always carries the paging + CAS + authority-bound-writer
+// contract (extensions/AGENTS.md), so there is no partial-capability stand
+// down to support.
+export type CodexBindingOverflowRecoveryState = Required<
+  Pick<
+    PluginStateKeyedStore<StoredCodexAppServerBinding>,
+    "compareAndApply" | "entriesInKeyRange" | "observe" | "withCurrent"
+  >
 >;
 
 // A full namespace must not hard-fail every new session. Only row-count
@@ -132,16 +138,9 @@ export function withCodexBindingOverflowRecovery(
   overrides: Partial<CodexBindingOverflowRecoveryBounds> = {},
 ): CodexAppServerBindingStore {
   const bounds = { ...DEFAULT_RECOVERY_BOUNDS, ...overrides };
-  const entriesInKeyRange = recovery.entriesInKeyRange?.bind(recovery);
-  const observe = recovery.observe?.bind(recovery);
-  const compareAndApply = recovery.compareAndApply?.bind(recovery);
-  const withCurrent = recovery.withCurrent?.bind(recovery);
-  if (!entriesInKeyRange || !observe || !compareAndApply || !withCurrent) {
-    // Hosts without ranged listing, row CAS, or authority-bound writes get
-    // the pre-recovery behavior: the row-limit error propagates instead of a
-    // full-table scan or an unfenced delete.
-    return store;
-  }
+  const entriesInKeyRange = recovery.entriesInKeyRange.bind(recovery);
+  const observe = recovery.observe.bind(recovery);
+  const withCurrent = recovery.withCurrent.bind(recovery);
   // Lexical position of the last examined row; undefined scans from the start.
   // Persisted across calls, so spaced failures keep advancing instead of
   // re-reading the same protected prefix every time.
@@ -230,8 +229,15 @@ export function withCodexBindingOverflowRecovery(
         // says nothing about the caller: fence every delete on live authority,
         // locally before dispatch and again at the worker's write admission.
         assertCurrent?.();
+        // A delete only ever runs under the caller's authority: with neither
+        // an assertCurrent closure nor a prepared authority, recovery sheds
+        // nothing and the row-limit error propagates. Plugin-runtime liveness
+        // alone does not authorize deleting a shared row for a caller.
         const writer = await recoveryWriter();
-        const result = await (writer?.compareAndApply ?? compareAndApply)(
+        if (!writer) {
+          continue;
+        }
+        const result = await writer.compareAndApply(
           entry.key,
           observation.comparison,
           {
