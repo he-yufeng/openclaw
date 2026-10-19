@@ -418,23 +418,26 @@ describe("plugin contract boundary invariants", () => {
     expect(missingGuards).toStrictEqual([]);
   });
 
-  it("keeps the codex binding-overflow recovery adapter forwarding every required capability", () => {
-    // withCodexBindingOverflowRecovery stands down unless the registered
-    // adapter exposes all four capabilities; a missing getter silently
-    // disables overflow recovery on every mutation.
+  it("keeps the codex binding-overflow recovery sourced from the current-host stores", () => {
+    // The recovery must reuse the V2 mutation store for paging/observation and
+    // the authority-bound opener for deletes; a second handle with capability
+    // probes is prohibited for bundled plugins (extensions/AGENTS.md).
     const source = readRepoSource("extensions/codex/index.ts");
-    const adapterStart = source.indexOf("const lazyBindingRecoveryStateStore");
-    expect(adapterStart).toBeGreaterThanOrEqual(0);
-    const adapterEnd = source.indexOf("};", adapterStart);
-    expect(adapterEnd).toBeGreaterThan(adapterStart);
-    const adapterBody = source.slice(adapterStart, adapterEnd);
-    const requiredGetters = [
-      "get compareAndApply(",
-      "get entriesInKeyRange(",
-      "get observe(",
-      "get withCurrent(",
+    const blockStart = source.indexOf("const bindingRecoveryState");
+    expect(blockStart).toBeGreaterThanOrEqual(0);
+    const blockEnd = source.indexOf("};", blockStart);
+    expect(blockEnd).toBeGreaterThan(blockStart);
+    const block = source.slice(blockStart, blockEnd);
+    const requiredSnippets = [
+      "entriesInKeyRange",
+      "openBindingMutationStore()",
+      "observe",
+      "compareAndApply",
+      "withCurrent",
+      "openKeyedStoreV2",
+      "bindingStateOptions",
     ];
-    const missing = requiredGetters.filter((getter) => !adapterBody.includes(getter));
+    const missing = requiredSnippets.filter((snippet) => !block.includes(snippet));
     expect(missing).toStrictEqual([]);
   });
 

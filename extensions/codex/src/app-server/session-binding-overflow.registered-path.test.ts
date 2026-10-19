@@ -2,13 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { PluginStateSyncKeyedStore } from "openclaw/plugin-sdk/plugin-state-runtime";
-import {
-  createPluginStateKeyedStoreForTests,
-  createPluginStateKeyedStoreV2ForTests,
-  createPluginStateSyncKeyedStoreForTests,
-  resetPluginStateStoreForTests,
-} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 // Integration proof for the Codex binding overflow recovery through the
 // registered plugin path (#125913): the extension entry builds the binding
 // store and its recovery adapter itself from api.runtime.state. The openers
@@ -19,6 +12,18 @@ import {
 // maxEntries so the 50,000-row production cap becomes fillable; the lazy
 // adapter, the recovery sweep, and authority-bound deletes are the shipped
 // code paths.
+import { createNativeSessionBindingScope } from "openclaw/plugin-sdk/agent-harness-session-runtime";
+import type {
+  OpenAsyncKeyedStoreOptions,
+  PluginStateActionAuthority,
+  PluginStateSyncKeyedStore,
+} from "openclaw/plugin-sdk/plugin-state-runtime";
+import {
+  createPluginStateKeyedStoreForTests,
+  createPluginStateKeyedStoreV2ForTests,
+  createPluginStateSyncKeyedStoreForTests,
+  resetPluginStateStoreForTests,
+} from "openclaw/plugin-sdk/plugin-state-test-runtime";
 import { createTestPluginApi } from "openclaw/plugin-sdk/plugin-test-api";
 import {
   createPluginRuntimeMock,
@@ -67,6 +72,7 @@ async function withRegisteredCodexBindingStore(
     bindingStore: CodexAppServerBindingStore;
     syncBindingStore: PluginStateSyncKeyedStore<StoredCodexAppServerBinding>;
   }) => Promise<void>,
+  hooks?: { onRecoveryPage?: () => void },
 ) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-binding-entry-"));
   try {
@@ -83,15 +89,31 @@ async function withRegisteredCodexBindingStore(
           ),
         // Mirrors the production openKeyedStoreV2: the authority folds into
         // the store's admission checks at open time.
-        openKeyedStoreV2: (options, authority) =>
-          createPluginStateKeyedStoreV2ForTests(
+        openKeyedStoreV2: <T>(
+          options: OpenAsyncKeyedStoreOptions,
+          authority?: PluginStateActionAuthority,
+        ) => {
+          const store = createPluginStateKeyedStoreV2ForTests<T>(
             "codex",
             withFixtureEnv(clampBindingCapacity(options)),
             {
               assertCurrent: () => authority?.assertCurrent(),
               sessionEntryCurrent: authority?.sessionEntryCurrent,
             },
-          ),
+          );
+          // Only the recovery sweep pages the namespace, so the hook fires
+          // exactly between the failed capacity insert and the delete.
+          if (options?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE && hooks?.onRecoveryPage) {
+            const page = store.entriesInKeyRange?.bind(store);
+            if (page) {
+              store.entriesInKeyRange = (range) => {
+                hooks.onRecoveryPage!();
+                return page(range);
+              };
+            }
+          }
+          return store;
+        },
         openSyncKeyedStore: (options) =>
           createPluginStateSyncKeyedStoreForTests(
             "codex",
@@ -131,6 +153,9 @@ async function withRegisteredCodexBindingStore(
       syncBindingStore,
     });
   } finally {
+    // Close the worker and cached database handles before removing the
+    // directory; removing first fails teardown with EBUSY on Windows.
+    resetPluginStateStoreForTests();
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
 }
@@ -164,13 +189,20 @@ describe("Codex binding overflow recovery through the registered plugin path", (
       let runCalls = 0;
       let rowDuringLease: unknown;
       const fresh = { kind: "conversation" as const, bindingId: "fresh" };
-      const result = await bindingStore.withLease(fresh, async () => {
-        runCalls += 1;
-        // The lease record exists while held; it is released on completion,
-        // so it can only be observed from inside the callback.
-        rowDuringLease = syncBindingStore.lookup(bindingStoreKey(fresh));
-        return "started";
-      });
+      // A real prepared authority rides the whole path: lease admission, the
+      // sweep's prepareMutation, and the delete's worker-bound write.
+      const authority = createNativeSessionBindingScope(() => {});
+      const result = await bindingStore.withLease(
+        fresh,
+        async () => {
+          runCalls += 1;
+          // The lease record exists while held; it is released on completion,
+          // so it can only be observed from inside the callback.
+          rowDuringLease = syncBindingStore.lookup(bindingStoreKey(fresh));
+          return "started";
+        },
+        { authority },
+      );
 
       expect(result).toBe("started");
       expect(runCalls).toBe(1);
@@ -185,35 +217,37 @@ describe("Codex binding overflow recovery through the registered plugin path", (
     });
   });
 
-  it("deletes nothing when the caller's authority is revoked at admission", async () => {
-    await withRegisteredCodexBindingStore(async ({ bindingStore, syncBindingStore }) => {
-      fillToCapacity(syncBindingStore);
+  it("reaches the delete and revokes it at admission when authority lapses mid-recovery", async () => {
+    let revoked = false;
+    await withRegisteredCodexBindingStore(
+      async ({ bindingStore, syncBindingStore }) => {
+        fillToCapacity(syncBindingStore);
 
-      const revoked = new Error("session authority revoked");
-      // The V2 store runs the authority's assertCurrent when the writer is
-      // bound, so the sweep's delete dies before dispatching anything.
-      const authority = {
-        prepareMutation: async () => ({
-          assertCurrent: () => {
-            throw revoked;
-          },
-          sessionEntryCurrent: undefined,
-        }),
-      };
-      let runCalls = 0;
-      await expect(
-        bindingStore.withLease(
-          { kind: "conversation", bindingId: "fresh" },
-          async () => {
-            runCalls += 1;
-          },
-          { authority: authority as unknown as CodexBindingAuthority },
-        ),
-      ).rejects.toBe(revoked);
+        // A real prepared authority whose liveness reads a flag. Acquisition
+        // passes while current; the recovery sweep's first page flip marks the
+        // lapse, so the delete's authority-bound store refuses to open.
+        const revokedError = new Error("session authority revoked");
+        const authority = createNativeSessionBindingScope(() => {
+          if (revoked) {
+            throw revokedError;
+          }
+        });
+        let runCalls = 0;
+        await expect(
+          bindingStore.withLease(
+            { kind: "conversation", bindingId: "fresh" },
+            async () => {
+              runCalls += 1;
+            },
+            { authority },
+          ),
+        ).rejects.toBe(revokedError);
 
-      expect(runCalls).toBe(0);
-      // Zero deletes: the disposable row survives the failed admission.
-      expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
-    });
+        expect(runCalls).toBe(0);
+        // Zero deletes: the disposable row survives the refused admission.
+        expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
+      },
+      { onRecoveryPage: () => (revoked = true) },
+    );
   });
 });

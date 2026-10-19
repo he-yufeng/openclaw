@@ -180,55 +180,27 @@ export default definePluginEntry({
       entries: () => openManagedThreadStateStore().entries(),
       registerIfAbsent: (key, value) => openManagedThreadStateStore().registerIfAbsent(key, value),
     };
-    // Capacity recovery lists and deletes through the worker-backed handle on
-    // the same namespace, so an overflow never parks the Gateway thread on a
-    // full-table decode. Opened lazily like the sync handle above; a runtime
-    // without the async opener leaves recovery stood down.
-    let bindingRecoveryStateStore: PluginStateKeyedStore<StoredCodexAppServerBinding> | undefined;
-    let bindingRecoveryStateStoreFailed = false;
-    const openBindingRecoveryStateStore = () => {
-      if (bindingRecoveryStateStoreFailed) {
-        return undefined;
-      }
-      try {
-        return (bindingRecoveryStateStore ??=
-          api.runtime.state.openKeyedStore?.<StoredCodexAppServerBinding>({
-            namespace: CODEX_APP_SERVER_BINDING_NAMESPACE,
-            maxEntries: CODEX_APP_SERVER_BINDING_MAX_ENTRIES,
-            overflowPolicy: "reject-new",
-          }));
-      } catch {
-        // A runtime whose keyed-store backend is unavailable or unconfigured
-        // stands recovery down instead of failing the surrounding call.
-        bindingRecoveryStateStoreFailed = true;
-        return undefined;
-      }
-    };
-    const lazyBindingRecoveryStateStore: CodexBindingOverflowRecoveryState = {
-      get compareAndApply() {
-        const store = openBindingRecoveryStateStore();
-        return store?.compareAndApply?.bind(store);
-      },
-      get entriesInKeyRange() {
-        const store = openBindingRecoveryStateStore();
-        return store?.entriesInKeyRange?.bind(store);
-      },
-      get observe() {
-        const store = openBindingRecoveryStateStore();
-        return store?.observe?.bind(store);
-      },
-      // The wrapper refuses to arm recovery without an authority-bound write
-      // path; omitting this getter silently disabled it on every mutation,
-      // even on a fully capable host.
-      get withCurrent() {
-        const store = openBindingRecoveryStateStore();
-        return store?.withCurrent?.bind(store);
-      },
+    // Capacity recovery pages and observes through the same worker-backed V2
+    // store ordinary binding mutations already use on this namespace, so an
+    // overflow never parks the Gateway thread on a full-table decode and no
+    // second handle or capability probe is needed. Deletes stay on the
+    // authority-bound opener, which binds the caller's checks at write
+    // admission.
+    const bindingRecoveryState: CodexBindingOverflowRecoveryState = {
+      entriesInKeyRange: (range) => openBindingMutationStore().entriesInKeyRange?.(range),
+      observe: (key) => openBindingMutationStore().observe?.(key),
+      compareAndApply: (key, comparison, action) =>
+        openBindingMutationStore().compareAndApply?.(key, comparison, action),
+      withCurrent: (authority) =>
+        api.runtime.state.openKeyedStoreV2<StoredCodexAppServerBinding>(
+          bindingStateOptions,
+          authority,
+        ),
     };
     const bindingStore = createLazyCodexAppServerBindingStore(
       lazyBindingStateStore,
       lazyManagedThreadStateStore,
-      lazyBindingRecoveryStateStore,
+      bindingRecoveryState,
     );
     registerCodexCliMetadata(api);
     const { resolveCodexSupervisionAppServerRuntimeOptions } = createCodexAppServerConfig(
