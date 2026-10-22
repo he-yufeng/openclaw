@@ -295,7 +295,8 @@ describe("plugin contract boundary invariants", () => {
     expect(blockStart).toBeGreaterThanOrEqual(0);
     const blockEnd = source.indexOf("};", blockStart);
     expect(blockEnd).toBeGreaterThan(blockStart);
-    const block: string = source.slice(blockStart, blockEnd);
+    // oxlint-disable-next-line unicorn/prefer-set-has -- block is a string slice; includes() below is substring search, not array lookup.
+    const block = source.slice(blockStart, blockEnd);
     const requiredSnippets = [
       "entriesInKeyRange",
       "openBindingMutationStore()",
@@ -305,7 +306,7 @@ describe("plugin contract boundary invariants", () => {
       "openKeyedStoreV2",
       "bindingStateOptions",
     ];
-    const missing = requiredSnippets.filter((snippet) => block.indexOf(snippet) === -1);
+    const missing = requiredSnippets.filter((snippet) => !block.includes(snippet));
     expect(missing).toStrictEqual([]);
   });
 
