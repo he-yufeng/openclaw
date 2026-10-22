@@ -558,13 +558,10 @@ describe("Codex app-server binding overflow recovery", () => {
       });
       let runCalls = 0;
       await expect(
-        store.withLease(
-          { kind: "conversation", bindingId: "fresh" },
-          async () => {
-            runCalls += 1;
-            throw inner;
-          },
-        ),
+        store.withLease({ kind: "conversation", bindingId: "fresh" }, async () => {
+          runCalls += 1;
+          throw inner;
+        }),
       ).rejects.toBe(inner);
       expect(runCalls).toBe(1);
       // No recovery ran for a post-acquisition failure: the disposable row

@@ -237,14 +237,10 @@ export function withCodexBindingOverflowRecovery(
         if (!writer) {
           continue;
         }
-        const result = await writer.compareAndApply(
-          entry.key,
-          observation.comparison,
-          {
-            operation: "delete",
-            action: "delete",
-          },
-        );
+        const result = await writer.compareAndApply(entry.key, observation.comparison, {
+          operation: "delete",
+          action: "delete",
+        });
         if (result.status === "applied") {
           shed += 1;
         }
@@ -283,8 +279,11 @@ export function withCodexBindingOverflowRecovery(
         // The failed insert owns no row yet, so the sweep skips nothing by
         // key; the skip only guards a concurrent insert claiming it mid-retry.
         if (
-          (await evictDisposableBindingRows(bindingStoreKey(identity), assertCurrent, authority)) ===
-          0
+          (await evictDisposableBindingRows(
+            bindingStoreKey(identity),
+            assertCurrent,
+            authority,
+          )) === 0
         ) {
           throw error;
         }
