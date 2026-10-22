@@ -19,7 +19,6 @@ import type {
   PluginStateSyncKeyedStore,
 } from "openclaw/plugin-sdk/plugin-state-runtime";
 import {
-  createPluginStateKeyedStoreForTests,
   createPluginStateKeyedStoreV2ForTests,
   createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
@@ -35,7 +34,6 @@ import { CODEX_APP_SERVER_BINDING_NAMESPACE } from "./session-binding-meta.js";
 import {
   bindingStoreKey,
   type CodexAppServerBindingStore,
-  type CodexBindingAuthority,
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
 
@@ -87,8 +85,8 @@ async function withRegisteredCodexBindingStore(
     ? new Error("session authority revoked")
     : undefined;
   try {
-    const withFixtureEnv = <T extends object>(options: T) => ({
-      ...options,
+    const withFixtureEnv = <T extends object>(fixture: T) => ({
+      ...fixture,
       env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
     });
     const runtime = createPluginRuntimeMock({
@@ -111,7 +109,7 @@ async function withRegisteredCodexBindingStore(
                 if (!opened) {
                   opened = true;
                 } else if (revoked) {
-                  throw revokedError;
+                  throw revokedError ?? new Error("session authority revoked");
                 }
                 authority?.assertCurrent();
               },
