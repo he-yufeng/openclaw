@@ -295,7 +295,7 @@ describe("plugin contract boundary invariants", () => {
     expect(blockStart).toBeGreaterThanOrEqual(0);
     const blockEnd = source.indexOf("};", blockStart);
     expect(blockEnd).toBeGreaterThan(blockStart);
-    const block = source.slice(blockStart, blockEnd);
+    const block: string = source.slice(blockStart, blockEnd);
     const requiredSnippets = [
       "entriesInKeyRange",
       "openBindingMutationStore()",
@@ -305,7 +305,7 @@ describe("plugin contract boundary invariants", () => {
       "openKeyedStoreV2",
       "bindingStateOptions",
     ];
-    const missing = requiredSnippets.filter((snippet) => !block.includes(snippet));
+    const missing = requiredSnippets.filter((snippet) => block.indexOf(snippet) === -1);
     expect(missing).toStrictEqual([]);
   });
 
