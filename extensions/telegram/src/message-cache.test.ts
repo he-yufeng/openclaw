@@ -149,9 +149,7 @@ describe("telegram message cache", () => {
 
     expect(await cache.retireMessage({ accountId: "default", chatId: 7, messageId: 5 })).toBe(true);
     expect(await get("5")).toBeNull();
-    expect(
-      (await cache.get({ accountId, chatId: group.id, messageId: "5" }))?.messageId,
-    ).toBe("5");
+    expect((await cache.get({ accountId, chatId: group.id, messageId: "5" }))?.messageId).toBe("5");
   });
 
   it("resolves external reply references only from the same chat without inventing message bodies", async () => {

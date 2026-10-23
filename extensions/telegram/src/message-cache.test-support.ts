@@ -39,7 +39,11 @@ export function useMessageCacheFixture(prefix: string, interruptRetained = false
   };
   beforeEach(async () => {
     state = await createOpenClawTestState({ prefix, layout: "state-only" });
-    fixture.beforeCompare = fixture.beforeMove = fixture.afterMove = fixture.beforeRegister = undefined;
+    fixture.beforeCompare =
+      fixture.beforeMove =
+      fixture.afterMove =
+      fixture.beforeRegister =
+        undefined;
     const openKeyedStore: TelegramRuntime["state"]["openKeyedStoreV2"] = <T>(
       options: Parameters<TelegramRuntime["state"]["openKeyedStore"]>[0],
     ): PluginStateKeyedStore<T, 2> => {
