@@ -5,6 +5,7 @@ import { t } from "../../i18n/index.ts";
 import { currentConfigObject } from "../../lib/config/config-state-model.ts";
 import type { RuntimeConfigCapability } from "../../lib/config/runtime-config-capability.ts";
 import { formatUiError } from "../../lib/format-error.ts";
+import type { GatewayPageBinding } from "../../lib/gateway-page-binding.ts";
 import { invalidateModelAuthStatusRequests } from "../../lib/model-auth-request-state.ts";
 import {
   modelSettingPrimary,
@@ -12,7 +13,9 @@ import {
   modelSettingPatch,
   withModelSettingPrimary,
 } from "../../lib/model-setting.ts";
-import type { DefaultModelSelection, ModelBehaviorConfig } from "./data.ts";
+import type { DefaultModelSelection, DefaultsDraft, ModelBehaviorConfig } from "./data.ts";
+
+export type ModelDefaultsSaveField = "thinking" | "fastMode" | "defaults";
 
 function replaceFirstFallback(fallbacks: string[], model: string | null): string[] {
   return model ? [model, ...fallbacks.slice(1).filter((fallback) => fallback !== model)] : [];
@@ -20,7 +23,10 @@ function replaceFirstFallback(fallbacks: string[], model: string | null): string
 
 export function modelDefaultsActions(
   getDefaults: () => DefaultModelSelection,
-  stageDefaults: (patch: Partial<DefaultModelSelection & ModelBehaviorConfig>) => void,
+  stageDefaults: (
+    patch: Partial<DefaultModelSelection & ModelBehaviorConfig>,
+    field?: ModelDefaultsSaveField,
+  ) => void,
 ) {
   return {
     onPrimaryChange: (model: string) => {
@@ -48,11 +54,13 @@ export function modelDefaultsActions(
     },
     onDecisionChange: (model: string | null) => stageDefaults({ decisionModel: model }),
     onThinkingChange: (level: string) =>
-      stageDefaults({ thinkingLevel: level, thinkingOverridden: true }),
-    onThinkingReset: () => stageDefaults({ thinkingLevel: undefined, thinkingOverridden: false }),
+      stageDefaults({ thinkingLevel: level, thinkingOverridden: true }, "thinking"),
+    onThinkingReset: () =>
+      stageDefaults({ thinkingLevel: undefined, thinkingOverridden: false }, "thinking"),
     onFastModeChange: (mode: FastMode) =>
-      stageDefaults({ fastMode: mode, fastModeOverridden: true }),
-    onFastModeReset: () => stageDefaults({ fastMode: undefined, fastModeOverridden: false }),
+      stageDefaults({ fastMode: mode, fastModeOverridden: true }, "fastMode"),
+    onFastModeReset: () =>
+      stageDefaults({ fastMode: undefined, fastModeOverridden: false }, "fastMode"),
   };
 }
 
@@ -77,12 +85,12 @@ export function readModelBehaviorConfig(
  * destructive-array guard rejects such merge patches unless the exact path is
  * confirmed via replacePaths.
  */
-export const DEFAULT_MODELS_REPLACE_PATHS = [
+const DEFAULT_MODELS_REPLACE_PATHS = [
   "agents.defaults.model.fallbacks",
   "agents.defaults.utilityModel.fallbacks",
 ];
 
-export function buildDefaultsPatch(
+function buildDefaultsPatch(
   params: Omit<DefaultModelSelection, "fallbacks"> &
     ModelBehaviorConfig & {
       fallbacks: readonly string[];
@@ -175,6 +183,40 @@ type ModelProviderConfigMutationOwner = {
   setMessage: (message: ModelProviderRowMessage | null) => void;
 };
 
+export function runModelProviderDefaultsMutation(
+  context: ApplicationContext,
+  gateway: Pick<GatewayPageBinding, "capture" | "isCurrent">,
+  owner: Omit<ModelProviderConfigMutationOwner, "runtimeConfig" | "isCurrentClient"> & {
+    defaults: DefaultsDraft;
+    busy: boolean;
+  },
+): Promise<boolean | null> {
+  const scope = gateway.capture();
+  // Global defaults remain editable when the configured roster is empty.
+  if (
+    !scope ||
+    owner.busy ||
+    modelProviderConfigMutationBlockedReason(context) ||
+    modelProviderConfigBusy(context)
+  ) {
+    return Promise.resolve(null);
+  }
+  return runModelProviderConfigMutation(
+    {
+      runtimeConfig: context.runtimeConfig,
+      isCurrentClient: () => gateway.isCurrent(scope),
+      isCurrentAgent: owner.isCurrentAgent,
+      setBusy: owner.setBusy,
+      setMessage: owner.setMessage,
+    },
+    {
+      raw: buildDefaultsPatch(owner.defaults),
+      note: t("modelProviders.notes.defaultModel"),
+      replacePaths: DEFAULT_MODELS_REPLACE_PATHS,
+    },
+  );
+}
+
 export function modelProviderConfigMutationBlockedReason(
   context: Pick<ApplicationContext, "gateway" | "runtimeConfig">,
 ): string | null {
@@ -222,18 +264,19 @@ export async function modelProviderMutationWarnings(
 /**
  * The config owner adopts the committed snapshot and reconciles application.
  * Saving ends at its acknowledgement, not at a second read or provider discovery.
+ * Null keeps an undispatched or superseded draft; false reports a settled failure.
  */
 export async function runModelProviderConfigMutation(
   owner: ModelProviderConfigMutationOwner,
   params: ModelProviderConfigMutation,
-): Promise<void> {
+): Promise<boolean | null> {
   const { runtimeConfig } = owner;
   owner.setBusy(true);
   owner.setMessage(null);
   try {
     await runtimeConfig.ensureLoaded();
     if (!owner.isCurrentClient()) {
-      return;
+      return null;
     }
     const patched = await runtimeConfig.patch({
       raw: params.raw,
@@ -241,7 +284,11 @@ export async function runModelProviderConfigMutation(
       ...(params.replacePaths ? { replacePaths: params.replacePaths } : {}),
     });
     if (!owner.isCurrentClient()) {
-      return;
+      return null;
+    }
+    // No dispatched write or recorded failure leaves the caller's draft intact.
+    if (!patched && !runtimeConfig.state.lastError) {
+      return null;
     }
     if (!patched && owner.isCurrentAgent()) {
       owner.setMessage({
@@ -249,10 +296,15 @@ export async function runModelProviderConfigMutation(
         text: runtimeConfig.state.lastError ?? t("modelProviders.configUnavailable"),
       });
     }
+    return patched;
   } catch (error) {
-    if (owner.isCurrentClient() && owner.isCurrentAgent()) {
+    if (!owner.isCurrentClient()) {
+      return null;
+    }
+    if (owner.isCurrentAgent()) {
       owner.setMessage({ kind: "error", text: modelProviderErrorMessage(error) });
     }
+    return false;
   } finally {
     if (owner.isCurrentClient() && owner.isCurrentAgent()) {
       owner.setBusy(false);
@@ -270,7 +322,7 @@ export async function runModelProviderApiKeyMutation(
     client: GatewayBrowserClient;
     agentId: string;
     provider: string;
-    apiKey: string | null;
+    apiKey: string;
     success: string;
   },
 ): Promise<{ ok: false } | { ok: true; warning: string | null }> {
@@ -284,15 +336,10 @@ export async function runModelProviderApiKeyMutation(
           throw new Error(t("modelProviders.requestFailed"));
         }
         const target = { provider: params.provider, agentId: params.agentId };
-        const receipt = await (params.apiKey === null
-          ? client.request<{ warning?: string }>("models.authLogout", {
-              ...target,
-              credentialType: "api_key",
-            })
-          : client.request<{ warning?: string }>("models.authSetApiKey", {
-              ...target,
-              apiKey: params.apiKey,
-            }));
+        const receipt = await client.request<{ warning?: string }>("models.authSetApiKey", {
+          ...target,
+          apiKey: params.apiKey,
+        });
         invalidateModelAuthStatusRequests(client);
         return receipt;
       },

@@ -1,3 +1,6 @@
+/** Canonical route-capability schema for provider-owned manifest augmentation. */
+export { ModelInferenceCapabilitiesSchema } from "../../packages/model-catalog-core/src/model-inference-capabilities.js";
+
 export type {
   JsonValue,
   DecisionEntry,
@@ -21,6 +24,9 @@ export type {
   DecisionBatchResultV2,
   ProviderDecisionOutcomeV2,
   DecisionOutcomeV2,
+  DecisionEvaluateOptionsV2,
+  DecisionProviderV2,
+  DecisionRuntimeV2,
 } from "../decisions/types-v2.js";
 export {
   decisionBatchV1ToV2,
@@ -30,3 +36,4 @@ export {
 } from "../decisions/compatibility.js";
 export { validateDecisionBatchV2, validateDecisionResultV2 } from "../decisions/validation-v2.js";
 export { DecisionContractError } from "../decisions/validation.js";
+export type { DecisionProviderContextV2 } from "../decisions/provider-context.js";

@@ -27,8 +27,10 @@ To participate in durable admitted turns, context engines must declare
 `info.transcriptSemantics`, then implement `commitTurn(...)` as an atomic
 write keyed by `advancementKey` that has no additional effect when repeated. OpenClaw supplies only the inclusive
 accepted turn, from its admitted user entry through its terminal entry; use the
-`readSessionTranscriptVisibleMessageDelta(...)` cursor API to bootstrap or
-rebuild earlier history. Without the full contract, OpenClaw uses the legacy
+`readSessionTranscriptVisibleMessageDelta(...)` cursor API from
+`openclaw/plugin-sdk/context-engine-transcript-runtime` to bootstrap or rebuild
+earlier history (see
+[Context engine transcript cursor](/plugins/sdk-runtime/agent#context-engine-transcript-cursor)). Without the full contract, OpenClaw uses the legacy
 context path for the whole logical turn and its retries, leaves the configured
 engine unchanged, and tries that engine again on the next logical turn.
 
@@ -266,8 +268,17 @@ type MemoryAudience =
   `conversation` audience for the durable root session.
 - A spawned child inherits its root audience only after the host validates each
   recorded parent key, session ID, and lifecycle revision.
-- Missing, malformed, cross-agent, cyclic, or stale lineage produces no
-  audience. Unknown or missing durable chat type also produces no audience.
+- A child spawned into another agent receives `owner-private` audience for its
+  own agent only when the spawn that crossed agents was owner-attributed and the
+  root is the owner's direct chat. Conversation audience never crosses agents;
+  that lineage produces no audience.
+- Operator-created root sessions record a `direct` chat type at creation, so
+  sessions started later by `sessions_send`, cron, or the `agent` method resolve
+  an audience. The turn's owner status still selects `owner-private` or
+  `conversation`.
+- Missing, malformed, cyclic, or stale lineage produces no audience. Unknown or
+  missing durable chat type also produces no audience. The Gateway logs every
+  denial as `memory_audience_denied` with the session key and reason.
 
 Audience is separate from sandbox policy. A provider can deny sandboxed callers
 even when they have a valid audience. Operator authority is also separate and
@@ -336,6 +347,14 @@ Dreaming is not a provider runtime capability. Selecting another memory plugin c
 still activate Memory Core as a dreaming sidecar under the existing loader policy.
 Explicitly disabling Memory Core prevents that sidecar. The Dreams UI and file-backed
 maintenance methods do not imply that the selected provider implements dreaming.
+
+## Memory host event diagnostics
+
+`readMemoryHostEventRecords` from `openclaw/plugin-sdk/memory-host-events`
+accepts an optional `type` filter. Storage applies it before `limit`, so a
+diagnostic can request the latest `memory.dream.completed` event with `limit: 1`
+without loading unrelated recall history. Omitting `type` preserves the full
+retained event stream.
 
 ## Bundled Memory Core workers
 

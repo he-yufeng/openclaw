@@ -93,7 +93,6 @@ export function createTelegramDraftStream(params: {
   onProviderMessage?: (message: Message) => Promise<void> | void;
   /** Called once Telegram confirms a superseded preview message was deleted. */
   onPreviewRetired?: (messageId: number) => void;
-  log?: (message: string) => void;
   warn?: (message: string) => void;
 }) {
   const richMessages = params.richMessages === true;
@@ -645,7 +644,6 @@ export function createTelegramDraftStream(params: {
           replyTargetState = { kind: "available" };
         }
         params.onPreviewRetired?.(messageId);
-        params.log?.(`telegram stream preview deleted (chat=${chatId}, message=${messageId})`);
       } catch (err) {
         params.warn?.(`telegram stream preview cleanup failed: ${formatErrorMessage(err)}`);
       }
@@ -708,8 +706,6 @@ export function createTelegramDraftStream(params: {
       retireWhenReplaced(supersededMessageId, supersededVisibleSince);
     }
   };
-
-  params.log?.(`telegram stream preview ready (maxChars=${maxChars}, throttleMs=${throttleMs})`);
 
   return {
     update: (

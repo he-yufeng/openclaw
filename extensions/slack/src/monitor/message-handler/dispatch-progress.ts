@@ -79,7 +79,6 @@ export function createSlackProgressRuntime(runtimeParams: {
           }
           return ts;
         },
-        log: logVerbose,
         warn: logVerbose,
       })
     : undefined;
@@ -716,7 +715,6 @@ export function createSlackProgressRuntime(runtimeParams: {
   return {
     draftStream,
     previewLifecycle,
-    isProgressMode,
     useDraftProgressCard,
     useNativeProgressStreaming,
     progressDraftActive,

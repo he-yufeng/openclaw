@@ -1,5 +1,5 @@
 {
-  "startupJsGzipBytes": 374285,
-  "reason": "Restored the original startup budget after the Solid shell and overlay primitives landed; main measured 342,363 B gzip at the restore.",
-  "updatedAt": "2026-10-12"
+  "startupJsGzipBytes": 294961,
+  "reason": "Startup leaf icons, update classification, and lazy English: matched b5b24cf15c2 build 310773 to 294961 B gzip with 7 JS and 1 CSS request.",
+  "updatedAt": "2026-10-23"
 }

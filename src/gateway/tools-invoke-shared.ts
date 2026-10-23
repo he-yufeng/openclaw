@@ -1,4 +1,4 @@
-import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
+import { asOptionalRecord, isRecord } from "@openclaw/normalization-core/record-coerce";
 // Gateway tool invocation engine.
 // Shared implementation behind HTTP and RPC tool invocation adapters.
 import {
@@ -12,6 +12,7 @@ import { runBeforeToolCallHook } from "../agents/agent-tools.before-tool-call.js
 import { resolveToolLoopDetectionConfig } from "../agents/agent-tools.js";
 import { getChannelAgentToolMeta } from "../agents/channel-tool-metadata.js";
 import { readEmbeddedMessageDeliveryFact } from "../agents/embedded-agent-message-delivery.js";
+import { createGatewayToolPolicyAssertion } from "../agents/gateway-tool-policy.js";
 import { resolveIngressWorkspaceOverrideForSessionRun } from "../agents/spawned-context.js";
 import { isKnownCoreToolId } from "../agents/tool-catalog.js";
 import { resolveStoredSessionPermissionPolicy } from "../agents/tool-fs-policy.js";
@@ -66,12 +67,29 @@ import {
 import { resolveStoredSessionKeyForAgentStore } from "./session-store-key.js";
 import { loadGatewaySessionEntryReadOnlyInWorker } from "./session-utils-store-worker.js";
 import { resolveGatewayScopedTools } from "./tool-resolution.js";
-import { isToolUploadRequest } from "./tool-upload-policy.js";
 import {
   areGatewayUploadsEnabled,
   assertGatewayUploadsEnabled,
   GATEWAY_UPLOADS_DISABLED_MESSAGE,
+  isGatewayUploadRequest,
 } from "./upload-policy.js";
+
+/** New client bytes, not a request to deliver a file already owned by the Gateway. */
+function isToolUploadRequest(toolName: string, args: unknown): boolean {
+  if (!isRecord(args)) {
+    return false;
+  }
+  switch (toolName) {
+    case "file_write":
+      return typeof args.contentBase64 === "string";
+    case "workboard_attachment_add":
+      return true;
+    case "message":
+      return isGatewayUploadRequest("message.action", { params: args });
+    default:
+      return false;
+  }
+}
 
 const MEMORY_TOOL_NAMES = new Set(["memory_search", "memory_get"]);
 
@@ -150,25 +168,6 @@ function resolveMemoryToolDisableReasons(cfg: OpenClawConfig): string[] {
     reasons.push("memory plugin disabled by test default");
   }
   return reasons;
-}
-
-function mergeActionIntoArgsIfSupported(params: {
-  toolSchema: unknown;
-  action: string | undefined;
-  args: Record<string, unknown>;
-}): Record<string, unknown> {
-  const { toolSchema, action, args } = params;
-  if (!action || args.action !== undefined) {
-    return args;
-  }
-  const schemaObj = toolSchema as { properties?: Record<string, unknown> } | null;
-  const hasAction = Boolean(
-    schemaObj &&
-    typeof schemaObj === "object" &&
-    schemaObj.properties &&
-    "action" in schemaObj.properties,
-  );
-  return hasAction ? { ...args, action } : args;
 }
 
 function resolveToolInputErrorStatus(err: unknown): number | null {
@@ -542,11 +541,18 @@ async function invokeGatewayToolWithSignal(
     const toolCallId = idempotencyKey
       ? `${params.toolCallIdPrefix}-${conversationReadOrigin}-${idempotencyKey}`
       : `${params.toolCallIdPrefix}-${conversationReadOrigin}-${Date.now()}`;
-    const toolArgs = mergeActionIntoArgsIfSupported({
-      toolSchema: tool.parameters,
-      action,
-      args,
-    });
+    const schemaObj = tool.parameters as { properties?: Record<string, unknown> } | null;
+    const toolArgs =
+      action &&
+      args.action === undefined &&
+      Boolean(
+        schemaObj &&
+        typeof schemaObj === "object" &&
+        schemaObj.properties &&
+        "action" in schemaObj.properties,
+      )
+        ? { ...args, action }
+        : args;
     assertInvocationCurrent();
     const hookResult = await runBeforeToolCallHook({
       toolName,
@@ -581,6 +587,7 @@ async function invokeGatewayToolWithSignal(
       async () => {
         assertInvocationCurrent();
         assertCapturedInputCommitAllowed();
+        createGatewayToolPolicyAssertion(tool, params.cfg)(hookResult.params);
         return await tool.execute?.(toolCallId, hookResult.params, params.signal);
       },
     );

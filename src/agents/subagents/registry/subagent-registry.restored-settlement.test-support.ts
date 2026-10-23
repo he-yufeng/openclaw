@@ -2,7 +2,6 @@ import { expectDefined } from "@openclaw/normalization-core";
 import { expect, it, vi, type Mock } from "vitest";
 import { createDeferred } from "../../../../test/helpers/promise.js";
 import { withSessionEntryReadOnlyInWorker } from "../../../config/sessions/session-entry-read-runtime.js";
-import type { ChatAbortControllerEntry } from "../../../gateway/chat-abort.types.js";
 import type { GatewayRecoveryRuntime } from "../../../gateway/server-instance-runtime.types.js";
 import type { deleteGatewaySession } from "../../../gateway/server-methods/sessions-delete.js";
 import {
@@ -49,13 +48,12 @@ export async function activateSubagentRegistryWithRecoveryRuntime(
   recoveryRuntime: GatewayRecoveryRuntime,
 ): Promise<void> {
   const gatewayContext = {
-    chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
     recoveryRuntime,
     trackExecution: trackAsyncWork,
     resolveGatewayContext: () => gatewayContext as never,
   };
   bindGatewayContextResolver(recoveryRuntime, gatewayContext.resolveGatewayContext);
-  await mod.activateSubagentRegistry(gatewayContext.resolveGatewayContext);
+  await mod.activateSubagentRegistry(gatewayContext.resolveGatewayContext).settled;
 }
 
 export function registerRestoredRollbackPublicationTest({
@@ -382,7 +380,6 @@ export function registerRestoredRequesterWakeSettlementTests({
       });
       let gatewayOpen = true;
       const instanceContext = {
-        chatAbortControllers: new Map<string, ChatAbortControllerEntry>(),
         recoveryRuntime,
       } as never;
       const resolveInstance = () => (gatewayOpen ? instanceContext : undefined);
@@ -393,8 +390,8 @@ export function registerRestoredRequesterWakeSettlementTests({
       const settleRootWork = observeRootWork();
       try {
         await mod.initSubagentRegistry();
-        await mod.activateSubagentRegistry(resolveGatewayContext);
-        await mod.activateSubagentRegistry(resolveGatewayContext);
+        await mod.activateSubagentRegistry(resolveGatewayContext).settled;
+        await mod.activateSubagentRegistry(resolveGatewayContext).settled;
         expect(wakeRequester).not.toHaveBeenCalled();
         if (restoreTiming === "partial restore") {
           await mod.testing.runSweeperTickForTests();
@@ -402,7 +399,7 @@ export function registerRestoredRequesterWakeSettlementTests({
         }
         gatewayOpen = restoreTiming !== "after Gateway closure";
         await mod.initSubagentRegistry();
-        await mod.activateSubagentRegistry(resolveGatewayContext);
+        await mod.activateSubagentRegistry(resolveGatewayContext).settled;
         await vi.advanceTimersByTimeAsync(1_000);
         if (!gatewayOpen || restoreTiming === "without instance binding") {
           await vi.advanceTimersByTimeAsync(5_000);

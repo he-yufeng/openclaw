@@ -5,6 +5,7 @@ import type {
 } from "../../gateway/server-methods/types.js";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 import { withAgentDatabasePreparationContext } from "../../state/agent-database-preparation-context.js";
+import { withAgentInputRecoveryContext } from "../../state/agent-input-recovery-context.js";
 import {
   getPluginExecutionFrame,
   pluginInstanceInvocation,
@@ -37,6 +38,15 @@ type PluginRuntimePluginScope = {
   pluginTrustedOfficialInstall?: boolean;
 };
 
+// Native async resources retain this resolver; do not capture the execution callback's frame.
+function createAgentInputRecoveryResolver(gatewayScope: PluginRuntimeGatewayRequestScope) {
+  return () =>
+    (gatewayScope.resolveGatewayContext
+      ? gatewayScope.resolveGatewayContext()
+      : gatewayScope.context
+    )?.inputRecovery;
+}
+
 function runWithPluginGatewayScope<T>(
   gatewayScope: PluginRuntimeGatewayRequestScope,
   run: () => T,
@@ -44,17 +54,19 @@ function runWithPluginGatewayScope<T>(
 ): T {
   const current = getPluginExecutionFrame();
   const runtime = getPluginRuntimeExecutionFrame(current);
-  return runWithPluginExecutionFrame(
-    runtime?.gatewayScope === gatewayScope && runtime.invocation === invocation
-      ? runtime
-      : new PluginRuntimeExecutionFrame(
-          // Reuse prepared frame facts; the mutable Gateway view remains call-local.
-          current ?? {},
-          gatewayScope,
-          runtime?.generationRegistry,
-          invocation,
-        ),
-    run,
+  return withAgentInputRecoveryContext(createAgentInputRecoveryResolver(gatewayScope), () =>
+    runWithPluginExecutionFrame(
+      runtime?.gatewayScope === gatewayScope && runtime.invocation === invocation
+        ? runtime
+        : new PluginRuntimeExecutionFrame(
+            // Reuse prepared frame facts; the mutable Gateway view remains call-local.
+            current ?? {},
+            gatewayScope,
+            runtime?.generationRegistry,
+            invocation,
+          ),
+      run,
+    ),
   );
 }
 
@@ -171,9 +183,30 @@ export function withPluginRuntimeGatewayContextResolver<T>(
   scoped.resolveGatewayContext = resolveGatewayContext;
   delete scoped.context;
   return withAgentDatabasePreparationContext(
-    () => resolveGatewayContext?.()?.agentDatabaseStartup,
+    resolveAgentDatabasePreparation(resolveGatewayContext),
     () => runWithPluginGatewayScope(scoped, run),
   );
+}
+
+const resolveUnboundAgentDatabasePreparation = () => undefined;
+const agentDatabasePreparationResolvers = new WeakMap<
+  GatewayContextResolver,
+  () => GatewayRequestContext["agentDatabaseStartup"]
+>();
+
+// One owner callback per resolver lets nested work reuse the preparation async frame.
+function resolveAgentDatabasePreparation(
+  resolveGatewayContext: GatewayContextResolver | undefined,
+) {
+  if (!resolveGatewayContext) {
+    return resolveUnboundAgentDatabasePreparation;
+  }
+  let resolve = agentDatabasePreparationResolvers.get(resolveGatewayContext);
+  if (!resolve) {
+    resolve = () => resolveGatewayContext()?.agentDatabaseStartup;
+    agentDatabasePreparationResolvers.set(resolveGatewayContext, resolve);
+  }
+  return resolve;
 }
 
 /** Runs work against an owned registry handle while preserving any gateway request facts. */

@@ -4,7 +4,7 @@ import {
   asOptionalObjectRecord as readObjectRecord,
   asOptionalRecord as readRecord,
 } from "@openclaw/normalization-core/record-coerce";
-import { prepareAgentRunTerminalReply } from "../agents/agent-run-terminal-reply.js";
+import { prepareAgentRunReplyText } from "../agents/agent-run-terminal-reply.js";
 import { normalizeContextUsage } from "../agents/usage.js";
 import { parseInboundMediaUri, buildInboundMediaUriFromPath } from "../media/media-reference.js";
 import { STATE_CONTENTION_DIAGNOSTIC } from "../sessions/session-run-error-presentation.js";
@@ -177,6 +177,10 @@ export function sanitizeChatHistoryContentBlock(
     return { block, changed: false, truncated: false };
   }
   const entry = { ...(block as Record<string, unknown>) };
+  // Native inline blocks are host projections of admitted tool details, never transcript-authored UI.
+  if (entry.type === "plugin_view") {
+    return { block: { type: "text", text: "" }, changed: true, truncated: false };
+  }
   let changed = stripPrivateToolCallContextForDisplay(entry);
   // Display-cap truncation is a fact consumers need (to fetch the full row), so
   // it is tracked apart from `changed`, which also covers metadata stripping.
@@ -189,7 +193,7 @@ export function sanitizeChatHistoryContentBlock(
       ? opts?.toolResultMaxChars
       : undefined;
   if (isToolResultHistoryBlockType(entry.type) && "details" in entry) {
-    const projectedDetails = projectToolResultDetails(entry.details, maxChars);
+    const projectedDetails = projectToolResultDetails(entry.details, maxChars, entry);
     if (projectedDetails.details) {
       entry.details = projectedDetails.details;
     } else {
@@ -418,9 +422,8 @@ export function prepareAssistantHistoryMessage(message: unknown): unknown {
   const blocks = finalBlocks.length ? finalBlocks : readAssistantTextBlocksForPhase(entry);
   const rawText =
     typeof inlineText === "string" ? inlineText : blocks.map((block) => block.text).join("");
-  const prepared = prepareAgentRunTerminalReply({ rawText });
-  const text = prepared.text;
-  if (prepared.terminalReply.disposition === "silent" || text === rawText) {
+  const text = prepareAgentRunReplyText(rawText);
+  if (text === undefined || text === rawText) {
     return message;
   }
   // History is projected more than once. This is already prepared text,
@@ -471,6 +474,8 @@ export function sanitizeChatHistoryMessage(
     ("upstreamUserText" in openClawMeta ||
       "modelPromptProjection" in openClawMeta ||
       "sessionSendDelivery" in openClawMeta ||
+      "requesterOrigin" in openClawMeta ||
+      "chatInputRecovery" in openClawMeta ||
       "media" in openClawMeta)
   ) {
     // Codex retains the decorated upstream prompt for transcript reconstruction.
@@ -481,6 +486,9 @@ export function sanitizeChatHistoryMessage(
     delete projectedMeta.modelPromptProjection;
     // Durable delivery facts contain private endpoint bindings, not display data.
     delete projectedMeta.sessionSendDelivery;
+    // Operational requester custody is independent of redacted display identity.
+    delete projectedMeta.requesterOrigin;
+    delete projectedMeta.chatInputRecovery;
     if ("media" in projectedMeta) {
       projectedMeta.media = projectChatHistoryMediaFacts(projectedMeta.media);
       if (projectedMeta.media === undefined) {
@@ -513,7 +521,7 @@ export function sanitizeChatHistoryMessage(
     const conflictDetails = projectWorkspaceConflictDetails(entry);
     const toolResultDetails =
       !conflictDetails && messageHasToolResultShape(entry)
-        ? projectToolResultDetails(entry.details, maxChars)
+        ? projectToolResultDetails(entry.details, maxChars, entry)
         : undefined;
     // Only the terminal owner's presentation category crosses this report boundary.
     // Correlation is projected separately; raw diagnostics and report fields stay private.
@@ -706,9 +714,6 @@ export function sanitizeChatHistoryMessages(
   maxChars: number = DEFAULT_CHAT_HISTORY_TEXT_MAX_CHARS,
   opts?: { includeCommentaryFallbacks?: boolean; toolResultMaxChars?: number },
 ): unknown[] {
-  if (messages.length === 0) {
-    return messages;
-  }
   let changed = false;
   const next: unknown[] = [];
   for (const original of messages) {

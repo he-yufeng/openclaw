@@ -11,8 +11,10 @@ import {
   type createTrajectoryRuntimeRecorder,
   toTrajectoryToolDefinitions,
 } from "../../../trajectory/runtime.js";
+import { getToolDefinitionSource } from "../../agent-tool-definition-adapter.js";
 import type { createCacheTrace } from "../../cache-trace.js";
 import { createAgentHarnessPromptToolPolicy } from "../../harness/prompt-tool-policy.js";
+import type { ResolvedToolPromptFinalizer } from "../../resolved-tool-prompt.types.js";
 import type { AgentMessage } from "../../runtime/index.js";
 import type { AgentSession } from "../../sessions/index.js";
 import { normalizeToolPolicyName } from "../../tool-policy.js";
@@ -21,11 +23,13 @@ import { log } from "../logger.js";
 import { buildEmbeddedAgentHookContext } from "./agent-hook-context.js";
 import { summarizeSessionContext } from "./attempt-context-summary.js";
 import { resolvePromptSubmissionSkipReason } from "./attempt-prompt-submit.js";
-import type { ResolvedToolPromptFinalizer } from "./params.js";
 import type { EmbeddedRunAttemptParams } from "./types.js";
 
 type NamedTool = { name: string };
-type PromptToolSession = Pick<AgentSession, "getActiveToolNames" | "setActiveToolsByName">;
+type PromptToolSession = Pick<
+  AgentSession,
+  "getActiveToolNames" | "getToolDefinition" | "setActiveToolsByName"
+>;
 
 type PromptBuildToolPolicyBaseline = {
   activeToolNames: readonly string[];
@@ -55,7 +59,7 @@ export function createPromptBuildToolPolicy<
   });
   let baseline = captureBaseline();
   let toolsAllow: string[] | undefined;
-  let decisionIsCurrent: (() => boolean) | undefined;
+  let decisionPruned = false;
   const current = {
     activeToolNames: [...baseline.activeToolNames],
     callableToolNames: [...baseline.activeToolNames],
@@ -69,18 +73,18 @@ export function createPromptBuildToolPolicy<
       applyPromptBuildToolsAllow({
         ...params,
         baseline,
-        toolsAllow: decisionIsCurrent ? [] : toolsAllow,
+        toolsAllow: decisionPruned ? [] : toolsAllow,
       }),
     );
     params.onApplied?.(current);
     return current;
   };
-  const apply = (nextToolsAllow: string[] | undefined, nextDecisionIsCurrent?: () => boolean) => {
+  const apply = (nextToolsAllow: string[] | undefined, pruneForDecision = false) => {
     const modelFacingToolsBefore = current.effectiveTools.length;
     toolsAllow = nextToolsAllow;
-    decisionIsCurrent = nextDecisionIsCurrent;
+    decisionPruned = pruneForDecision;
     const applied = applyCurrent();
-    if (decisionIsCurrent) {
+    if (decisionPruned) {
       logDecisionToolPrefilter({
         effect: "applied",
         modelFacingToolsBefore,
@@ -95,22 +99,6 @@ export function createPromptBuildToolPolicy<
     // The session baseline includes client tools and survives prompt-level pruning.
     // Read its latest permission generation, not the previous turn's restricted surface.
     hasBaselineTools: () => baseline.activeToolNames.length > 0,
-    prepareForDispatch: <T>(prepareRestoredPrompt: () => Promise<T>): Promise<T> | undefined => {
-      if (!decisionIsCurrent || decisionIsCurrent()) {
-        return undefined;
-      }
-      // Drop only the optional Decision cap. The current host generation and
-      // independent prompt-hook cap still own what is permitted.
-      const modelFacingToolsBefore = current.effectiveTools.length;
-      decisionIsCurrent = undefined;
-      applyCurrent();
-      logDecisionToolPrefilter({
-        effect: "restored",
-        modelFacingToolsBefore,
-        modelFacingToolsAfter: current.effectiveTools.length,
-      });
-      return prepareRestoredPrompt();
-    },
     refresh: () => {
       // A late hook must filter this generation, never restore retained callable
       // entries from the catalog that the permission owner has just revoked.
@@ -164,25 +152,28 @@ export function applyPromptBuildToolsAllow<
     toolsAllow: params.toolsAllow,
     forceToolNames: params.forceToolNames,
   };
+  // The registry's winner owns a direct name. A shadowed native tool cannot
+  // lend its plugin grant to the client definition registered in its place.
+  const registeredTools = params.baseline.activeToolNames.flatMap((name) => {
+    const definition = params.session.getToolDefinition(name);
+    return definition ? [getToolDefinitionSource(definition) ?? definition] : [];
+  });
   const promptPolicy = createAgentHarnessPromptToolPolicy({
-    tools: params.effectiveTools,
+    tools: registeredTools,
     catalogRef: params.catalogRef,
     catalogEntries: params.baseline.catalogEntries,
     codeModeControlsEnabled: params.codeModeControlsEnabled,
   }).apply(policyInput);
+  const callableNames = new Set(promptPolicy.callableToolNames.map(normalizeToolPolicyName));
   const filterTools = <T extends NamedTool>(tools: T[]) =>
-    createAgentHarnessPromptToolPolicy({ tools, codeModeControlsEnabled: false }).apply(policyInput)
-      .tools;
+    createAgentHarnessPromptToolPolicy({ tools, codeModeControlsEnabled: false })
+      .apply(policyInput)
+      .tools.filter((tool) => callableNames.has(normalizeToolPolicyName(tool.name)));
   const allowedUncompactedTools = filterTools(params.uncompactedEffectiveTools);
   const allowedTools = filterTools(params.tools);
   const allowedActiveNames = new Set(
-    filterTools(params.baseline.activeToolNames.map((name) => ({ name }))).map((tool) =>
-      normalizeToolPolicyName(tool.name),
-    ),
+    promptPolicy.tools.map((tool) => normalizeToolPolicyName(tool.name)),
   );
-  for (const tool of [...promptPolicy.tools, ...allowedUncompactedTools, ...allowedTools]) {
-    allowedActiveNames.add(normalizeToolPolicyName(tool.name));
-  }
 
   const activeToolNames = params.baseline.activeToolNames.filter((name) =>
     allowedActiveNames.has(normalizeToolPolicyName(name)),
@@ -194,7 +185,9 @@ export function applyPromptBuildToolsAllow<
   return {
     activeToolNames,
     callableToolNames: promptPolicy.callableToolNames,
-    effectiveTools: promptPolicy.tools,
+    effectiveTools: params.effectiveTools.filter((tool) =>
+      allowedActiveNames.has(normalizeToolPolicyName(tool.name)),
+    ),
     uncompactedEffectiveTools: allowedUncompactedTools,
     tools: allowedTools,
   };

@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { AgentWorkspaceAccess } from "../../agents/workspace-access.js";
+import { throwSettledAggregate } from "../../infra/error-graph-internal.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { getGatewayRestartDrainSignal } from "../../process/gateway-work-admission.js";
 import type { WorkspaceSkillSourcePlan } from "../loading/workspace-skill-sources.js";
@@ -10,7 +11,6 @@ const runInSkillsWatcherContext = AsyncLocalStorage.snapshot();
 const MAX_REMOTE_WATCHERS = 128;
 type RemoteSkillsWatch = {
   access: AgentWorkspaceAccess;
-  workspaceDir: string;
   agentIds: Set<string>;
   unowned: boolean;
   signature: string;
@@ -19,8 +19,6 @@ type RemoteSkillsWatch = {
   task?: Promise<void>;
 };
 const remoteWatchers = new Map<string, RemoteSkillsWatch>();
-// A watcher removed from the registry may still be settling after abort.
-const remoteWatchTasks = new Map<Promise<void>, RemoteSkillsWatch>();
 let registryUpdate = Promise.resolve();
 
 function updateRegistry(update: () => Promise<void>): Promise<void> {
@@ -78,7 +76,6 @@ export function ensureRemoteSkillsWatcher(params: {
     }
     const state: RemoteSkillsWatch = {
       access,
-      workspaceDir,
       agentIds: new Set(params.agentId ? [params.agentId] : []),
       unowned: params.agentId === undefined,
       signature,
@@ -132,11 +129,6 @@ export function ensureRemoteSkillsWatcher(params: {
         }
       }
     });
-    remoteWatchTasks.set(state.task, state);
-    void state.task.then(
-      () => remoteWatchTasks.delete(state.task!),
-      () => remoteWatchTasks.delete(state.task!),
-    );
   });
 }
 
@@ -155,26 +147,12 @@ export function closeRemoteSkillsWatchersForAgent(params: { agentId: string }): 
       })
       .map(([key]) => key);
     await Promise.all(keys.map(retireWatcher));
-    await Promise.all(
-      [...remoteWatchTasks]
-        .filter(([, owner]) => owner.agentIds.has(params.agentId))
-        .map(([task]) => task),
-    );
   });
 }
 
 export function closeRemoteSkillsWatchers(): Promise<void> {
   return updateRegistry(async () => {
     const results = await Promise.allSettled([...remoteWatchers.keys()].map(retireWatcher));
-    const settledTasks = await Promise.allSettled(remoteWatchTasks.keys());
-    const failures = results.flatMap((result) =>
-      result.status === "rejected" ? [result.reason] : [],
-    );
-    failures.push(
-      ...settledTasks.flatMap((result) => (result.status === "rejected" ? [result.reason] : [])),
-    );
-    if (failures.length) {
-      throw new AggregateError(failures, "Remote skills watcher shutdown failed");
-    }
+    throwSettledAggregate(results, "Remote skills watcher shutdown failed");
   });
 }
