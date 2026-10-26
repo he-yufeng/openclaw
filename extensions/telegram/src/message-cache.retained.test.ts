@@ -447,10 +447,17 @@ describe("Telegram retained message history", () => {
       // the same bucket. Without a shared writer queue the retiring handle
       // can complete its fence + delete before this compare commits, and the
       // stale observation then resurrects the preview.
-      retiring.retireMessage({ accountId, chatId, messageId: 60 }).then(() => retireDone.resolve());
+      void retiring
+        .retireMessage({ accountId, chatId, messageId: 60 })
+        .then(() => retireDone.resolve());
       // Give a separate-chain retire time to finish; a shared-chain retire
       // queues behind this write and the race resolves first.
-      await Promise.race([retireDone.promise, new Promise((resolve) => setTimeout(resolve, 20))]);
+      await Promise.race([
+        retireDone.promise,
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 20);
+        }),
+      ]);
     };
 
     await record(recording, message(60));
