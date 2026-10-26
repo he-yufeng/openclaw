@@ -438,6 +438,28 @@ describe("Telegram retained message history", () => {
     expect(await historyIds(cache)).toEqual([]);
   });
 
+  it("shares the writer queue across cache instances over one bucket", async () => {
+    const recording = createCache();
+    const retiring = createCache();
+    const retireDone = Promise.withResolvers<void>();
+    fixture.beforeCompare = async () => {
+      // Production recording and preview retirement use separate handles over
+      // the same bucket. Without a shared writer queue the retiring handle
+      // can complete its fence + delete before this compare commits, and the
+      // stale observation then resurrects the preview.
+      retiring.retireMessage({ accountId, chatId, messageId: 60 }).then(() => retireDone.resolve());
+      // Give a separate-chain retire time to finish; a shared-chain retire
+      // queues behind this write and the race resolves first.
+      await Promise.race([retireDone.promise, new Promise((resolve) => setTimeout(resolve, 20))]);
+    };
+
+    await record(recording, message(60));
+    await retireDone.promise;
+
+    expect(await get(recording, 60)).toBeNull();
+    expect(await historyIds(recording)).toEqual([]);
+  });
+
   it("keeps a bounded-cache preview retired while its observation was in flight", async () => {
     const cache = createCache();
     const dmChat = { id: 7, type: "private" as const, first_name: "Ada" };

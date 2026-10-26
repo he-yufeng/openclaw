@@ -115,6 +115,7 @@ type TelegramMessageCacheBucket = {
   promotePromise?: Promise<void>;
   chatRetention?: Map<string, "bounded" | "retained">;
   retiredTombstones?: Map<string, number>;
+  keyWriteChains: Map<string, Promise<void>>;
 };
 
 const DEFAULT_MAX_MESSAGES = 5000;
@@ -205,6 +206,7 @@ function resolveMessageCacheBucket(params: {
   if (!bucketKey) {
     return {
       messages: new Map<string, TelegramCachedMessageNode>(),
+      keyWriteChains: new Map<string, Promise<void>>(),
       hydratePromise: Promise.resolve(),
     };
   }
@@ -214,10 +216,12 @@ function resolveMessageCacheBucket(params: {
   const existing = persistedMessageCacheBuckets.get(bucketKey);
   if (existing) {
     existing.persistentStore = params.persistentStore ?? existing.persistentStore;
+    existing.keyWriteChains ??= new Map<string, Promise<void>>();
     return existing;
   }
-  const bucket = {
+  const bucket: TelegramMessageCacheBucket = {
     messages: new Map<string, TelegramCachedMessageNode>(),
+    keyWriteChains: new Map<string, Promise<void>>(),
     ...(params.persistentStore ? { persistentStore: params.persistentStore } : {}),
   };
   persistedMessageCacheBuckets.set(bucketKey, bucket);
@@ -438,8 +442,11 @@ export function createTelegramMessageCache(params?: { scope?: string }): Telegra
   // Retirement and recording contend per key: a record that already passed
   // the fence must not land after a retire observed it, and a late record
   // must not reinsert what retirement deleted. Chain every writer per key so
-  // the fence check and the write it authorizes run as one step.
-  const keyWriteChains = new Map<string, Promise<void>>();
+  // the fence check and the write it authorizes run as one step. The chains
+  // live on the shared bucket so every cache instance over the same scope
+  // serializes against each other, matching the production fan-out in
+  // preview-retirement.
+  const keyWriteChains = bucket.keyWriteChains;
   const withKeyWriter = <T>(key: string, write: () => Promise<T>): Promise<T> => {
     const queued = (keyWriteChains.get(key) ?? Promise.resolve()).then(write, write);
     const settled = queued.then(
