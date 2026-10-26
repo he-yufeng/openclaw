@@ -424,6 +424,43 @@ describe("Telegram retained message history", () => {
     );
   });
 
+  it("retires a persisted preview after its memory entry was evicted", async () => {
+    const privateChat = { id: 7, type: "private" as const, first_name: "Ada" };
+    const dmPrefix = `${scopeKey}:${accountId}:7:`;
+    importPluginStateEntriesForDoctorForTests(
+      "telegram",
+      fixture.options(),
+      Array.from({ length: TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES }, (_, index) => {
+        const id = index + 1;
+        return {
+          key: `${dmPrefix}${id}`,
+          value: legacyRow(message(id, { chat: privateChat })),
+          createdAt: 1000 + id,
+        };
+      }),
+    );
+    const cache = createCache();
+    await get(cache, 1, 7);
+    await cache.record({
+      accountId,
+      chatId: 7,
+      msg: message(TELEGRAM_MESSAGE_CACHE_PERSISTENT_MAX_MESSAGES + 1, { chat: privateChat }),
+      historyEligible: true,
+    });
+
+    const { bounded } = openStores();
+    expect(await get(cache, 2, 7)).toBeNull();
+    expect(await bounded.lookup(`${dmPrefix}2`)).toBeDefined();
+    expect(await bounded.lookup(`${dmPrefix}1`)).toBeUndefined();
+
+    expect(await cache.retireMessage({ accountId, chatId: 7, messageId: 2 })).toBe(true);
+    expect(await bounded.lookup(`${dmPrefix}2`)).toBeUndefined();
+
+    resetTelegramMessageCacheForTest();
+    resetPluginStateStoreForTests();
+    expect(await get(createCache(), 2, 7)).toBeNull();
+  });
+
   it("keeps a preview retired while its own observation was still in flight", async () => {
     const cache = createCache();
     let retirePromise: Promise<boolean> | undefined;

@@ -575,10 +575,12 @@ export function createTelegramMessageCache(params?: { scope?: string }): Telegra
     const key = `${telegramMessageCacheKeyPrefix({ scopeKey, accountId, chatId })}${String(messageId)}`;
     return withKeyWriter(key, async () => {
       await markRetired(key);
-      const removed = messages.delete(key);
-      if (removed && bucket.persistentStore?.delete) {
+      let removed = messages.delete(key);
+      if (bucket.persistentStore?.delete) {
         try {
-          await bucket.persistentStore.delete(key);
+          // Memory LRU and SQLite creation-order eviction diverge, so a
+          // missing in-memory entry does not prove the persisted row is gone.
+          removed = (await bucket.persistentStore.delete(key)) || removed;
         } catch (error) {
           logVerbose(`telegram: failed to retire persisted message cache entry: ${String(error)}`);
         }
