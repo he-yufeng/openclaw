@@ -70,17 +70,19 @@ async function withRegisteredCodexBindingStore(
     bindingStore: CodexAppServerBindingStore;
     syncBindingStore: PluginStateSyncKeyedStore<StoredCodexAppServerBinding>;
     revokedError?: Error;
+    deleteAttempts: { count: number };
   }) => Promise<void>,
   options?: { revokeAtWorkerAdmission?: boolean },
 ) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-binding-entry-"));
   // Revocation rig: the sweep is the only pager on this namespace, so a page
   // followed by an observe marks the exact window between the failed capacity
-  // insert and the recovery delete. The revocation lands there; the delete's
-  // authority-bound store then refuses at its first post-open admission,
-  // which is the worker's final admission gate.
+  // insert and the recovery delete. Revocation starts only after that
+  // observation completes and affects only caller-bound stores, so the
+  // unbound read cannot reject before the recovery writer is attempted.
   let paged = false;
   let revoked = false;
+  const deleteAttempts = { count: 0 };
   const revokedError = options?.revokeAtWorkerAdmission
     ? new Error("session authority revoked")
     : undefined;
@@ -99,7 +101,8 @@ async function withRegisteredCodexBindingStore(
         ) => {
           // Per store instance: the factory runs assertCurrent once at open,
           // every operation admission re-runs it. A revocation armed after
-          // open therefore only fails admissions, never the open itself.
+          // open therefore fails only caller-bound admissions, never the open
+          // itself or the unbound observation store.
           let opened = false;
           const store = createPluginStateKeyedStoreV2ForTests<T>(
             "codex",
@@ -108,7 +111,7 @@ async function withRegisteredCodexBindingStore(
               assertCurrent: () => {
                 if (!opened) {
                   opened = true;
-                } else if (revoked) {
+                } else if (revoked && authority) {
                   throw revokedError ?? new Error("session authority revoked");
                 }
                 authority?.assertCurrent();
@@ -117,6 +120,17 @@ async function withRegisteredCodexBindingStore(
             },
           );
           if (storeOptions?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE && revokedError) {
+            if (authority) {
+              const compareAndApply = store.compareAndApply?.bind(store);
+              if (compareAndApply) {
+                store.compareAndApply = (key, comparison, intent, compareOptions) => {
+                  if (intent.operation === "delete") {
+                    deleteAttempts.count += 1;
+                  }
+                  return compareAndApply(key, comparison, intent, compareOptions);
+                };
+              }
+            }
             const page = store.entriesInKeyRange?.bind(store);
             if (page) {
               store.entriesInKeyRange = (range) => {
@@ -126,11 +140,12 @@ async function withRegisteredCodexBindingStore(
             }
             const observe = store.observe?.bind(store);
             if (observe) {
-              store.observe = (key) => {
+              store.observe = async (key) => {
+                const observation = await observe(key);
                 if (paged) {
                   revoked = true;
                 }
-                return observe(key);
+                return observation;
               };
             }
           }
@@ -174,6 +189,7 @@ async function withRegisteredCodexBindingStore(
       bindingStore: bindingStore!,
       syncBindingStore,
       revokedError,
+      deleteAttempts,
     });
   } finally {
     // Close the worker and cached database handles before removing the
@@ -242,12 +258,12 @@ describe("Codex binding overflow recovery through the registered plugin path", (
 
   it("rejects a queued delete at final worker admission when authority lapses mid-recovery", async () => {
     await withRegisteredCodexBindingStore(
-      async ({ bindingStore, syncBindingStore, revokedError }) => {
+      async ({ bindingStore, syncBindingStore, revokedError, deleteAttempts }) => {
         fillToCapacity(syncBindingStore);
 
         // The caller's authority is current at lease admission; the lapse
-        // lands while the sweep pages and observes, so the delete is already
-        // queued when the admission gate refuses it.
+        // starts after the sweep's observation completes, so recovery reaches
+        // compareAndApply before the final admission gate refuses the delete.
         const authority = createNativeSessionBindingScope(() => {});
         let runCalls = 0;
         await expect(
@@ -261,6 +277,7 @@ describe("Codex binding overflow recovery through the registered plugin path", (
         ).rejects.toBe(revokedError);
 
         expect(runCalls).toBe(0);
+        expect(deleteAttempts.count).toBe(1);
         // Zero deletes: the disposable row survives the refused admission.
         expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
       },
