@@ -2,45 +2,52 @@ import type { JSX } from "@solidjs/web";
 import type { ToolsEffectiveResult } from "../../../api/types.ts";
 import type { ApplicationNavigationOptions } from "../../../app/context.ts";
 import type { IconName } from "../../../components/solid/icon.tsx";
+import type {
+  MenuControls,
+  MenuEntry,
+  MenuHandle,
+  MenuItem,
+} from "../../../components/solid/menu.tsx";
 import type { McpServerSummary } from "../../../lib/config/mcp-servers.ts";
 import type { SessionToolOverrides } from "../../../lib/sessions/patch.ts";
 import type { ComposerLibraryProps } from "../composer-library-session.ts";
 import type { ChatAttachmentControlsProps } from "./chat-attachment-controls.types.ts";
+import type { ChatAttachmentInputHandle } from "./chat-attachment-inputs.ts";
 
 export type ChatComposerPlusMenuView =
   | "root"
   | "skills"
   | "connectors"
-  | `tools:${string}`
+  | "libraries"
   | `library:${string}`;
 
 export type ChatComposerMenuSkill = {
   key: string;
   name: string;
+  emoji?: string;
   enabled: boolean;
   baseEnabled: boolean;
   missingDeps?: boolean;
   blocked?: boolean;
 };
 
-type ChatComposerRootToggle = {
-  value: string;
-  label: string;
-  icon?: IconName;
-  checked: boolean;
-  disabled: boolean;
-  title?: string;
-  onChange: (checked: boolean) => void;
-};
-
 export type ChatComposerPlusMenuProps = {
   attachments: ChatAttachmentControlsProps;
+  inputHandle: ChatAttachmentInputHandle;
   capabilityMenu?: ChatComposerCapabilityMenuProps;
   disabled: boolean;
   open: boolean;
   view: ChatComposerPlusMenuView;
   toolOverrides: SessionToolOverrides | null | undefined;
-  rootToggles?: readonly ChatComposerRootToggle[];
+  rootToggles?: readonly {
+    value: string;
+    label: string;
+    icon?: IconName;
+    checked: boolean;
+    disabled: boolean;
+    title?: string;
+    onChange: (checked: boolean) => void;
+  }[];
   onOpenChange: (open: boolean) => void;
   onViewChange: (view: ChatComposerPlusMenuView) => void;
 };
@@ -48,10 +55,8 @@ export type ChatComposerPlusMenuProps = {
 export type ChatComposerCapabilityMenuProps = {
   basePath: string;
   skills: readonly ChatComposerMenuSkill[] | null;
-  skillsLoading: boolean;
-  skillsError: boolean;
+  skillsRead: Promise<readonly ChatComposerMenuSkill[] | null> | null;
   library?: ComposerLibraryProps;
-  libraryDialog?: JSX.Element;
   mcpServers: readonly McpServerSummary[];
   toolsEffectiveResult: ToolsEffectiveResult | null;
   toolsEffectiveLoading: boolean;
@@ -61,7 +66,6 @@ export type ChatComposerCapabilityMenuProps = {
   mutationBlockedReason: string | null;
   canAdmin: boolean;
   adminBlockedReason: string | null;
-  addServerDialog?: JSX.Element;
   onLoadSkills: () => void;
   onLoadView?: (view: ChatComposerPlusMenuView) => void;
   onPatchToolOverrides: (next: SessionToolOverrides | null) => void;
@@ -75,3 +79,17 @@ export type ChatComposerCapabilityMenuProps = {
 
 export type ChatComposerPlusMenuContentProps = ChatComposerPlusMenuProps &
   ChatComposerCapabilityMenuProps & { showCapabilities: boolean };
+
+export type ChatComposerPlusMenuHandlers = {
+  items(): readonly MenuEntry[];
+  select(item: MenuItem, event: CustomEvent<MenuItem>): void;
+};
+
+export type ChatComposerPlusMenuBodyProps = {
+  menu: ChatComposerPlusMenuContentProps;
+  view: ChatComposerPlusMenuView;
+  readMenu: () => MenuHandle;
+  onReady: (handlers: ChatComposerPlusMenuHandlers | undefined) => void;
+  controls: MenuControls;
+  renderItems: (items: () => readonly MenuEntry[]) => JSX.Element;
+};

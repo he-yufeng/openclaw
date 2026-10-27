@@ -95,6 +95,12 @@ export async function exportPostgresBackup(params: {
     await createVerifiedSqliteSnapshot({
       sourcePath: raw,
       targetPath: image,
+      // This worker created and closed the private export; no live source locks need isolation.
+      sourceAcquisition: {
+        mode: "isolated-process",
+        stagingRoot: params.directory,
+        preserveSourceArtifacts: true,
+      },
       preserveRowIds: true,
       async transform(db) {
         if (params.gitIdentity) {
@@ -104,9 +110,9 @@ export async function exportPostgresBackup(params: {
           .prepare("SELECT total_changes() AS n")
           .get()?.n;
         sanitizeOpenClawGlobalStateSnapshot(db);
-        const { embedSessionColdArchivesInSnapshot } =
-          await import("../config/sessions/session-cold-storage-backup.js");
-        await embedSessionColdArchivesInSnapshot({
+        const { embedSessionColdArchivesInSnapshotInWorker } =
+          await import("../config/sessions/session-cold-storage-backup.worker.js");
+        await embedSessionColdArchivesInSnapshotInWorker({
           database: db,
           sourceStorePath: params.sourcePath,
         });

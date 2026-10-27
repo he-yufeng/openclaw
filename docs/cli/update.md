@@ -96,6 +96,12 @@ profile emits the guidance to stderr and does not create a state database for a
 skipped update. These non-outcomes do not run rollback verification or offer an
 update failure report.
 
+After durable success, updates automatically retire eligible superseded recovery
+copies through the state owner, retaining the current update's rollback generation.
+Cleanup warnings never fail or roll back the successful update. Manual
+`openclaw update cleanup` remains available for inspection and retry; see
+[recovery retirement](/cli/update/repair-and-recovery#update-cleanup).
+
 ## Usage
 
 ```bash
@@ -122,6 +128,10 @@ launcher scripts).
 Invalid configuration reports `invalid-config` before database schema inspection.
 An unreadable configuration file or failed configuration loading step instead
 reports `config-read-failed`, with a recognized filesystem error code when available.
+An ownership refusal during loading includes the `gateway-ownership-unverified`
+failure fact and points to `openclaw gateway recover-lock` for inspection. Active
+maintenance instead reports `gateway-maintenance-busy` with wait or stop guidance.
+Neither diagnostic includes the recorded holder's private details.
 For supported package targets, the candidate makes that
 decision after private staging; see [Candidate-owned admission](#candidate-owned-admission).
 The local diagnostic identifies invalid fields and recommends
@@ -260,6 +270,12 @@ recorded rollback outcome. Failed steps use stable identifiers such as
 `candidate-state-snapshot`, `candidate-doctor-lint`, and `post-install-verify` in
 the report body and issue title; command arguments and private paths remain redacted.
 Snapshot errors identify the active database, execution approvals, or plugin phase.
+Snapshot watchdog failures also retain the last progress event, its age, and the
+last database's page count, copied bytes, and copy time in saved stderr and
+`openclaw update status`. The watchdog's byte estimate describes the total snapshot
+input, including plugins; it is not the size of the database active at timeout.
+Phase-only progress, such as plugin inventory after the shared database copy,
+replaces the active phase without losing the last database's copy counters.
 Schema inspection failures put recognized worker error codes and causes before private
 source context, including causes after warning lines, so they survive redaction. Saved
 diagnostic lines omit a path and its trailing text, including quoted paths whose filenames
@@ -324,7 +340,7 @@ budget per attempt. Interrupted pack transfers restart the missing pack, not the
 installed history. Before building, preparation copies the reused objects into
 its own store; the prepared release retains independent Git objects.
 
-Immutable preparation requires a separately adopted build account and toolchain.
+When a separate build account and toolchain are adopted, immutable preparation uses them.
 The build account must differ from the runtime account, have no supplementary
 groups, and match the recorded numeric identity. The updater runs dependency
 installation and builds in a restricted systemd service with a private home,
@@ -337,10 +353,26 @@ Build storage admission and the runtime account's write/quota probe run
 separately. A failed admission, installation, build, or process-settlement check
 leaves the existing service and `current` pointer unchanged. Uncertain process
 settlement retains the build scratch for inspection. Installations without an
-adopted build identity can still inspect status, reuse an already prepared
-generation, and detect an already-current target; preparing a new target reports
-the missing adoption. Build-identity adoption is staged for the native immutable
-update rollout and is not exposed as an `openclaw.json` setting or CLI flag yet.
+adopted build identity use a non-root operator account in the same private staging
+area and restricted systemd service. A non-root caller uses its own account and
+toolchain search path. A root updater resolves the installation's non-root service
+account or recorded directory owner and uses the verified service toolchain path.
+It never runs candidate dependency installation or build scripts as root. If no
+non-root owner can be resolved, preparation refuses before changing the installation;
+run `openclaw update` as the service user or provision the isolated build account.
+
+At account selection, each fallback build warns that the isolated build account is
+missing and names the account, UID, and GID it will use. The sealed
+`dist/build-info.json` records `immutableBuild` with `builtBy: "operator"`,
+`isolation: "none"`, `account`, `uid`, and `gid`; status and Doctor report these
+recorded facts. The build uses a clean environment and private home and temporary
+directories. Exact-SHA verification, process settlement, materialization, and
+sealing still apply. Malformed or unreadable build-account descriptors refuse
+preparation rather than silently selecting the fallback.
+
+Build-account provisioning remains staged and has no supported CLI command or
+`openclaw.json` setting yet. Updates can use the non-root fallback; this section will carry
+provisioning instructions when that workflow becomes available.
 
 `--drain-timeout <seconds>` sets the immutable drain budget independently of
 `--timeout`, which retains the canary/readiness phase budget. The default drain
@@ -360,7 +392,8 @@ work; the native owner explicitly authorizes startup after publication.
 When enabled, the native updater drains through the Gateway suspension owner,
 stops the old service, publishes `current` under a fenced activation record,
 starts the selected generation, and verifies its process, build, authenticated
-health, HTTP readiness, plugins, and channels. Build and install work stay outside
+health, core HTTP readiness, and plugins. Channel-only outages remain named
+warnings while `/readyz` retains its actual HTTP status. Build and install work stay outside
 cutover. Startup responses with `status: "starting"`, including agent database
 inspection, keep the readiness wait open within its bounded budget. An
 inconclusive check retains the recovery record; it does not establish failure.
@@ -554,9 +587,11 @@ the update needs to replace the installation method or a separate serving root.
 The temporary candidate is removed without activating it.
 
 When replacement is needed, the updater retains its running worker files before
-changing the installed package. Linux OverlayFS installations use private copies
-so hard-link copy-up cannot invalidate the retained files’ identity checks.
-Other supported filesystems keep the hard-link fast path and copy fallback.
+changing the installed package. Ordinary files use hard links, with a copy
+fallback when linking is unavailable. If a linked file's identity changes, its
+size, mode, and content must match the inventory. A mismatch discards that runtime
+as a rollback source and logs the path and failed check; the update continues
+without using the unverified tree. Writes through the same inode remain best effort.
 
 SQLite read-only workers use that retained generation through post-install
 verification, even after the package manager removes the previous package path.
@@ -569,6 +604,14 @@ worker-launch code; installing a corrected candidate cannot repair that first ho
 
 Source updates retain a retired workspace dependency link when only its ignored `node_modules` directory remains.
 An older installed updater that fails at `updater-runtime-retention` needs this correction in its running code before retrying; a newer candidate cannot repair that earlier step.
+
+Installed updaters up to 2026.10.7 and the 2026.10.10 betas retain their runtime in the update process
+and, after any second without a completed entry, rescan the whole retained tree
+to measure progress. On a busy or slow disk, `updater-runtime-retention` can take
+several minutes for a global install of about 45,000 files while still advancing;
+let it finish instead of interrupting the update. Newer updaters retain in a
+private worker bounded by the update deadline. The candidate does not take part in
+this step, so a newer target cannot speed it up.
 
 Runtime retention excludes updater-owned package backups in the global module
 directory, including backup symlinks to source checkouts. An older installed
@@ -635,7 +678,9 @@ after admission, including every mutation.
 If the marker is absent or invalid, the updater uses its installed admission
 checks and records `update-admission-unsupported-target`. If the candidate times
 out, crashes, or returns no valid protocol-1 verdict, it records
-`update-admission-fallback` and uses those same installed checks. These warnings
+`update-admission-fallback` and uses those same installed checks. When stdout is
+not one JSON document (`malformed-json`), the warning ends with a bounded,
+redacted excerpt of the first stdout line. These warnings
 are informational; the installed checks determine whether the update proceeds.
 Both warning steps retain their identity, status, and timestamps when history
 compacts at its 128-step or 16 KiB limit. Warning text can be compacted to fit
@@ -651,7 +696,12 @@ passes `--context <absolute-path>` to a private mode-0600 context file; this com
 path and required argument select admission child mode. The command emits
 one JSON document with `protocol`, `verdict`, `reasons`, `warnings`, and `facts`
 containing candidate/installed versions, the candidate's `nodeEngines` requirement
-when declared, and named check results. It exits `0`
+when declared, and named check results. Console logs from admission and its
+private inspection workers go to stderr at every console level, so stdout carries
+only that document. Candidates up to 2026.10.7 and the 2026.10.10 betas wrote debug
+diagnostics to stdout when the console level was raised (for example
+`logging.consoleLevel: "debug"`), so their admission fell back with `malformed-json`
+to the installed checks. It exits `0`
 for admission, `3` for refusal, or `2` for an internal error without a valid
 verdict. It rejects inherited update authority variables with exit `2`, allowing
 the supervisor to fall back. It does not perform managed-service ancestry checks.
@@ -819,6 +869,20 @@ through activation, readiness, and recovery, including native service commands.
 Expiry reports `update-activation-timeout` or pending recovery; it does not start
 another recovery phase. Outstanding writers retain ownership until they settle.
 
+Candidate checks compute an automatic allowance from the copied SQLite and
+plugin state. A shorter update deadline limits that allowance; the update report
+and history warn with both values because checks may time out early. Increase
+`--timeout` to allow more time. This warning comes from the installed updater and
+protects subsequent updates after installation.
+
+The same deadline cancels runtime-retention inventory, its file-hashing workers,
+and materialization before activation. Retention makes one attempt and stops if
+dependency discovery cannot make progress; it does not repeatedly copy a changing
+tree. If retention fails, the serving installation stays untouched. Retry after
+addressing the reported storage or dependency problem. This protection belongs
+to the installed updater, so selecting a newer candidate cannot fix an older
+updater that is already stuck in retention.
+
 After activation or rollback is verified, obsolete package and launcher backup
 trees share a five-minute cleanup budget. Expiry retains the remaining backups
 and records their paths as a warning without undoing the verified installation.
@@ -864,6 +928,10 @@ Use `openclaw update status` and Doctor for recovery guidance.
 | `--reapply-local-overrides`                      | Replay trusted local packaged `dist` edits when the new package has the same baseline. Otherwise preserve them for manual recovery.                                                                                                                                                                                                                               |
 | `--accept-capabilities`                          | Accept each plugin's reviewed capability changes during post-update sync. This acknowledges the exact staged capability surface; it does not disable capability checks or establish future trust.                                                                                                                                                                 |
 | `--full-integrity-check`                         | Request full SQLite integrity checks during candidate migrations, including Doctor subprocesses. Also accepted by `update repair` and `update wizard`.                                                                                                                                                                                                            |
+
+Invalid `--channel` values are quoted as JSON strings in diagnostics, including
+escaped quotes, newlines, and control characters. This applies to `update`,
+`update repair`, and `update finalize`, in both human and `--json` output.
 
 There is no `--verbose` flag. Use `--dry-run` to preview planned actions,
 `--json` for machine-readable results, and `openclaw update status --json`

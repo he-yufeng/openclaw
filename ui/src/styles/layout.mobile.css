@@ -41,14 +41,6 @@ html:not(.openclaw-native-macos):not(.openclaw-native-nav):not(.openclaw-native-
   display: none;
 }
 
-.shell--mobile-nav.shell--connection-status {
-  grid-template-rows: var(--shell-topbar-height) auto minmax(0, 1fr);
-  grid-template-areas:
-    "topbar"
-    "connection"
-    "content";
-}
-
 .shell--mobile-nav .shell-nav,
 .shell--mobile-nav.shell--nav-collapsed .shell-nav {
   position: fixed;
@@ -128,11 +120,6 @@ html:not(.openclaw-native-macos):not(.openclaw-native-nav):not(.openclaw-native-
   }
 }
 
-/* Inside the drawer there is no Escape key to hint at. */
-.shell--mobile-nav .settings-sidebar__esc {
-  display: none;
-}
-
 /* Show the hamburger toggle at the same breakpoint where the drawer takes over;
    the desktop rail toggle makes no sense once the sidebar is a drawer. */
 .shell--mobile-nav .topbar .topbar-nav-toggle {
@@ -149,9 +136,13 @@ html:not(.openclaw-native-macos):not(.openclaw-native-nav):not(.openclaw-native-
   gap: 10px;
 }
 
-.shell--mobile-nav .topnav-shell__content {
-  display: flex;
-  justify-content: center;
+.mobile-connection-status {
+  min-width: 0;
+  height: 18px;
+}
+
+:is(.topbar-nav-toggle, .chat-pane__nav-toggle) .gateway-status-dot {
+  inset: 8px 8px auto auto;
 }
 
 .shell--mobile-nav .topbar-brand {
@@ -327,6 +318,8 @@ html.openclaw-native-desktop body .shell--mobile-nav {
   }
 
   .chat-thread {
+    --chat-thread-padding-top: 0px;
+
     margin-top: 0;
     /* Horizontal inset lives on .chat-thread-inner (see layout.css): padding
        on the scroll container floats macOS overlay scrollbars off the edge. */

@@ -8,7 +8,7 @@ import {
   resolveSqliteTranscriptScope,
   toDatabaseOptions,
 } from "./session-accessor.sqlite-scope.js";
-import { readActiveTranscriptEntryAnchor } from "./session-accessor.sqlite-transcript-anchor.js";
+import { readActiveTranscriptEntryAnchor } from "./session-accessor.sqlite-transcript-admitted-read.js";
 import {
   rewriteNativeAssistantTranscriptMessageForRun,
   rewriteNativeTranscriptMessageAtAnchor,
@@ -117,11 +117,11 @@ async function rewritePreparedTranscriptMessage<T>(
     resolveSqliteTranscriptScope(requested, params.readSource),
   );
   const database = { ...toDatabaseOptions(scope), path: scope.path };
-  const selection = structuredClone({
+  const selection = {
     scope,
     target: params.target,
     expectedEntry: params.expectedEntry,
-  });
+  };
   return await runSessionEntryWorkerOperation<
     SessionMessageRewriteCommitted,
     MessageRewriteResult<T> | null
@@ -141,7 +141,6 @@ async function rewritePreparedTranscriptMessage<T>(
               });
             },
             beforeWrite() {},
-            async release() {},
           })
         : undefined,
     async run(worker, commit) {

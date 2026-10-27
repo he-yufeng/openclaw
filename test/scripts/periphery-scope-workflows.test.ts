@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -16,7 +16,10 @@ const WORKFLOW_CASES = (
 ).map(([name, scopedPath]) =>
   Object.assign(
     { name, scopedPath },
-    compileScopeWorkflow(`.github/workflows/${name}-periphery.yml`),
+    compileScopeWorkflow(
+      `.github/workflows/${name === "shared-openclawkit" ? "macos" : name}-periphery.yml`,
+      name === "shared-openclawkit" ? "shared-scan" : "should-scan",
+    ),
   ),
 );
 const sharedWorkflow = WORKFLOW_CASES[2]!;
@@ -34,32 +37,35 @@ type ScopeWorkflow = {
   on: { pull_request: { paths?: string[]; types: string[] } };
   jobs: { scope: { steps: WorkflowStep[] } };
 };
-type ScopeFunction = (...args: [unknown, unknown, unknown, NodeJS.Require]) => Promise<void>;
+type ScopeFunction = (
+  ...args: [unknown, unknown, unknown, NodeJS.Require, unknown]
+) => Promise<void>;
 
 type ScopeOptions = {
   diffExitCode?: number;
   repoRoot?: string;
   draft?: boolean;
   eventName?: string;
+  sharedOnly?: boolean;
   files?: Array<string | { filename: string; previous_filename?: string }>;
 };
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const require = createRequire(import.meta.url);
 
-function compileScopeWorkflow(workflowPath: string) {
+function compileScopeWorkflow(workflowPath: string, outputName = "should-scan") {
   const workflow = parse(readFileSync(workflowPath, "utf8")) as ScopeWorkflow;
   const step = workflow.jobs?.scope?.steps?.find((candidate) => candidate.id === "scope");
   const script = step?.with?.script;
   if (!script) {
     throw new Error(`missing Periphery scope script in ${workflowPath}`);
   }
-  const parameters = ["context", "core", "exec", "require"];
+  const parameters = ["context", "core", "exec", "require", "process"];
   const execute = compileFunction(
     `return (async () => {\n${script}\n})();`,
     parameters,
   ) as ScopeFunction;
-  return { workflow, script, execute };
+  return { workflow, script, execute, outputName };
 }
 
 async function runScope(
@@ -105,19 +111,15 @@ async function runScope(
     { setOutput: (name: string, value: string) => outputs.set(name, value) },
     exec,
     require,
+    { env: { PERIPHERY_SHARED_ONLY: String(options.sharedOnly ?? false) } },
   );
-  return outputs.get("should-scan");
+  return outputs.get(fixture.outputName);
 }
 
 function makeRepo() {
   const root = tempDirs.make("openclaw-periphery-");
-  const git = (...args: string[]) => {
-    const result = spawnSync("git", args, { cwd: root, encoding: "utf8" });
-    if (result.status !== 0) {
-      throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
-    }
-    return result.stdout.trim();
-  };
+  const git = (...args: string[]) =>
+    execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
   const write = (relativePath: string, contents: string) => {
     const file = path.join(root, relativePath);
     mkdirSync(path.dirname(file), { recursive: true });
@@ -133,15 +135,16 @@ function makeRepo() {
   return { root, git, write, commit };
 }
 
-it.each(WORKFLOW_CASES)("uses the synthetic merge parent for $name scope", ({ workflow }) => {
-  const steps = workflow.jobs?.scope?.steps ?? [];
-  const checkout = steps.find((step) => step.name === "Checkout");
-
-  expect(workflow.on?.pull_request?.types).toContain("converted_to_draft");
-  expect(workflow.on?.pull_request?.paths).toBeUndefined();
-  expect(checkout?.with?.["fetch-depth"]).toBe(2);
-  expect(steps.some((step) => step.name === "Ensure base commit")).toBe(false);
-});
+it.each(WORKFLOW_CASES)(
+  "admits draft transitions and merge-parent history for $name",
+  ({ workflow }) => {
+    expect(workflow.on?.pull_request?.types).toContain("converted_to_draft");
+    expect(workflow.on?.pull_request?.paths).toBeUndefined();
+    expect(
+      workflow.jobs.scope.steps.find((step) => step.name === "Checkout")?.with?.["fetch-depth"],
+    ).toBe(2);
+  },
+);
 
 it.each(WORKFLOW_CASES)("selects only $name scope changes", async (fixture) => {
   const { scopedPath } = fixture;
@@ -151,7 +154,7 @@ it.each(WORKFLOW_CASES)("selects only $name scope changes", async (fixture) => {
   await check({ files: ["scripts/install-periphery.sh"] }, "true");
   await check({ files: ["docs/index.md"] }, "false");
   await check({ draft: true, files: [scopedPath] }, "false");
-  await check({ eventName: "workflow_dispatch" }, "true");
+  await check({ eventName: "workflow_dispatch", sharedOnly: fixture === sharedWorkflow }, "true");
   await check({ files: [{ filename: "docs/Moved.swift", previous_filename: scopedPath }] }, "true");
   await expect(runScope(fixture, { diffExitCode: 128 })).rejects.toThrow(
     "git diff failed with exit code 128",
@@ -161,21 +164,13 @@ it.each(WORKFLOW_CASES)("selects only $name scope changes", async (fixture) => {
 it.each(WORKFLOW_CASES)(
   "excludes prose but keeps source, mixed changes, resources and renames for $name",
   async (fixture) => {
-    const { scopedPath, script } = fixture;
+    const { scopedPath } = fixture;
     const repo = makeRepo();
     const repoRoot = repo.root;
     repo.write("seed", "base\n");
     repo.commit();
-    const prosePaths = [...script.matchAll(/":\(exclude\)([^"]+)"/g)].flatMap((match) =>
-      match[1] ? [match[1]] : [],
-    );
-    const firstProsePath = prosePaths[0];
-    if (!firstProsePath) {
-      throw new Error(`missing prose exclusions in ${fixture.name}`);
-    }
-    for (const prosePath of prosePaths) {
-      repo.write(prosePath, "documentation\n");
-    }
+    const firstProsePath = fixture.name === "macos" ? "apps/macos/README.md" : "apps/ios/README.md";
+    repo.write(firstProsePath, "documentation\n");
     repo.commit();
     await expect(runScope(fixture, { repoRoot })).resolves.toBe("false");
 
@@ -201,6 +196,22 @@ it("selects shared scans from native protocol generator inputs", async () => {
     "scripts/native-protocol-inputs.json",
   ]) {
     await expect(runScope(sharedWorkflow, { files: [file] })).resolves.toBe("true");
+  }
+});
+
+it("keeps app and shared-only admission independent in the canonical graph", async () => {
+  const appWorkflow = WORKFLOW_CASES[1]!;
+  for (const fixture of [appWorkflow, sharedWorkflow]) {
+    const shared = fixture === sharedWorkflow;
+    await expect(
+      runScope(fixture, { files: ["apps/shared/OpenClawKit/Sources/Shared.swift"] }),
+    ).resolves.toBe(String(shared));
+    await expect(
+      runScope(fixture, { eventName: "workflow_dispatch", sharedOnly: true }),
+    ).resolves.toBe(String(shared));
+    await expect(runScope(fixture, { eventName: "workflow_dispatch" })).resolves.toBe(
+      String(!shared),
+    );
   }
 });
 

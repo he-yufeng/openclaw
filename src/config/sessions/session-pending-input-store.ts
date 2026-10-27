@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
+import { observeDiagnosticsTimelinePhases } from "../../infra/diagnostics-timeline.js";
 import { hasSqliteWorkerOutcomeUnknown } from "../../infra/sqlite-worker-contract.js";
 import { registerOpenClawAgentDatabaseAsyncResource } from "../../state/openclaw-agent-db-resources.js";
 import { runOpenClawAgentWriteTransaction } from "../../state/openclaw-agent-db.js";
@@ -24,6 +25,7 @@ import {
   readPendingInputMutationReceipt,
   type PendingInputCustodyGrant,
   type PendingInputMutation,
+  type PendingInputMutationReceipt,
   type PendingInputRead,
 } from "./session-pending-input-operations.types.js";
 import { captureSessionStoreReadTarget } from "./session-store-read-target.js";
@@ -45,6 +47,7 @@ export async function preparePendingInputStore(
   assertCurrent: () => void,
   lifecycleAdmission?: SessionInputLifecycleAdmission,
 ) {
+  using phase = observeDiagnosticsTimelinePhases("persist.stage.store.actor");
   const memoryOwner = captureSessionActorStorageOwner(scope, {
     assertCurrent,
     authorize: assertCurrent,
@@ -67,6 +70,7 @@ export async function preparePendingInputStore(
     env: captureSessionTranscriptStorageEnvironment(scope.env ?? process.env),
   };
   const inputActor = await getSessionInputActor(scope);
+  phase.mark("persist.stage.store.scope");
   if (lifecycleAdmission && !inputActor) {
     throw new Error("Restart resume requires the current input actor.");
   }
@@ -101,6 +105,7 @@ export async function preparePendingInputStore(
     throw new Error("Pending input changed its captured database owner");
   }
   const assertSource = readTarget.assertCurrent;
+  phase.mark("persist.stage.store.kernel");
   const { mutatePendingInput } = await import("./session-pending-input-operations.kernel.js");
   assertSource();
   let revoked = false;
@@ -270,7 +275,7 @@ export async function preparePendingInputStore(
               },
             };
             let expectedState: ReturnType<typeof buildRestartRecoveryExpectedState> | undefined;
-            let receipt: ReturnType<typeof readPendingInputMutationReceipt>;
+            let receipt: PendingInputMutationReceipt | undefined;
             const outcome = await runSessionActorCommand(
               inputActor.actor,
               authority,
@@ -295,10 +300,7 @@ export async function preparePendingInputStore(
                   authority,
                   {
                     committed(commit) {
-                      receipt = readPendingInputMutationReceipt(
-                        commit.value.pendingInputReceipt,
-                        input,
-                      );
+                      receipt = commit.value.pendingInputReceipt;
                       if (!receipt) {
                         throw new Error("Input actor omitted its committed custody receipt");
                       }
@@ -322,7 +324,6 @@ export async function preparePendingInputStore(
             return receipt;
           }
           let admitted: SessionWorkerReceiptAdmission | undefined;
-          const readReceipt = (facts: unknown) => readPendingInputMutationReceipt(facts, input);
           let committedFacts: PendingInputCustodyGrant | undefined;
           const checkGrant = (stage: "transaction" | "commit", facts: unknown) => {
             if (
@@ -345,7 +346,7 @@ export async function preparePendingInputStore(
                 const receipt = await settleSessionWorkerReceipt(
                   () => worker.execute({ type: "session.pendingInputs.mutate", input }),
                   () => admitted,
-                  readReceipt,
+                  readPendingInputMutationReceipt,
                   "Pending input has no confirmed native completion and commit receipt",
                   "Pending input native commitment is unknown; do not replay",
                 );
@@ -365,7 +366,7 @@ export async function preparePendingInputStore(
               if (
                 !isRecord(facts) ||
                 !isRecord(facts.publication) ||
-                !readReceipt(facts.publication.receipt)
+                !readPendingInputMutationReceipt(facts.publication.receipt)
               ) {
                 throw new Error("Pending input commit omitted its exact receipt");
               }

@@ -1,7 +1,5 @@
 import { Type } from "typebox";
 import { isAcpRuntimeSpawnAvailable } from "../../acp/runtime/availability.js";
-import { supportsThreadBindingSpawn } from "../../channels/conversation-resolution.js";
-import { resolveThreadBindingSpawnPolicy } from "../../channels/thread-bindings-policy.js";
 import { getRuntimeConfig } from "../../config/config.js";
 import { composeSessionSourceAssertion } from "../../config/sessions/session-source-authority.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -10,7 +8,11 @@ import {
   withExecRequestOwners,
 } from "../../infra/exec-request-context.js";
 import { resolveSnakeCaseParamKey } from "../../param-key.js";
-import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
+import {
+  isSubagentSessionKey,
+  normalizeAgentId,
+  parseAgentSessionKey,
+} from "../../routing/session-key.js";
 import { createLazyPromise } from "../../shared/lazy-promise.js";
 import {
   mergeAcceptedSessionSpawnsForRun,
@@ -41,6 +43,7 @@ import {
 import {
   bindCollectorSpawnTool,
   captureCollectorSpawnGuard,
+  captureCollectorPluginContext,
 } from "../subagents/swarm/swarm-collector-capability.js";
 import { resolveSwarmConfig } from "../subagents/swarm/swarm-config.js";
 import {
@@ -73,7 +76,9 @@ import {
   PlacedSessionsSpawnSchema,
   PLACED_SESSIONS_SPAWN_DESCRIPTION,
 } from "./sessions-placement-tool-contract.js";
+import { describeSessionsSpawnAgentId } from "./sessions-spawn-agent-id.js";
 import type { SessionsSpawnToolOptions } from "./sessions-spawn-options.js";
+import { resolveSessionsSpawnThreadAvailability } from "./sessions-spawn-thread-availability.js";
 import { maybeSpawnVisibleSession } from "./sessions-spawn-visible.js";
 import { SESSIONS_SPAWN_SESSION_SCHEMA } from "./sessions-spawn-visible.schema.js";
 
@@ -118,31 +123,6 @@ function recordAcceptedSessionSpawn(
   });
 }
 
-function resolveSessionsSpawnThreadAvailability(opts?: {
-  config?: OpenClawConfig;
-  agentChannel?: string;
-  agentAccountId?: string;
-}) {
-  const channel = opts?.agentChannel;
-  const cfg = opts?.config;
-  if (!channel || !cfg || !supportsThreadBindingSpawn(channel)) {
-    return { subagent: false, acp: false };
-  }
-  const resolve = (kind: "subagent" | "acp") => {
-    const policy = resolveThreadBindingSpawnPolicy({
-      cfg,
-      channel,
-      accountId: opts?.agentAccountId,
-      kind,
-    });
-    return policy.enabled && policy.spawnEnabled;
-  };
-  return {
-    subagent: resolve("subagent"),
-    acp: resolve("acp"),
-  };
-}
-
 const createSessionsSpawnToolSchema = createCachedToolSchema({
   build: buildSessionsSpawnToolSchema,
   key: (params) =>
@@ -158,7 +138,7 @@ function buildSessionsSpawnToolSchema(params: {
   const spawnModes = params.threadAvailable ? SUBAGENT_SPAWN_MODES : (["run"] as const);
   const schema = {
     task: Type.String(),
-    user: requesterProfileSchema(),
+    user: requesterProfileSchema({ defaultToTurnOwner: true }),
     taskName: Type.Optional(
       Type.String({
         description:
@@ -189,7 +169,7 @@ function buildSessionsSpawnToolSchema(params: {
     cwd: Type.Optional(
       Type.String({
         description:
-          "Child working directory. Visible paths outside configured agent workspaces require operator.admin. Mutually exclusive with projectId/projectGitUrl. With no source selector and worktree=true: inherit the same-agent parent managed repository; otherwise use the target agent workspace.",
+          "Child working directory. Workspace-contained file tools (apply_patch/file writes) resolve and contain paths against cwd; set cwd for edits outside the agent workspace. Visible paths outside configured agent workspaces require operator.admin. Mutually exclusive with projectId/projectGitUrl. With no source selector and worktree=true: inherit the same-agent parent managed repository; otherwise use the target agent workspace.",
       }),
     ),
     ...(params.threadAvailable
@@ -232,12 +212,18 @@ function buildSessionsSpawnToolSchema(params: {
         description: "Light bootstrap; subagent only; unavailable with visible=true.",
       }),
     ),
+    blind: Type.Optional(
+      Type.Boolean({
+        description:
+          'Blind trial: child prompt omits its model, session ids and workspace path. Hidden subagent, context="isolated".',
+      }),
+    ),
     ...(params.swarmEnabled
       ? {
           collect: Type.Optional(
             Type.Boolean({
               description:
-                "Swarm collector child for large parallel fan-out, not one or a few children; no completion notification.",
+                "Swarm collector child for large parallel fan-out or required in-turn result collection; collect with agents_wait, no completion notification.",
             }),
           ),
           outputSchema: Type.Optional(
@@ -342,6 +328,14 @@ export function createSessionsSpawnTool(
     requesterAgentId,
     sandboxed: opts?.sandboxed,
   });
+  const agentIdGuidance = describeSessionsSpawnAgentId({
+    cfg: effectiveConfig,
+    requesterAgentId,
+    requesterIsSubagent: opts?.requesterIsSubagent ?? isSubagentSessionKey(opts?.agentSessionKey),
+    acpAvailable,
+    collectDefaultAgentId: swarmConfig.enabled ? swarmConfig.defaultAgentId : undefined,
+    spawnContext: opts,
+  });
   const parameters = opts?.workerPlacement
     ? PlacedSessionsSpawnSchema
     : createSessionsSpawnToolSchema({
@@ -365,6 +359,7 @@ export function createSessionsSpawnTool(
           swarmEnabled: swarmConfig.enabled,
           sessionToolsVisibility,
           spawnRestricted: restrictToSpawned,
+          agentIdGuidance,
         }),
     parameters,
     execute: wrapGatewayPersonalToolExecution(async (_toolCallId, args, signal) =>
@@ -455,6 +450,9 @@ export function createSessionsSpawnTool(
         }
         if (collect && runtime === "acp") {
           throw new ToolInputError('sessions_spawn collect=true supports runtime="subagent" only.');
+        }
+        if (params.blind === true && (runtime === "acp" || params.visible === true)) {
+          throw new ToolInputError('blind=true requires a hidden runtime="subagent" child.');
         }
         const requestedAgentId = readToolStringParam(params, "agentId");
         const requesterPolicyError = resolveSenderRestrictedSpawnError({
@@ -583,6 +581,7 @@ export function createSessionsSpawnTool(
           onSpawnEffectsStart,
           agentSessionKey: opts?.agentSessionKey,
           senderIsOwner: opts?.senderIsOwner,
+          gitContributorProfileId: opts?.gitContributorProfileId,
           expectedParentSessionId: opts?.expectedParentSessionId,
           requesterTurnRunId: opts?.requesterTurnRunId,
           completionOwnerKey: opts?.completionOwnerKey,
@@ -674,6 +673,7 @@ export function createSessionsSpawnTool(
                 : undefined,
             context,
             lightContext,
+            ...(params.blind === true ? { blind: true } : {}),
             completionTarget,
             attachments,
             attachMountPath:
@@ -685,7 +685,9 @@ export function createSessionsSpawnTool(
             withExecRequestOwners(
               {
                 ...inheritedSpawnContext(),
+                signal: executionSignal,
                 requesterThinkingLevel: opts?.requesterThinkingLevel,
+                ...(collect ? captureCollectorPluginContext(tool, _toolCallId) : {}),
                 requesterThinkingExplicit,
                 requesterModel: opts?.requesterModel,
                 currentMessagingTarget: opts?.currentMessagingTarget ?? opts?.currentChannelId,

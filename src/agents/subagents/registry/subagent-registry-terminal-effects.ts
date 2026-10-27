@@ -116,7 +116,7 @@ export async function completeTerminalEffects(
   const isProvisionalKill = entry.killReconciliation !== undefined;
 
   // Duplicate receipts drain cleanup without replaying best-effort timing writes.
-  if (!suppressSessionEffects && (mutated || completeParams.recoverInterrupted === true)) {
+  if (!suppressSessionEffects && (mutated || completeParams.recoverInterrupted !== undefined)) {
     try {
       const assertSessionEffectsOwnerCurrent = () => {
         if (!isCurrentSessionEffectsOwner()) {
@@ -156,7 +156,7 @@ export async function completeTerminalEffects(
   // unchanged row still needs its first session-status and progress events.
   const shouldPublishTerminalStatus =
     mutated ||
-    (completeParams.recoverInterrupted === true &&
+    (completeParams.recoverInterrupted !== undefined &&
       !isProvisionalKill &&
       !context.progressEndedEntries.has(getSubagentRunRuntimeKey(entry)));
   if (
@@ -383,8 +383,11 @@ export async function completeTerminalEffects(
   }
 
   if (isProvisionalKill) {
-    // Browser and MCP resources can close immediately, but completion delivery
-    // waits for the provider result or the killed tombstone reconciliation.
+    // Browser and MCP resources can close immediately; completion delivery waits
+    // for the kill's confirmation once the run's controller operation settles.
+    if (isCurrentTerminalCallback()) {
+      params.confirmProvisionalKill(entry);
+    }
     return;
   }
 

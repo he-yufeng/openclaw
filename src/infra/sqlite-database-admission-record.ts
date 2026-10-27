@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import fs, { type BigIntStats } from "node:fs";
 import path from "node:path";
 import { setEnvironmentData, threadId } from "node:worker_threads";
+import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import type { SqliteCleanCloseSealRefusal } from "./sqlite-clean-close-seal.js";
 import { SQLITE_DATABASE_ADMISSIONS_KEY } from "./sqlite-database-admission-key.js";
 import {
   isSoleDatabaseFileDescriptor,
@@ -37,15 +39,15 @@ export type AdmissionFactValue = {
 
 export function readSqliteDatabaseAdmissionFact<T>(
   fact: AdmissionFactValue,
-  key: SqliteDatabaseAdmissionKey<T>,
+  key: SqliteDatabaseFactKey<T>,
 ): T | undefined {
-  fact[decodedValue] ??= { value: key.read(fact.value) };
-  // SAFETY: A private key name identifies one value type, decoded by that key at admission.
+  fact[decodedValue] ??= { value: key.read ? key.read(fact.value) : fact.value };
+  // SAFETY: Each key names its typed publisher's value; boundary keys retain their decoder.
   return fact[decodedValue].value as T | undefined;
 }
 
 export function admitSqliteDatabaseFactValue<T>(
-  key: SqliteDatabaseAdmissionKey<T>,
+  key: SqliteDatabaseFactKey<T>,
   value: T,
 ): AdmissionFactValue {
   const fact: AdmissionFactValue = { value };
@@ -66,9 +68,66 @@ export type StagedAdmissionFact = AdmissionFactValue &
   };
 export type ScopedWriteRevision = {
   identity: string;
-  // The revision and retirement flag share custody across all admission snapshots.
+  // Revision, retirement, and active effect pins share custody across admission snapshots.
   state: Int32Array<SharedArrayBuffer>;
 };
+
+const MAX_WRITE_SCOPE_BYTES = 1024 * 1024;
+const scopeRetention = resolveGlobalSingleton(
+  Symbol.for("openclaw.sqliteDatabaseWriteScopeRetention"),
+  () => new WeakMap<Map<string, ScopedWriteRevision>, { bytes: number; retired: Set<string> }>(),
+);
+// Account for UTF-16 keys plus the UUID, shared cell, and map/snapshot entries.
+const writeScopeBytes = (key: string) => key.length * 2 + 256;
+
+/** Idle receipts cache freshness; active effect guards retain their exact shared cells. */
+export function retainSqliteDatabaseWriteScope(
+  record: Admission,
+  key: string,
+  revision: ScopedWriteRevision,
+): void {
+  const scopes = record.writeScopes;
+  let retention = scopeRetention.get(scopes);
+  if (!retention) {
+    retention = {
+      bytes: [...scopes.keys()].reduce((bytes, scopeKey) => bytes + writeScopeBytes(scopeKey), 0),
+      retired: new Set(),
+    };
+    scopeRetention.set(scopes, retention);
+  }
+  if (!scopes.delete(key)) {
+    retention.bytes += writeScopeBytes(key);
+  }
+  scopes.set(key, revision);
+  pruneSqliteDatabaseWriteScopes(record);
+}
+
+/** Active effect scopes may exceed the idle budget until their final release. */
+export function pruneSqliteDatabaseWriteScopes(record: Admission): boolean {
+  const retention = scopeRetention.get(record.writeScopes)!;
+  if (retention.bytes <= MAX_WRITE_SCOPE_BYTES) {
+    return false;
+  }
+  let changed = false;
+  for (const [oldest, value] of record.writeScopes) {
+    // Claim an unpinned cell before another isolate can retain it for an effect.
+    const pins = Atomics.compareExchange(value.state, 2, 0, -1);
+    if (pins > 0 && Atomics.load(value.state, 1) === 0) {
+      continue;
+    }
+    Atomics.store(value.state, 1, 1);
+    // A writer missing this cell must fence receipts registered after its dispatch.
+    advanceSqliteDatabaseGeneration(record, "writeScopeRevision");
+    record.writeScopes.delete(oldest);
+    retention.bytes -= writeScopeBytes(oldest);
+    retention.retired.add(oldest);
+    changed = true;
+    if (retention.bytes <= MAX_WRITE_SCOPE_BYTES) {
+      break;
+    }
+  }
+  return changed;
+}
 
 export type Admission = {
   identity: string;
@@ -78,6 +137,8 @@ export type Admission = {
   descriptorOwner: number;
   generationId: string;
   generation: SharedArrayBuffer;
+  /** First-load diagnostic, shared with workers without rereading the seal. */
+  cleanCloseRefusal?: SqliteCleanCloseSealRefusal;
   /** Last complete host snapshot; relays preserve this value without advancing it. */
   hostRevision?: number;
   writeScopes: Map<string, ScopedWriteRevision>;
@@ -87,6 +148,7 @@ export type Admission = {
   facts: Map<string, AdmissionFact>;
 };
 export type SqliteDatabaseAdmissions = Admission[];
+type AdmissionPublications = Map<Admission, string[] | undefined>;
 export type SqliteDatabaseAdmissionKey<T> = {
   name: string;
   read(this: void, value: unknown): T | undefined;
@@ -100,6 +162,11 @@ export type SqliteDatabaseAdmissionExchange = (
   location?: string,
   create?: boolean,
 ) => SqliteDatabaseAdmissions;
+
+/** Internal typed publications need no decoder; public/custom keys retain their read contract. */
+export type SqliteDatabaseFactKey<T> = Omit<SqliteDatabaseAdmissionKey<T>, "read"> & {
+  read?: SqliteDatabaseAdmissionKey<T>["read"];
+};
 
 export function readSqliteDatabaseAdmissions(value: unknown): SqliteDatabaseAdmissions | undefined {
   // SAFETY: These facts come only from this process's paired worker and bootstrap transports.
@@ -210,15 +277,18 @@ function snapshotWriteScopes(
   keys?: readonly string[],
 ): WriteScopeBuckets {
   let buckets = previous;
-  const visit = (value: ScopedWriteRevision, key: string) => {
+  const retention = scopeRetention.get(current);
+  const visit = (value: ScopedWriteRevision | undefined, key: string) => {
     let hash = 0;
     for (let index = 0; index < key.length; index++) {
       hash = (hash * 31 + key.charCodeAt(index)) | 0;
     }
     const index = hash & (EMPTY_WRITE_SCOPE_BUCKETS.length - 1);
-    const retired = Atomics.load(value.state, 1) !== 0;
+    const retired = !value || Atomics.load(value.state, 1) !== 0;
     if (retired) {
-      current.delete(key);
+      if (current.delete(key) && retention) {
+        retention.bytes -= writeScopeBytes(key);
+      }
     }
     if (retired ? !previous[index]!.has(key) : previous[index]!.get(key) === value) {
       return;
@@ -232,19 +302,20 @@ function snapshotWriteScopes(
     if (retired) {
       buckets[index]!.delete(key);
     } else {
-      buckets[index]!.set(key, value);
+      buckets[index]!.set(key, value!);
     }
   };
   if (keys) {
     for (const key of keys) {
-      const value = current.get(key);
-      if (value) {
-        visit(value, key);
-      }
+      visit(current.get(key), key);
     }
   } else {
     current.forEach(visit);
   }
+  for (const key of retention?.retired ?? []) {
+    visit(current.get(key), key);
+  }
+  retention?.retired.clear();
   return buckets;
 }
 
@@ -292,10 +363,8 @@ export class SqliteDatabaseAdmissionRegistry {
   private exchangeCursor = createSqliteDatabaseAdmissionCursor();
   private readonly locations = new Map<string, string>();
   private readonly published = new Map<string, PublishedAdmission>();
-  readonly descriptors = new Map<
-    string,
-    { descriptor: number; facts: Map<string, AdmissionFact> }
-  >();
+  private readonly scopeSweeps = new WeakMap<Admission, number>();
+  readonly descriptors = new Map<string, Pick<Admission, "descriptor" | "facts">>();
   private revision = 0;
   private retainProcessFacts = true;
 
@@ -354,6 +423,7 @@ export class SqliteDatabaseAdmissionRegistry {
   }
 
   releaseWorker(owner: number): void {
+    const changedRecords: AdmissionPublications = new Map();
     for (const record of this.records.values()) {
       const references = owner > 0 ? record.references.get(owner) : undefined;
       if (!references) {
@@ -362,8 +432,11 @@ export class SqliteDatabaseAdmissionRegistry {
       // Zero permits a live worker to reopen; negative cells cannot be revived by old snapshots.
       Atomics.store(new Int32Array(references), 0, -1);
       this.retireUnreferenced(record);
+      changedRecords.set(record, undefined);
     }
-    this.publish();
+    if (changedRecords.size > 0) {
+      this.publish(changedRecords);
+    }
   }
 
   observeLocation(location: string, identity: string): void {
@@ -452,12 +525,9 @@ export class SqliteDatabaseAdmissionRegistry {
     return true;
   }
 
-  publish(selected?: Admission | Set<Admission>, scopeKeys?: readonly string[]): void {
-    if (
-      selected &&
-      !(selected instanceof Set) &&
-      this.records.get(selected.identity) !== selected
-    ) {
+  publish(selected?: Admission | AdmissionPublications, scopeKeys?: readonly string[]): void {
+    const isBatch = selected instanceof Map;
+    if (selected && !isBatch && this.records.get(selected.identity) !== selected) {
       return;
     }
     // Another isolate can retire shared custody. Reclaim it at publication, not on every request.
@@ -469,10 +539,10 @@ export class SqliteDatabaseAdmissionRegistry {
         this.forget(current.identity);
         continue;
       }
-      if (selected && selected !== current && !(selected instanceof Set && selected.has(current))) {
+      if (selected && selected !== current && !(isBatch && selected.has(current))) {
         continue;
       }
-      let changed = selected === current || selected instanceof Set;
+      let changed = selected === current || isBatch;
       for (const [owner, references] of current.references) {
         if (Atomics.load(new Int32Array(references), 0) < 0) {
           current.references.delete(owner);
@@ -480,12 +550,18 @@ export class SqliteDatabaseAdmissionRegistry {
         }
       }
       const previous = this.published.get(current.identity);
-      // Discovery already knows its keys; general publication also sweeps remote retirements.
+      const scopeRevision = readSqliteDatabaseGeneration(current, "writeScopeRevision");
+      const keys = previous && selected ? (isBatch ? selected.get(current) : scopeKeys) : undefined;
+      const sweep = keys === undefined && this.scopeSweeps.get(current) !== scopeRevision;
       const writeScopes = snapshotWriteScopes(
         current.writeScopes,
         previous?.writeScopes,
-        previous && selected === current ? scopeKeys : undefined,
+        keys ?? (sweep ? undefined : []),
       );
+      // Keyed publications can acknowledge a revision without sweeping remote retirements.
+      if (sweep) {
+        this.scopeSweeps.set(current, scopeRevision);
+      }
       changed ||= writeScopes !== previous?.writeScopes;
       if (!changed) {
         continue;
@@ -595,12 +671,12 @@ export class SqliteDatabaseAdmissionRegistry {
   }
 
   install(admissions: SqliteDatabaseAdmissions): boolean {
-    const changedRecords = new Set<Admission>();
+    const changedRecords: AdmissionPublications = new Map();
     for (const incoming of admissions) {
       let record = this.records.get(incoming.identity);
       if (incoming.descriptorOwner !== 0 || isSqliteDatabaseAdmissionRetired(incoming)) {
         if (record && isSqliteDatabaseAdmissionRetired(record)) {
-          changedRecords.add(record);
+          changedRecords.set(record, undefined);
         }
         continue;
       }
@@ -612,7 +688,7 @@ export class SqliteDatabaseAdmissionRegistry {
         record = {
           ...incoming,
           facts: new Map(incoming.facts),
-          writeScopes: new Map(incoming.writeScopes),
+          writeScopes: new Map(),
           references: new Map(incoming.references),
           hostRevision: undefined,
         };
@@ -623,6 +699,10 @@ export class SqliteDatabaseAdmissionRegistry {
         // Only the host creates a generation; unrelated revocation cells cannot certify its facts.
         continue;
       }
+      if (!record.cleanCloseRefusal && incoming.cleanCloseRefusal) {
+        record.cleanCloseRefusal = incoming.cleanCloseRefusal;
+        changed = true;
+      }
       for (const [key, fact] of incoming.facts) {
         if (
           isSqliteDatabaseAdmissionFactCurrent(incoming, fact) &&
@@ -632,6 +712,7 @@ export class SqliteDatabaseAdmissionRegistry {
           changed = true;
         }
       }
+      const scopeKeys = changedRecords.get(record) ?? [];
       for (const [key, revision] of incoming.writeScopes) {
         if (Atomics.load(revision.state, 1) !== 0) {
           continue;
@@ -645,9 +726,14 @@ export class SqliteDatabaseAdmissionRegistry {
           continue;
         }
         if (threadId === 0) {
-          advanceSqliteDatabaseGeneration(record, "writeScopeRevision");
+          const previousRevision = advanceSqliteDatabaseGeneration(record, "writeScopeRevision");
+          // The keyed publication covers this addition, never an unseen peer's retirement.
+          if (this.scopeSweeps.get(record) === previousRevision) {
+            this.scopeSweeps.set(record, (previousRevision + 1) | 0);
+          }
         }
-        record.writeScopes.set(key, revision);
+        retainSqliteDatabaseWriteScope(record, key, revision);
+        scopeKeys.push(key);
         changed = true;
       }
       const writeScopeRevision = readSqliteDatabaseGeneration(record, "writeScopeRevision");
@@ -673,13 +759,13 @@ export class SqliteDatabaseAdmissionRegistry {
       // Only the host has every borrower's reference cell; worker snapshots can omit later peers.
       this.retireUnreferenced(record);
       if (changed || isSqliteDatabaseAdmissionRetired(record)) {
-        changedRecords.add(record);
+        // Reuse the admitted snapshot; only imported cells need keyed publication.
+        changedRecords.set(record, scopeKeys.length > 0 ? scopeKeys : undefined);
       }
     }
     if (changedRecords.size > 0) {
       this.publish(changedRecords);
-      return true;
     }
-    return false;
+    return changedRecords.size > 0;
   }
 }

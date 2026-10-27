@@ -18,7 +18,7 @@ import {
 } from "openclaw/plugin-sdk/diagnostic-runtime";
 import { emitInternalDiagnosticEventForTest } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { expect, test } from "vitest";
-import { installRealOtelSdkTestHarness } from "./service.real-sdk.test-support.js";
+import { createTestMeter, installRealOtelSdkTestHarness } from "./service.real-sdk.test-support.js";
 import {
   startOtelService,
   startOtelServiceWithHostUsage,
@@ -34,10 +34,7 @@ function spanNamed(spans: ReadableSpan[], name: string) {
 }
 
 test("exports untimed response observations on their trusted turn without counting usage twice", async () => {
-  const reader = new PeriodicExportingMetricReader({
-    exporter: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
-  });
-  const meterProvider = new MeterProvider({ readers: [reader] });
+  const { reader, meterProvider } = createTestMeter();
   metrics.disable();
   expect(metrics.setGlobalMeterProvider(meterProvider)).toBe(true);
   try {
@@ -138,10 +135,17 @@ test("keeps runtime phase parents explicit when observations arrive under anothe
     startedAt: Date.now() - 25,
     durationMs: 25,
   };
+  const providerEndedAt = Date.now() - 1_000;
   try {
     await context.with(trace.setSpan(context.active(), unrelated), async () => {
       await Promise.resolve();
-      emit({ ...phase, name: "sessions.catalog.list.provider", trace: requestTrace });
+      emit({
+        ...phase,
+        name: "sessions.catalog.list.provider",
+        trace: requestTrace,
+        startedAt: providerEndedAt - 25,
+        endedAt: providerEndedAt,
+      });
       emit({
         ...phase,
         name: "sessions.catalog.list.planning",
@@ -168,6 +172,11 @@ test("keeps runtime phase parents explicit when observations arrive under anothe
     const startup = spans.find((span) => span.attributes["openclaw.phase"] === "startup.fixture")!;
     expect(provider.parentSpanContext?.spanId).toBe(caller.spanContext().spanId);
     expect(provider.spanContext().traceId).toBe(caller.spanContext().traceId);
+    expect(provider.endTime).toEqual([
+      Math.floor(providerEndedAt / 1_000),
+      (providerEndedAt % 1_000) * 1_000_000,
+    ]);
+    expect(provider.duration).toEqual([0, 25_000_000]);
     expect(planning.parentSpanContext).toBeUndefined();
     expect(planning.spanContext().traceId).not.toBe(unrelated.spanContext().traceId);
     expect(planning.attributes["openclaw.phase.detail.threadCpuMs"]).toBe(1.25);
@@ -184,21 +193,20 @@ test("keeps runtime phase parents explicit when observations arrive under anothe
 });
 
 test.each([
+  { traces: true, metricsEnabled: true },
   { traces: false, metricsEnabled: true },
   { traces: true, metricsEnabled: false },
 ])(
   "honors preloaded signal toggles (traces=$traces metrics=$metricsEnabled)",
   async ({ traces, metricsEnabled }) => {
-    const reader = new PeriodicExportingMetricReader({
-      exporter: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
-    });
-    const meterProvider = new MeterProvider({ readers: [reader] });
+    const { reader, meterProvider } = createTestMeter();
     try {
       metrics.disable();
       expect(metrics.setGlobalMeterProvider(meterProvider)).toBe(true);
       let deliveredPhases = 0;
       let deliveredWebSocketMetrics = 0;
       let deliveredRetentionMetrics = 0;
+      let deliveredWorkerRequests = 0;
       await startOtelService({
         traces,
         metrics: metricsEnabled,
@@ -217,6 +225,9 @@ test.each([
                 if (event.type === "sessions.list.retention") {
                   deliveredRetentionMetrics++;
                 }
+                if (event.type === "worker.request") {
+                  deliveredWorkerRequests++;
+                }
                 listener(event, metadata, privateData);
               }, filter);
             },
@@ -234,6 +245,14 @@ test.each([
       emit({ type: "gateway.ws.connections", operators: 1 });
       emit({ type: "sessions.list.retention", views: 3, refs: 17, estimatedBytes: 3_504 });
       emit({
+        type: "worker.request",
+        kind: "gitOperations",
+        requestClass: "task",
+        phase: "completed",
+        queueDepth: 0,
+        durationMs: 1,
+      });
+      emit({
         type: "model.usage",
         provider: "openai",
         model: "gpt-5.4",
@@ -250,6 +269,7 @@ test.each([
       expect(deliveredPhases).toBe(traces ? 1 : 0);
       expect(deliveredWebSocketMetrics).toBe(metricsEnabled ? 2 : 0);
       expect(deliveredRetentionMetrics).toBe(metricsEnabled ? 1 : 0);
+      expect(deliveredWorkerRequests).toBe(0);
       for (const name of [
         "openclaw.gateway.rpc.response",
         "openclaw.model.usage",
@@ -335,121 +355,8 @@ test("keeps parentless Gateway RPC spans out of unrelated ambient OpenTelemetry 
   }
 });
 
-test("exports trusted WebSocket event totals and the current operator socket count", async () => {
-  const reader = new PeriodicExportingMetricReader({
-    exporter: new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE),
-  });
-  const meterProvider = new MeterProvider({ readers: [reader] });
-  metrics.disable();
-  metrics.setGlobalMeterProvider(meterProvider);
-  const { service, ctx } = await startOtelService({ metrics: true });
-  try {
-    emit({ type: "gateway.ws.connections", operators: 2 });
-    emit({ type: "gateway.ws.event", event: "chat", count: 2, bytes: 256 });
-    emit({ type: "gateway.ws.event", event: "chat", count: 1, bytes: 128 });
-    emit({ type: "gateway.ws.event", event: "other", count: 1, bytes: 64 });
-    emit({ type: "gateway.ws.connections", operators: 0 });
-    for (const emitUntrusted of [emitDiagnosticEvent, emitInternalDiagnosticEventForTest]) {
-      emitUntrusted({
-        type: "gateway.ws.event",
-        event: "private-untrusted",
-        count: 99,
-        bytes: 999,
-      });
-      emitUntrusted({ type: "gateway.ws.connections", operators: 99 });
-    }
-    for (const [event, reason] of [
-      ["sessions.changed", "agent.run.started"],
-      ["session.message", "assistant"],
-    ] as const) {
-      for (const delivery of ["subscribed", "roster"] as const) {
-        const observation = {
-          type: "gateway.ws.event",
-          event,
-          count: 2,
-          bytes: 256,
-          sessionEvent: { reason, delivery },
-        } as const;
-        emit(observation);
-        emit({ ...observation, count: 1, bytes: 128 });
-        emitDiagnosticEvent(observation);
-      }
-    }
-    await waitForDiagnosticEventsDrained();
-
-    const { resourceMetrics, errors } = await reader.collect();
-    expect(errors).toEqual([]);
-    const wsMetrics = resourceMetrics.scopeMetrics
-      .flatMap((scope) => scope.metrics)
-      .filter((metric) => metric.descriptor.name.startsWith("openclaw.gateway.ws."));
-    expect(
-      Object.fromEntries(
-        wsMetrics.map((metric) => [
-          metric.descriptor.name,
-          {
-            unit: metric.descriptor.unit,
-            points: metric.dataPoints.map(({ attributes, value }) => ({ attributes, value })),
-          },
-        ]),
-      ),
-    ).toEqual({
-      ...Object.fromEntries(
-        [
-          ["openclaw.gateway.ws.session_event_frames", "1", 3],
-          ["openclaw.gateway.ws.session_event_bytes", "By", 384],
-        ].map(([name, unit, value]) => [
-          name,
-          {
-            unit,
-            points: [
-              ["sessions.changed", "agent.run.started"],
-              ["session.message", "assistant"],
-            ].flatMap(([event, reason]) =>
-              ["subscribed", "roster"].map((delivery) => ({
-                attributes: {
-                  "openclaw.gateway.ws.event": event,
-                  "openclaw.gateway.ws.reason": reason,
-                  "openclaw.gateway.ws.delivery": delivery,
-                },
-                value,
-              })),
-            ),
-          },
-        ]),
-      ),
-      "openclaw.gateway.ws.events": {
-        unit: "1",
-        points: [
-          { attributes: { "openclaw.gateway.ws.event": "chat" }, value: 3 },
-          { attributes: { "openclaw.gateway.ws.event": "other" }, value: 1 },
-          { attributes: { "openclaw.gateway.ws.event": "sessions.changed" }, value: 6 },
-          { attributes: { "openclaw.gateway.ws.event": "session.message" }, value: 6 },
-        ],
-      },
-      "openclaw.gateway.ws.event_bytes": {
-        unit: "By",
-        points: [
-          { attributes: { "openclaw.gateway.ws.event": "chat" }, value: 384 },
-          { attributes: { "openclaw.gateway.ws.event": "other" }, value: 64 },
-          { attributes: { "openclaw.gateway.ws.event": "sessions.changed" }, value: 768 },
-          { attributes: { "openclaw.gateway.ws.event": "session.message" }, value: 768 },
-        ],
-      },
-      "openclaw.gateway.ws.operator_connections": {
-        unit: "1",
-        points: [{ attributes: {}, value: 0 }],
-      },
-    });
-  } finally {
-    await service.stop?.(ctx);
-    await meterProvider.shutdown();
-  }
-});
-
 test("exports Gateway RPC phase metrics with real SDK aggregation and upstream trace parents", async () => {
-  const metricExporter = new InMemoryMetricExporter(AggregationTemporality.CUMULATIVE);
-  const reader = new PeriodicExportingMetricReader({ exporter: metricExporter });
-  const meterProvider = new MeterProvider({ readers: [reader] });
+  const { reader, meterProvider } = createTestMeter();
   metrics.disable();
   metrics.setGlobalMeterProvider(meterProvider);
   const { service, ctx } = await startOtelService({ traces: true, metrics: true });

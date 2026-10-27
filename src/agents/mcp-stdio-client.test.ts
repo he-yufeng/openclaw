@@ -1,5 +1,4 @@
-import { ReadBuffer } from "@modelcontextprotocol/sdk/shared/stdio.js";
-import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { ReadBuffer, type JSONRPCMessage } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { createMcpStdioClient, type McpStdioClient } from "./mcp-stdio-client.js";
@@ -155,6 +154,29 @@ describe("createMcpStdioClient", () => {
       message: "unavailable: proxy write failed",
       cause: failure,
     });
+    expectRetired(fixture);
+  });
+
+  it.each([
+    {
+      name: "keeps complete characters at the 32KiB tail boundary",
+      output: Buffer.from("你".repeat(20000)),
+      expected: /^unavailable: proxy exited \(1\): 你+$/,
+    },
+    {
+      name: "preserves malformed bytes when stderr was not truncated",
+      output: Buffer.from([0x80, 0x61]),
+      expected: /^unavailable: proxy exited \(1\): �a$/,
+    },
+  ])("$name", async ({ output, expected }) => {
+    const fixture = createFixture();
+    const { client, root, stderr, requested } = fixture;
+    const pending = client.request("tools/call", {}, { timeoutMs: 1000 });
+    const rejected = expect(pending).rejects.toThrow(expected);
+    await requested;
+    stderr.write(output);
+    root.resolve({ code: 1, signal: null });
+    await rejected;
     expectRetired(fixture);
   });
 });

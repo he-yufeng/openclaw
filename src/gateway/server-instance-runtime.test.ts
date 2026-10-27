@@ -11,7 +11,9 @@ import {
   stageActivePluginRegistry,
 } from "../plugins/runtime.js";
 import { getActiveGatewayRootWorkCount } from "../process/gateway-work-admission.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { trackAsyncWork } from "../shared/async-work-scope.js";
+import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import { createChannelTestPluginBase, createTestRegistry } from "../test-utils/channel-plugins.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 // First dispatch lazily loads these modules; keep cold compilation outside the test deadline.
@@ -24,6 +26,8 @@ import { createGatewayInstanceRuntime } from "./server-instance-runtime.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./server-methods/types.js";
 import { createSyntheticPluginRuntimeClient } from "./server-plugin-runtime-client.js";
 import { getGatewayRecoveryRuntime } from "./server-recovery-runtime-context.js";
+import { createRpcSourceForTest, claimRpcSourceForTest } from "./test-helpers.rpc-source.js";
+import { createWorkerSessionPlacementStore } from "./worker-environments/placement-store.js";
 
 function createContext(): GatewayRequestContext {
   return {
@@ -31,8 +35,6 @@ function createContext(): GatewayRequestContext {
     deps: {},
     getRuntimeConfig: () => ({}),
     logGateway: { warn: vi.fn(), error: vi.fn() },
-    chatAbortControllers: new Map(),
-    chatQueuedTurns: new Map(),
     dedupe: new Map(),
   } as unknown as GatewayRequestContext;
 }
@@ -81,6 +83,43 @@ function approvalRequest(id: string, request = {}) {
 }
 
 const unavailable = "Gateway instance dispatch unavailable";
+
+it("retains only the exact failed placement until its generation or Gateway changes", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const placements = createWorkerSessionPlacementStore({ database: openOpenClawStateDatabase() });
+    const target = {
+      sessionId: "failed-session",
+      sessionKey: "agent:main:dashboard:failed-placement",
+      agentId: "main",
+    };
+    const context = createContext();
+    context.workerSessionPlacementService = placements;
+    const runtime = createRuntime({ context });
+    const request = { ...target, profileId: "synthetic", executionMode: "worker-turn" as const };
+    const requested = await placements.startDispatch(request);
+    const failure = await placements.fail({
+      sessionId: target.sessionId,
+      expectedGeneration: requested.generation,
+      recoveryError: "Synthetic worker setup failure",
+    });
+    await expect(
+      runtime.recovery.prepareFailedWorkerPlacement({ ...target, agentId: "other" }),
+    ).resolves.toBeUndefined();
+    const prepared = await runtime.recovery.prepareFailedWorkerPlacement(target);
+    expect(prepared?.reason).toContain(failure.recoveryError);
+    expect(prepared?.reason).toContain("restart the worker");
+    expect(prepared?.isCurrent()).toBe(true);
+    await placements.startDispatch(request);
+    expect(prepared?.isCurrent()).toBe(false);
+    prepared?.release();
+    await expect(runtime.recovery.prepareFailedWorkerPlacement(target)).resolves.toBeUndefined();
+    runtime.close();
+    await expect(runtime.recovery.prepareFailedWorkerPlacement(target)).rejects.toThrow(
+      unavailable,
+    );
+  });
+});
+
 async function expectCompleted(id: string) {
   expect(await findDeliveryIntentOwner(id)).toMatchObject({ status: "completed" });
 }
@@ -146,10 +185,9 @@ it("uses the typed recovery path and fails closed when the owning instance close
     ok: true,
     payload: { runId: "active", status: "accepted" },
   });
-  context.chatAbortControllers.set("active", {
-    controller: new AbortController(),
-    executionStarted: true,
-  } as never);
+  const activeSource = createRpcSourceForTest({}, { runId: "active" });
+  await claimRpcSourceForTest(activeSource);
+  rpcSourceTesting.set("active", activeSource);
   await expect(
     recovery.dispatchAgent({ message: "test", idempotencyKey: "active" }, undefined, {
       onExecutionStarted,
@@ -256,7 +294,7 @@ it("sends recovery notices through normal outbound without invoking plugin actio
       await expect(staleDelivery).rejects.toThrow("Recovery notice owner retired before delivery");
 
       expect(visibleSend).toHaveBeenCalledOnce();
-      expect(queuedResumption).toBeNull();
+      expect(queuedResumption).toMatchObject({ namespace: "preparing", retired: true });
       expect(sendText).toHaveBeenCalledWith(expect.objectContaining(target));
       expect(handleAction).not.toHaveBeenCalled();
 
@@ -344,6 +382,20 @@ it.each(["unsubscribe", "resolve", "close"] as const)(
     expect(onRequested).not.toHaveBeenCalled();
   },
 );
+
+it("reads current approval config only while its Gateway instance is open", () => {
+  const initial = { gateway: { publicOrigin: "https://before.example.com" } };
+  const next = { gateway: { publicOrigin: "https://after.example.com" } };
+  let current = initial;
+  const context = { ...createContext(), getRuntimeConfig: () => current };
+  const runtime = createRuntime({ context });
+  const getRuntimeConfig = runtime.nativeApprovals.getRuntimeConfig;
+  expect(getRuntimeConfig()).toBe(initial);
+  current = next;
+  expect(getRuntimeConfig()).toBe(next);
+  runtime.close();
+  expect(() => getRuntimeConfig()).toThrow("Gateway instance approval runtime is closed");
+});
 
 it("rejects methods outside each closed internal principal", async () => {
   const runtime = createRuntime();

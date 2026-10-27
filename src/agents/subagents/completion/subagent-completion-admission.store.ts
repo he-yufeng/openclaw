@@ -10,8 +10,12 @@ import type { OpenClawStateDatabaseOptions } from "../../../state/openclaw-state
 import { captureOpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.js";
 import type { OpenClawStateWorkerContext } from "../../../state/openclaw-state-worker-context.types.js";
 import type { SubagentAnnounceDeliveryResult } from "../announce/subagent-announce-dispatch.js";
+import { retireSubagentCompletionControllerInput } from "../registry/subagent-controller-inputs.js";
 import { ensureDeliveryState } from "../registry/subagent-delivery-state.js";
-import { SUBAGENT_ENDED_REASON_KILLED } from "../registry/subagent-lifecycle-events.js";
+import {
+  SUBAGENT_ENDED_REASON_ERROR,
+  SUBAGENT_ENDED_REASON_KILLED,
+} from "../registry/subagent-lifecycle-events.js";
 import {
   getSubagentRunsForChildSession,
   subagentRuns,
@@ -253,6 +257,32 @@ type CompletionMutationPublication = {
   publication: "published" | "unchanged";
 };
 
+function sameCompletionTerminalOwner(
+  current: SubagentRunRecord,
+  expected: SubagentRunRecord,
+): boolean {
+  if (current.terminalOwner === expected.terminalOwner) {
+    return true;
+  }
+  // Cleanup retires the transient recovery marker, not the interrupted winner's settlement custody.
+  return (
+    expected.terminalOwner === "interrupted-recovery" &&
+    current.terminalOwner === undefined &&
+    current.cleanupCompletedAt !== undefined &&
+    current.execution.suppressSessionEffects === true &&
+    current.execution.status === "terminal" &&
+    expected.execution.status === "terminal" &&
+    current.endedReason === SUBAGENT_ENDED_REASON_ERROR &&
+    expected.endedReason === current.endedReason &&
+    current.execution.interruptionReason === "gateway-restart" &&
+    expected.execution.interruptionReason === current.execution.interruptionReason &&
+    current.execution.startedAt === expected.execution.startedAt &&
+    current.execution.endedAt === expected.execution.endedAt &&
+    current.execution.outcome?.status === "error" &&
+    isDeepStrictEqual(current.execution.outcome, expected.execution.outcome)
+  );
+}
+
 function currentCompletionOwner(
   rows: ReadonlyMap<string, SubagentRunRecord>,
   expected: SubagentRunRecord,
@@ -273,7 +303,7 @@ function currentCompletionOwner(
     current.killReconciliation?.supersededAt !== expected.killReconciliation?.supersededAt ||
     (current.endedReason === SUBAGENT_ENDED_REASON_KILLED) !==
       (expected.endedReason === SUBAGENT_ENDED_REASON_KILLED) ||
-    current.terminalOwner !== expected.terminalOwner ||
+    !sameCompletionTerminalOwner(current, expected) ||
     current.suppressAnnounceReason !== expected.suppressAnnounceReason
   ) {
     throw new SubagentCompletionSourceChangedError(
@@ -291,7 +321,7 @@ async function mutateCompletion(
       receipt: SubagentCompletionMutationResult,
       mutation: SubagentCompletionMutation,
     ) => void;
-    onPublished?: () => void;
+    onPublished?: (applied: boolean | null) => void;
   } = {},
 ): Promise<CompletionMutationPublication> {
   const runIds = entries.map((entry) => entry.runId);
@@ -328,7 +358,7 @@ async function mutateCompletion(
         if (value.receiptRetentionFailure) {
           throw value.receiptRetentionFailure.error;
         }
-        options.onPublished?.();
+        options.onPublished?.(value.applied);
       },
       async commit(planned, authority) {
         const input = {
@@ -402,7 +432,11 @@ export async function settleSubagentCompletionDelivery(
           "Subagent completion delivery generation changed",
         );
       }
-      const subagent = structuredClone(current);
+      // The registry freezes the source row; only delivery changes here.
+      const subagent = {
+        ...current,
+        delivery: current.delivery && { ...current.delivery },
+      };
       const delivery = ensureDeliveryState(subagent);
       if (delivery.status !== "delivered" || delivery.queueId !== undefined) {
         const now = Date.now();
@@ -447,7 +481,21 @@ export async function blockSubagentCompletionDelivery(
       }
       return { kind: "block", params: { ...request, subagent: current }, now: Date.now() };
     },
-    params,
+    {
+      ...params,
+      onPublished(applied) {
+        if (
+          applied === true &&
+          (params.suspendedReason ||
+            params.operatorAuthorityUnavailable ||
+            params.storeReplaced ||
+            params.disposition === "permanent_failure")
+        ) {
+          // The durable outcome precedes releasing FIFO for its queued failure notice.
+          retireSubagentCompletionControllerInput(params.subagent);
+        }
+      },
+    },
   );
   return result.applied === true;
 }
@@ -530,6 +578,7 @@ export async function mutateRequesterCompletionBatch(
     },
     {
       ...params,
+      onPublished: () => params.onPublished?.(),
       onCommitted(result, mutation) {
         if (
           !params.committed &&

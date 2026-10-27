@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { isPromiseLike } from "@openclaw/normalization-core/promise-like";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { assertSessionEntryCurrentAdmission } from "../../../config/sessions/session-entry-current-admission.js";
@@ -223,13 +224,28 @@ export async function runSubagentRegistryWorkerWrite<T>(
   prepare: () => SubagentRegistryWorkerWrite<T>,
 ): Promise<T> {
   const write = prepare();
+  let acknowledged = false;
   let commitGranted = false;
   let admission: SqliteWorkerOperationAdmission | undefined;
   try {
     return await runOpenClawStateWorkerOperation(
       context,
-      async (scope) =>
-        write.kind === "registry" ? write.decode(await write.execute(scope)) : write.execute(scope),
+      async (scope) => {
+        if (write.kind !== "registry") {
+          return write.execute(scope);
+        }
+        await write.execute(scope);
+        // The broker drains native receipts before acknowledging the command.
+        if (!admission?.committed) {
+          throw new SqliteWorkerError(
+            "Registry committed receipt is unavailable",
+            "outcome-unknown",
+          );
+        }
+        const result = write.decode(admission.committed.facts);
+        acknowledged = true;
+        return result;
+      },
       {
         assertCurrent: write.assertCurrent,
         createAdmission: () => {
@@ -302,7 +318,7 @@ export async function runSubagentRegistryWorkerWrite<T>(
       throw error;
     }
     throw new SubagentRegistryWriteError(
-      write.kind === "registry" && write.acknowledged()
+      write.kind === "registry" && acknowledged
         ? "committed"
         : commitGranted || hasSqliteWorkerOutcomeUnknown(error)
           ? "unknown"
@@ -312,31 +328,45 @@ export async function runSubagentRegistryWorkerWrite<T>(
   }
 }
 
-function commitRows<T>(
+async function commitRows<T>(
   planned: SubagentRunMutation<T>,
   context: OpenClawStateWorkerContext,
   authority: SubagentRegistryWriteAuthority,
+  runs: ReadonlyMap<string, SubagentRunRecord>,
 ): Promise<SubagentRunMutationReceipt<T>> {
+  const postimages = new Map(
+    [...(planned.postimages ?? [])].map(
+      ([runId, row]) =>
+        [runId, row ? copySubagentRunRuntimeOwner(row, structuredClone(row)) : null] as const,
+    ),
+  );
+  const values = [...postimages.values()].flatMap((row) => {
+    if (!row) {
+      return [];
+    }
+    const value = bindSubagentRunRecord(row);
+    const previous = runs.get(row.runId);
+    // Runtime-only reservations still publish, but need no identical durable write.
+    // Prepared-only and compacted rows cannot prove equality with stored payloads.
+    return previous &&
+      !isSubagentRunPayloadEvicted(previous) &&
+      isDeepStrictEqual(value, bindSubagentRunRecord(previous))
+      ? []
+      : [value];
+  });
+  const write: SubagentRegistryWrite = {
+    writeId: randomUUID(),
+    values,
+    deleteRunIds: [...postimages].flatMap(([id, row]) => (row ? [] : [id])),
+    terminalEvents: planned.terminalEvents?.map(({ input }) => structuredClone(input)),
+  };
+  if (!values.length && !write.deleteRunIds.length && !write.terminalEvents?.length) {
+    authority.assertCurrent();
+    return { value: planned.value, postimages };
+  }
   return runSubagentRegistryWorkerWrite(context, () => {
-    const postimages = new Map(
-      [...(planned.postimages ?? [])].map(
-        ([runId, row]) =>
-          [runId, row ? copySubagentRunRuntimeOwner(row, structuredClone(row)) : null] as const,
-      ),
-    );
-    const values = [...postimages.values()].flatMap((row) =>
-      row ? [bindSubagentRunRecord(row)] : [],
-    );
-    const write: SubagentRegistryWrite = {
-      writeId: randomUUID(),
-      values,
-      deleteRunIds: [...postimages].flatMap(([id, row]) => (row ? [] : [id])),
-      terminalEvents: planned.terminalEvents?.map(({ input }) => structuredClone(input)),
-    };
-    let acknowledged = false;
     const decode = (value: unknown): SubagentRunMutationReceipt<T> => {
       const receipt = parseSubagentRegistryWriteReceipt(value, write);
-      acknowledged = true;
       // Runtime reservations are not encoded state; keep the admitted postimage intact.
       return {
         value: planned.value,
@@ -351,7 +381,6 @@ function commitRows<T>(
       execute: (scope) => scope.execute({ type: "subagents.persistChanges", input: write }),
       decode,
       terminalEvents: planned.terminalEvents,
-      acknowledged: () => acknowledged,
     };
   });
 }
@@ -493,7 +522,7 @@ export async function mutateSubagentRuns<P extends SubagentRunMutation<unknown>>
     // Outside writes require exclusive ownership while the Gateway is stopped.
     const committed: SubagentRunMutationReceipt<P["value"]> = options.commit
       ? await options.commit(planned, authority)
-      : await commitRows(planned, context, authority);
+      : await commitRows(planned, context, authority, runs);
     try {
       authority.assertDatabase();
       const postimages = committed.postimages ?? new Map<string, SubagentRunRecord | null>();

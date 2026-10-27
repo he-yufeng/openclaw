@@ -111,6 +111,16 @@ vi.mock("../../../config/sessions/session-accessor.js", async (importOriginal) =
   patchSessionEntryCore: async () => null,
 }));
 
+// Controller reservation reads use the same synthetic requester as lifecycle reads.
+vi.mock("../../../config/sessions/session-entry-read-runtime.js", async (importOriginal) => ({
+  ...(await importOriginal<
+    typeof import("../../../config/sessions/session-entry-read-runtime.js")
+  >()),
+  ...(await import("./subagent-registry.mock-state.test-support.js")).createSessionEntryReadMocks(
+    sessionStore,
+  ),
+}));
+
 const announceSpy = vi.fn(
   async (_params: unknown): Promise<"delivered" | "retryable"> => "delivered",
 );
@@ -182,9 +192,17 @@ vi.mock("../../../context-engine/init.js", () => ({ ensureContextEnginesInitiali
 vi.mock("../../../context-engine/registry.js", () => ({
   resolveContextEngine: vi.fn(async () => noopContextEngine),
 }));
+// mock-isolation: Steer tests supply registry handles without discovering installed plugins.
 vi.mock("../../runtime-plugins.js", async () => {
   const { createEmptyPluginRegistry } = await import("../../../plugins/registry-empty.js");
-  return { loadAgentRuntimePluginRegistryHandle: vi.fn(() => createEmptyPluginRegistry()) };
+  const loadRegistry = vi.fn<
+    typeof import("../../runtime-plugins.js").loadAgentRuntimePluginRegistryHandle
+  >(() => createEmptyPluginRegistry());
+  return {
+    loadAgentRuntimePluginRegistryHandle: loadRegistry,
+    loadAgentRuntimePluginRegistryHandleAsync: async (...args: Parameters<typeof loadRegistry>) =>
+      loadRegistry(...args),
+  };
 });
 
 vi.mock("../../../plugins/hook-runner-global.js", () => ({
@@ -499,8 +517,6 @@ describe("subagent registry steer restarts", () => {
       draft.archiveAtMs = endedAt;
       draft.delivery = {
         status: "suspended",
-        attemptCount: 2,
-        lastAttemptAt: endedAt,
         enqueuedAt: endedAt,
         deliveredAt: endedAt,
         announcedAt: endedAt,

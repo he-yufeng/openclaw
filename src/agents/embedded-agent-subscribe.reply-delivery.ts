@@ -4,6 +4,7 @@ import {
   getReplyPayloadMetadata,
   markReplyPayloadForSourceSuppressionDelivery,
   setReplyPayloadMetadata,
+  shouldKeepPayloadDuringSilentTurn,
 } from "../auto-reply/reply-payload.js";
 import {
   emitAgentEventWithAssistantSourceIfCurrent,
@@ -11,7 +12,7 @@ import {
   type AgentAssistantProjection,
   type AgentAssistantSourceReceipt,
 } from "../infra/agent-events.js";
-import { normalizeTextForComparison } from "./embedded-agent-helpers.js";
+import { normalizeTextForComparison } from "./embedded-agent-helpers/messaging-dedupe.js";
 import type { BlockReplyPayload } from "./embedded-agent-payloads.js";
 import { runBestEffortCallback } from "./embedded-agent-subscribe.callback.js";
 import {
@@ -458,6 +459,17 @@ export function createReplyDelivery({ params, state, log }: ReplyDeliveryParams)
           });
     const assistantTranscriptMediaUrls = Array.from(new Set(payload.mediaUrls ?? []));
     copyReplyPayloadMetadata(payload, blockPayload);
+    if (params.silentExpected && !shouldKeepPayloadDuringSilentTurn(blockPayload)) {
+      return;
+    }
+    if (
+      assistantTranscriptMediaUrls.length > 0 ||
+      getReplyPayloadMetadata(payload)?.assistantMediaFailures?.length
+    ) {
+      setReplyPayloadMetadata(blockPayload, {
+        assistantTranscriptSource: readAgentAssistantSource(state.lastAssistant),
+      });
+    }
     const taggedPayload =
       options?.assistantMessageIndex !== undefined
         ? setReplyPayloadMetadata(blockPayload, {

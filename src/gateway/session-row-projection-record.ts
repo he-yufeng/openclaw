@@ -146,6 +146,8 @@ export type SelectionChange =
       key: string;
       agentId: string;
       row: SelectionRow | undefined;
+      /** Synchronous internal publication scope; deferred refreshes have no causal label. */
+      scope?: string;
     };
 
 export function selectionRow(row: Row): SelectionRow | undefined {
@@ -167,7 +169,8 @@ export type Query = {
   storePath?: string;
   key?: string;
   sessionIdOrKey?: string;
-  parentSessionKey?: string;
+  /** Prepared qualified rows carry identity; raw keys retain alias resolution. */
+  parentSessionKey?: string | Pick<Row, "key" | "agentId">;
   sortBy?: Parameters<typeof compareSessionEntryPairs>[2] | null;
 };
 export type Inputs = Parameters<typeof rowProjection.readSessionRowInputs>[0];
@@ -183,10 +186,11 @@ type RowTarget = Pick<Row, "agentId" | "key" | "storeTarget">;
 export const identity = (row: RowTarget) =>
   `${row.agentId}\0${row.storeTarget.storePath}\0${row.key}`;
 export const physical = (storePath: string, key: string) => `physical:${storePath}\0${key}`;
-const logical = (agentId: string, key: string) => `logical:${agentId}\0${key}`;
+export const logicalSessionRowIdentity = (agentId: string, key: string) =>
+  `logical:${agentId}\0${key}`;
 export function dependents(row: Row, byParent: ReadonlyMap<string, Set<string>>) {
   return new Set([
-    ...(byParent.get(logical(row.agentId, row.key)) ?? []),
+    ...(byParent.get(logicalSessionRowIdentity(row.agentId, row.key)) ?? []),
     ...(byParent.get(physical(row.storeTarget.storePath, row.key)) ?? []),
   ]);
 }
@@ -411,10 +415,11 @@ export function publishTranscriptFields(
     lastAssistantMessage: fields.lastAssistantMessage,
     fallbackModel,
   });
-  row.materialized.source.lastMessagePreview = fields.lastMessagePreview;
-  row.materialized.row.lastMessagePreview = fields.lastMessagePreview;
-  row.materialized.source.lastAssistantMessage = fields.lastAssistantMessage;
-  row.materialized.row.lastAssistantMessage = fields.lastAssistantMessage;
+  const transcript = {
+    lastMessagePreview: fields.lastMessagePreview,
+    lastAssistantMessage: fields.lastAssistantMessage,
+  };
+  row.materialized = rowProjection.replaceSessionRowFacts(row.materialized, transcript, transcript);
   return true;
 }
 
@@ -509,54 +514,6 @@ export function snapshot(
     : { row: null };
 }
 
-function updateIndex(
-  map: Map<string, Set<string>>,
-  key: string | undefined,
-  id: string,
-  deleting: boolean,
-) {
-  if (!key) {
-    return;
-  }
-  const values = map.get(key);
-  if (deleting) {
-    values?.delete(id);
-    if (values?.size === 0) {
-      map.delete(key);
-    }
-  } else if (values) {
-    values.add(id);
-  } else {
-    map.set(key, new Set([id]));
-  }
-}
-
-export function index(
-  row: Row,
-  indexes: {
-    byStore: Map<string, Set<string>>;
-    byAgent: Map<string, Set<string>>;
-    byKey: Map<string, Set<string>>;
-    byParent: Map<string, Set<string>>;
-  },
-  deleting = false,
-) {
-  const { byStore, byAgent, byKey, byParent } = indexes;
-  const id = identity(row);
-  updateIndex(byStore, row.storeTarget.storePath, id, deleting);
-  updateIndex(byAgent, row.agentId, id, deleting);
-  updateIndex(byKey, `key:${row.key}`, id, deleting);
-  updateIndex(byKey, row.entry && `id:${row.entry.sessionId}`, id, deleting);
-  updateIndex(byKey, logical(row.agentId, row.key), id, deleting);
-  // Only raw sentinel parents resolve by physical store; ordinary parents resolve logically.
-  if (row.key === "global" || row.key === "unknown") {
-    updateIndex(byKey, physical(row.storeTarget.storePath, row.key), id, deleting);
-  }
-  for (const parent of row.parents) {
-    updateIndex(byParent, parent, id, deleting);
-  }
-}
-
 export function isPrivateSourceCurrent(source: NonNullable<Row["privateSource"]>): boolean {
   try {
     source.assertCurrent();
@@ -599,9 +556,13 @@ function selectSessionRowParent(
     cfg,
     agentId: fallbackAgentId,
     sessionKey: key,
-    read: (agentId, sessionKey) => referenced?.(logical(agentId, sessionKey))?.storedEntry,
+    read: (agentId, sessionKey) =>
+      referenced?.(logicalSessionRowIdentity(agentId, sessionKey))?.storedEntry,
   });
-  return { key: selected.key, reference: logical(selected.agentId, selected.key) };
+  return {
+    key: selected.key,
+    reference: logicalSessionRowIdentity(selected.agentId, selected.key),
+  };
 }
 
 /** Drop reader-only graphs while retaining cold metadata and index identity. */
@@ -639,7 +600,15 @@ export function readSessionRowParents(
   for (const run of context.subagentRunsByChildSessionKey.get(row.key) ?? []) {
     addParent(run.controllerSessionKey || run.requesterSessionKey);
   }
-  return parents;
+  if (parents.size !== row.parents.size) {
+    return parents;
+  }
+  for (const parent of parents) {
+    if (!row.parents.has(parent)) {
+      return parents;
+    }
+  }
+  return row.parents;
 }
 
 /** Reproject held lineage without acquiring board, transcript, or database facts. */
@@ -650,21 +619,35 @@ export function readSessionRowLineage(
   context: SessionListRowContext,
   referenced?: (reference: string) => Row | undefined,
 ) {
-  const entry = projectGatewaySessionEntry(
+  const projected = projectGatewaySessionEntry(
     cfg,
     storedEntry,
     (key) =>
       selectSessionRowParent(cfg, key, row.agentId, row.storeTarget.storePath, referenced).key,
   );
+  // Accepted source identity covers every field except the two projected lineage keys.
+  // Deferred archives have newer stored metadata but have not accepted its projection yet.
+  const entry =
+    row.entry &&
+    (!row.entryAcquisitionPending && row.storedEntry === storedEntry
+      ? row.entry.parentSessionKey === projected.parentSessionKey &&
+        row.entry.spawnedBy === projected.spawnedBy
+      : isDeepStrictEqual(row.entry, projected))
+      ? row.entry
+      : projected;
+  const parents = readSessionRowParents(row, storedEntry, cfg, context, referenced);
+  const selection =
+    entry === row.entry ? row.selection : readSessionListSelectionFacts(row.key, entry);
   return {
     entry,
-    parents: readSessionRowParents(row, storedEntry, cfg, context, referenced),
-    selection: readSessionListSelectionFacts(row.key, entry),
+    parents,
+    selection: isDeepStrictEqual(row.selection, selection) ? row.selection : selection,
   };
 }
 
 export function acquireSessionRowEntry(params: {
   row: Row;
+  rows: ReadonlyMap<string, Row>;
   storedEntry: SessionEntry | undefined;
   cfg: Inputs["cfg"];
   context: SessionListRowContext;
@@ -680,18 +663,17 @@ export function acquireSessionRowEntry(params: {
     return undefined;
   }
   const lineage = readSessionRowLineage(row, storedEntry, cfg, context, params.referenced);
-  const entryChanged = !isDeepStrictEqual(lineage.entry, row.entry);
-  // Selection and profile indexes retain entry identity until its metadata changes.
-  if (!entryChanged && row.entry) {
-    lineage.entry = row.entry;
-  }
+  const entryChanged = lineage.entry !== row.entry;
   const { entry, parents } = lineage;
   // Equal timestamps still need the full metadata comparison.
   const changed =
-    !isDeepStrictEqual(row.parents, parents) ||
-    !Object.is(storedEntry.updatedAt, row.storedEntry?.updatedAt) ||
-    !isDeepStrictEqual(storedEntry, row.storedEntry) ||
-    entryChanged;
+    row.parents !== parents || !isDeepStrictEqual(storedEntry, row.storedEntry) || entryChanged;
+  if (!changed && row.sharingEntry === row.storedEntry && !row.entryAcquisitionPending) {
+    if (params.rows.get(identity(row)) !== row) {
+      put(row);
+    }
+    return row;
+  }
   // Archive custody can retain new stored metadata before its lineage is acquired.
   const includeChildren =
     changesSessionRowDependents(row.storedEntry, storedEntry) ||

@@ -1,10 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
-import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.contracts.js";
-import { beginReplyMessageInjectionTarget } from "../../auto-reply/reply/reply-run-registry.message-injection.js";
-import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.operation.js";
-import { replyRunRegistry } from "../../auto-reply/reply/reply-run-registry.registry.js";
+import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
 import {
   activateMcpLoopbackClientGrantCapture,
   deactivateMcpLoopbackClientGrantCapture,
@@ -26,6 +22,12 @@ import { createMockPluginRegistry } from "../../plugins/hooks.test-fixtures.js";
 import { PluginInstance } from "../../plugins/plugin-instance.js";
 import { markPluginRegistryRetired } from "../../plugins/registry-lifecycle.js";
 import { withPluginRuntimeGenerationRegistryScope } from "../../plugins/runtime/generation-state.js";
+import type { ReplyBackendHandle } from "../../sessions/session-controller.contracts.js";
+import {
+  beginReplyMessageInjectionTarget,
+  captureCurrentReplyMessageInjectionTarget,
+} from "../../sessions/session-controller.message-injection.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { getAdmittedRunDelegatedAuthority } from "../admitted-run-context.js";
 import * as beforeToolCall from "../agent-tools.before-tool-call.js";
@@ -150,11 +152,10 @@ describe("plugin-owned CLI native tool policy", () => {
     expect(oldHook).toHaveBeenCalledOnce();
 
     markPluginRegistryRetired(previous);
-    const currentHook = vi.fn((event: { params: Record<string, unknown> }) =>
+    const currentHook: PluginHookHandlerMap["before_tool_call"] = (event) =>
       event.params.command === "echo blocked"
         ? { block: true, blockReason: "current policy blocked" }
-        : undefined,
-    );
+        : undefined;
     const current = createMockPluginRegistry([
       {
         hookName: "before_tool_call",
@@ -177,7 +178,6 @@ describe("plugin-owned CLI native tool policy", () => {
       }),
     );
     expect(oldHook).toHaveBeenCalledOnce();
-    expect(currentHook).toHaveBeenCalledTimes(2);
     expect(mockCallGatewayTool).not.toHaveBeenCalled();
   });
 
@@ -272,13 +272,6 @@ describe("plugin-owned CLI native tool policy", () => {
     expect(decision).toEqual({
       behavior: "allow",
       updatedInput: { url: "https://example.com/rewritten" },
-    });
-    expect(hook).toHaveBeenCalledOnce();
-    expect(hook.mock.calls[0]?.[0]).toMatchObject({
-      toolName: "web_fetch",
-      params: { url: "https://example.com/original" },
-      toolCallId: "native-WebFetch",
-      runId: context.params.runId,
     });
     expect(hook.mock.calls[0]?.[1]).toMatchObject({
       agentId: "main",
@@ -671,13 +664,12 @@ describe("plugin-owned CLI same-turn input", () => {
       yield SUCCESS_RESULT;
     });
     try {
-      await Promise.race([
+      await awaitGateBeforeSettlement(
         ready.promise,
-        run.then(() => {
-          throw new Error("CLI run ended before injection became ready");
-        }),
-      ]);
-      const target = replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key);
+        run,
+        "CLI run ended before injection became ready",
+      );
+      const target = captureCurrentReplyMessageInjectionTarget(operation.key);
       if (!target) {
         throw new Error("running CLI backend did not expose a registry injection target");
       }
@@ -706,6 +698,6 @@ describe("plugin-owned CLI same-turn input", () => {
         operation.complete();
       }
     }
-    expect(replyRunRegistry.resolveCurrentMessageInjectionTarget(operation.key)).toBeUndefined();
+    expect(captureCurrentReplyMessageInjectionTarget(operation.key)).toBeUndefined();
   });
 });

@@ -30,7 +30,9 @@ import {
   bindSessionPendingInputSources,
   listSessionPendingInputs,
   readSessionPendingInput,
+  readSessionPendingInputRequesterOrigin,
   stageSessionPendingInput,
+  prepareForeignLiveSessionPendingInputEntries,
   withSessionPendingInputPersistence as withPersistence,
   type SessionPendingInputReceipt,
 } from "./session-accessor.pending-inputs.js";
@@ -52,6 +54,7 @@ import {
   waitForSessionTranscriptProjection,
 } from "./session-transcript-reconcile.js";
 import { useTempSessionsFixture } from "./test-helpers.js";
+import { timedMessageEvent } from "./transcript-message.test-support.js";
 
 const custodyFault = useSqliteWorkerFault([
   {
@@ -192,9 +195,50 @@ it("keeps accepted input outside the active transcript and applies its hook once
   expect(await submitted("queued:user")).toEqual(receipt.message);
   const committedReplay = await stage("queued", { prepareMessageAfterIdempotencyCheck: prepare });
   expect(committedReplay.message).toEqual(receipt.message);
+  expect(bindSessionPendingInputSources([committedReplay], message("recollected"))).toBeUndefined();
   expect(prepare).toHaveBeenCalledOnce();
   receipt.finish("interrupted");
   expect(() => receipt.run(() => {})).toThrow("ownership ended");
+  const readForeign = await prepareForeignLiveSessionPendingInputEntries(scope());
+  expect(readForeign()).toEqual(new Map([[receipt.inputId, receipt.message.idempotencyKey]]));
+  committedReplay.finish("interrupted");
+  await committedReplay.settled?.();
+  expect(readForeign()).toEqual(new Map());
+});
+
+it("keeps requester facts with exact accepted custody through projection edits and restart replay", async () => {
+  const requesterOrigin = {
+    sessionKey: "agent:research:telegram:group:requesters",
+    messageProvider: "telegram",
+    senderId: "bob",
+  };
+  const input = { ...message("requester-custody"), __openclaw: { requesterOrigin } };
+  const receipt = await stage("requester-custody", { message: input });
+  receipt.message["__openclaw"] = {
+    requesterOrigin: { ...requesterOrigin, senderId: "alice" },
+  };
+  expect(readSessionPendingInputRequesterOrigin(receipt)).toMatchObject(requesterOrigin);
+  const captured = readSessionPendingInputRequesterOrigin(receipt);
+  expect(Object.isFrozen(captured)).toBe(true);
+  expect(captured?.sessionKey).toBe(requesterOrigin.sessionKey);
+  expect(readSessionPendingInputRequesterOrigin({ ...receipt })).toBeUndefined();
+  receipt.finish("interrupted");
+  await receipt.settled?.();
+  rotateAgentEventLifecycleGeneration();
+  const recovered = await stage("requester-custody", {
+    message: input,
+    trackCompletion: true,
+  });
+  expect(readSessionPendingInputRequesterOrigin(recovered)).toMatchObject(requesterOrigin);
+  await expect(
+    stage("requester-custody", {
+      message: {
+        ...input,
+        __openclaw: { requesterOrigin: { ...requesterOrigin, senderId: "alice" } },
+      },
+      trackCompletion: true,
+    }),
+  ).rejects.toThrow("conflicts");
 });
 
 it("mirrors a correlated input to another session without borrowing or consuming source custody", async () => {
@@ -229,9 +273,13 @@ it("mirrors a correlated input to another session without borrowing or consuming
   expect(await loadTranscriptEvents(target)).toEqual(targetTranscript);
 });
 
-it.each(["interrupted", "collected-consumed"] as const)(
-  "preserves request-bound receipts across legacy-hash rejection and re-upgrade (%s)",
-  async (disposition) => {
+it.each([
+  { disposition: "interrupted", restart: true },
+  { disposition: "interrupted", restart: false },
+  { disposition: "collected-consumed", restart: true },
+] as const)(
+  "preserves request-bound receipts across legacy-hash rejection ($disposition, restart=$restart)",
+  async ({ disposition, restart }) => {
     const runId = "versioned-input";
     const requestFingerprint = "f".repeat(64);
     const receipt = await stage(runId, { requestFingerprint });
@@ -240,7 +288,12 @@ it.each(["interrupted", "collected-consumed"] as const)(
     }
     receipt.finish("interrupted");
     await receipt.settled?.();
-    rotateAgentEventLifecycleGeneration();
+    expect(() => readSessionPendingInputRequesterOrigin(receipt)).toThrow(
+      SessionPendingInputCustodyError,
+    );
+    if (restart) {
+      rotateAgentEventLifecycleGeneration();
+    }
     const readStoredSource = () =>
       database()
         .db.prepare("SELECT * FROM session_pending_inputs WHERE input_id = ?")
@@ -262,8 +315,12 @@ it.each(["interrupted", "collected-consumed"] as const)(
     expect(await readTranscript()).toEqual(transcript);
     expect((await pendingInputs()).total).toBe(disposition === "interrupted" ? 1 : 0);
 
+    if (!restart) {
+      await expect(stage(runId, { requestFingerprint })).rejects.toThrow("ownership ended");
+    }
     const renewed = await stage(runId, {
       requestFingerprint,
+      retryInterrupted: !restart,
       prepareMessageAfterIdempotencyCheck: prepare,
     });
     expect(renewed.inputId).toBe(receipt.inputId);
@@ -566,6 +623,9 @@ it("binds lazy recorder collection to approved sources and reports consumed sour
     const duplicate = createUserTurnTranscriptRecorder({
       target,
       message: message("recorder-source", "Original source"),
+      assertOriginalInputCommit: () => {
+        throw new Error("Consumed input no longer belongs to its original source");
+      },
     });
     expect(
       await duplicate.stageApproved?.({ runId: "recorder-source", assertCurrent: () => {} }),
@@ -671,13 +731,7 @@ it.each(["deleted", "rebound", "replaced"] as const)(
         await upsertSessionEntryCore(scope(), { sessionId: "replacement-session", updatedAt: 2 });
       } else {
         await replaceTranscriptEvents(scope(), [
-          {
-            type: "message",
-            id: "rewritten-user",
-            parentId: null,
-            timestamp: new Date(100).toISOString(),
-            message: receipt.message,
-          },
+          timedMessageEvent("rewritten-user", null, new Date(100).toISOString(), receipt.message),
         ]);
         expect(anchor("rewritten-user")).toMatchObject({
           entryId: "rewritten-user",

@@ -1,9 +1,9 @@
 /* @vitest-environment jsdom */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { GatewayRequestError } from "../api/gateway.ts";
+import { SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD } from "../../../src/gateway/control-ui-contract.js";
+import { GatewayRequestError } from "../api/gateway-connect-errors.ts";
 import { sessionProgressCardsForGateway } from "../lib/session-progress-cards.ts";
-import { SESSION_PULL_REQUESTS_SUBSCRIBE_METHOD } from "../lib/session-pull-requests.ts";
 import { flush, waitForSolid } from "../test-helpers/solid-settle.ts";
 import { sessionProgressHoverTargetFromEvent } from "./session-progress-hovercard-target.ts";
 import { createHovercard } from "./session-progress-hovercard.test-support.ts";
@@ -73,6 +73,21 @@ describe("sessionProgressHoverTargetFromEvent", () => {
 });
 
 describe("session progress hovercard ownership", () => {
+  it("reads row facts through its shell callback without a descendant sidebar", async () => {
+    vi.useFakeTimers();
+    const harness = createHovercard({
+      sessionKey: "agent:research:main",
+      triggerKind: "markdown",
+      rowDetails: { label: "Referenced session facts" },
+    });
+    harness.provider.querySelector("openclaw-app-sidebar")!.remove();
+    document.body.append(harness.provider);
+    flush();
+    await harness.focus();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(portalText()).toContain("Referenced session facts");
+  });
+
   it.each([
     [
       "rate-limited",

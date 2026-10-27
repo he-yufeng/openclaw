@@ -22,6 +22,7 @@ import { isProcessAlive } from "../helpers/process-wait.js";
 import { installDistArtifactScripts as installScripts } from "./dist-artifact-fixture.js";
 import {
   materializeNativeCompiler,
+  materializeTypeChecker,
   overrideNativeFixtureExecutable,
   resolveInstalledNativeCompiler,
 } from "./native-boundary-fixture.js";
@@ -281,6 +282,8 @@ async function runWithProcesses(
         cwd: root,
         env: {
           ...process.env,
+          CI: "false",
+          OPENCLAW_LINT_TOOL: "oxlint",
           // Synthetic artifact writers do not inspect the host's installed Gateway.
           OPENCLAW_ALLOW_LIVE_DIST_BUILD: "1",
           ...(resourceOwner
@@ -815,6 +818,7 @@ describe.skipIf(process.platform === "win32")("dist artifact ownership", () => {
       await withProcesses(async ({ start }) => {
         const root = createCheckout();
         materializeNativeCompiler(root, { javaScriptApi: false });
+        materializeTypeChecker(root);
         const ownerPath = write(root, ".artifacts/dist-artifacts.lock/owner.json", owner);
         if (unjoined) {
           write(root, ".artifacts/dist-artifacts.lock/unjoined", "unverified cleanup");

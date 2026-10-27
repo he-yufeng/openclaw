@@ -1,46 +1,51 @@
 import type { JSX } from "@solidjs/web";
-import { createUniqueId, onCleanup, Show } from "solid-js";
+import { createUniqueId, onSettled, Show } from "solid-js";
 import { isMobileNavLayout } from "../app/mobile-nav-layout.ts";
 import { t } from "../lib/reactive/i18n.ts";
+import { listen } from "../lib/reactive/listener.ts";
 import { Popover, type PopoverHandle } from "./solid/popover.tsx";
 
-const TABBABLE_SELECTOR =
-  "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]";
-
-// The sheet is modal: Tab and Shift+Tab wrap between its first and last tabbable controls.
-function keepSheetFocus(panel: HTMLElement, event: KeyboardEvent) {
-  const tabbable = [...panel.querySelectorAll<HTMLElement>(TABBABLE_SELECTOR)].filter(
-    (candidate) => candidate.tabIndex >= 0 && candidate.checkVisibility(),
-  );
-  const boundary = event.shiftKey ? tabbable[0] : tabbable.at(-1);
-  const target = event.shiftKey ? tabbable.at(-1) : tabbable[0];
-  // A closing picker page may have handed focus back to its trigger.
-  const active = panel.ownerDocument.activeElement;
-  if (!target || active === panel || active === boundary) {
-    event.preventDefault();
-    target?.focus({ preventScroll: true });
-  }
-}
-
-type SidebarSessionFilterPopoverProps = {
+export function SidebarSessionFilterPopover(props: {
   class?: string;
   anchor: HTMLElement | null;
   label: string;
-  initialFocusSelector?: string;
+  initialFocus: () => HTMLElement | undefined;
+  focusTargets: () => readonly HTMLElement[];
   content: JSX.Element;
   onClose: (restoreFocus: boolean) => void;
-};
-
-export function SidebarSessionFilterPopover(props: SidebarSessionFilterPopoverProps) {
+}) {
   let host!: HTMLElement;
   let handle: PopoverHandle | undefined;
+  let disconnectKeydown: (() => void) | undefined;
   let focused = false;
   const handleKeydown = (event: KeyboardEvent) => {
     if (event.key === "Tab" && !event.defaultPrevented && isMobileNavLayout() && handle) {
-      keepSheetFocus(handle.overlay.surface, event);
+      // The sheet is modal: Tab and Shift+Tab wrap between its first and last tabbable controls.
+      const panel = handle.overlay.surface;
+      const targets = props.focusTargets();
+      const tabbable = targets
+        .filter(
+          (candidate) =>
+            panel.contains(candidate) &&
+            candidate.tabIndex >= 0 &&
+            !candidate.matches(":disabled") &&
+            !candidate.closest("[hidden]") &&
+            candidate.checkVisibility(),
+        )
+        .toSorted((left, right) =>
+          left.compareDocumentPosition(right) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1,
+        );
+      const boundary = event.shiftKey ? tabbable[0] : tabbable.at(-1);
+      const target = event.shiftKey ? tabbable.at(-1) : tabbable[0];
+      // A closing picker page may have handed focus back to its trigger.
+      const active = panel.ownerDocument.activeElement;
+      if (!target || active === panel || active === boundary) {
+        event.preventDefault();
+        target?.focus({ preventScroll: true });
+      }
     }
   };
-  onCleanup(() => handle?.overlay.surface.removeEventListener("keydown", handleKeydown));
+  onSettled(() => () => disconnectKeydown?.());
   const focusInitialControl = () => {
     if (focused) {
       return;
@@ -48,11 +53,7 @@ export function SidebarSessionFilterPopover(props: SidebarSessionFilterPopoverPr
     focused = true;
     // Opening must not take focus from a control already chosen inside the panel.
     if (!host.contains(host.ownerDocument.activeElement)) {
-      host
-        .querySelector<HTMLElement>(
-          props.initialFocusSelector ?? '#sidebar-sessions-status input[type="radio"]:checked',
-        )
-        ?.focus({ preventScroll: true });
+      props.initialFocus()?.focus({ preventScroll: true });
     }
   };
   return (
@@ -86,11 +87,12 @@ export function SidebarSessionFilterPopover(props: SidebarSessionFilterPopoverPr
           if (isMobileNavLayout()) {
             value.overlay.surface.setAttribute("aria-modal", "true");
           }
-          value.overlay.surface.addEventListener("keydown", handleKeydown);
+          disconnectKeydown = listen(value.overlay.surface, "keydown", handleKeydown);
         }}
         onOpenChange={(open) => {
           if (open) {
-            focusInitialControl();
+            // Native picker bridges mount their own roots in the preceding microtask.
+            queueMicrotask(focusInitialControl);
           } else {
             props.onClose(false);
           }

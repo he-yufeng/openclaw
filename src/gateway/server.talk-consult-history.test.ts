@@ -6,7 +6,6 @@ import {
   afterEach,
   beforeAll,
   beforeEach,
-  describe,
   expect,
   it,
   vi,
@@ -32,8 +31,10 @@ import {
   toDatabaseOptions,
 } from "../config/sessions/session-accessor.sqlite-scope.js";
 import { clearSessionStoreCacheForTest } from "../config/sessions/store-writer-state.js";
+import { racePromiseWithAbortSignal } from "../infra/abort-signal.js";
 import { runWithRetainedGatewayRootWork } from "../process/gateway-work-admission.js";
-import { getSessionWorkAdmissionRelease } from "../sessions/session-lifecycle-admission.js";
+import { captureSessionControllerSettlement } from "../sessions/session-controller.lifecycle.js";
+import { rpcSourceTesting } from "../sessions/session-lifecycle-admission.test-support.js";
 import { onInternalSessionTranscriptUpdate } from "../sessions/transcript-events.js";
 import { runOutsideAsyncWorkScope } from "../shared/async-work-scope.js";
 import {
@@ -50,6 +51,7 @@ import { createDirectChatContext } from "./server-chat.agent-events.test-helpers
 import { handleGatewayRequest } from "./server-methods.js";
 import type { GatewayClient, GatewayRequestContext, RespondFn } from "./server-methods/types.js";
 import { createTranscriptUpdateBroadcastHandler } from "./server-session-events.js";
+import { gatewayConnect, gatewayProfile } from "./server/client-fixtures.test-support.js";
 import * as lifecycleState from "./session-lifecycle-state.js";
 import { createPreparedLifecycleWriteTracker } from "./session-lifecycle-state.test-support.js";
 import {
@@ -153,19 +155,8 @@ beforeEach(async () => {
   const profile = ensureProfileForEmail("talk-history@example.test");
   client = {
     connId: connectionId,
-    connect: {
-      minProtocol: 1,
-      maxProtocol: 1,
-      role: "operator",
-      scopes: ["operator.read", "operator.write", "operator.admin"],
-      client: { id: "openclaw-control-ui", version: "test", platform: "test", mode: "webchat" },
-    },
-    authenticatedUserProfile: {
-      profileId: profile.id,
-      displayName: null,
-      hasAvatar: false,
-      updatedAt: 1,
-    },
+    connect: gatewayConnect(["operator.read", "operator.write", "operator.admin"]),
+    authenticatedUserProfile: gatewayProfile(profile.id),
   };
   // Admission, the recorder, and publication stay real; only model execution is held.
   gatewayReplyMock.mockImplementation(getReplyFromConfig);
@@ -175,7 +166,9 @@ beforeEach(async () => {
   releaseModel = createDeferred();
   runEmbeddedAgent.mockImplementation(async (params) => {
     modelStarted.resolve();
-    await releaseModel.promise;
+    const signal = params.abortSignal;
+    await racePromiseWithAbortSignal(releaseModel.promise, signal, (aborted) => aborted.reason);
+    signal?.throwIfAborted();
     return {
       payloads: [{ text: answer }],
       meta: {
@@ -197,7 +190,6 @@ beforeEach(async () => {
     broadcastToConnIds: broadcast,
     sessionEventSubscribers: { getAll: () => new Set([connectionId]) },
     sessionMessageSubscribers: { get: () => new Set([connectionId]) },
-    chatAbortControllers: context.chatAbortControllers,
   });
   unsubscribe = onInternalSessionTranscriptUpdate((update) => {
     if ((update.target?.sessionId ?? update.sessionId) !== sessionId) {
@@ -257,6 +249,8 @@ const assistantMessage = (text: string) =>
   makeAgentAssistantMessage({ content: [{ type: "text", text }] });
 const matchingTexts = (messages: unknown[], text: string) =>
   messages.map(extractText).filter((value) => value === text);
+const generatedInputs = <T>(messages: T[]) =>
+  messages.filter((message) => extractText(message)?.includes(args.question));
 function transcriptMessages() {
   return loadTranscriptEventsSync(scope()).flatMap((event) => {
     const message = asOptionalRecord(asOptionalRecord(event)?.message);
@@ -324,12 +318,15 @@ async function rpc(method: string, params: Record<string, unknown>) {
   return expectDefined(asOptionalRecord(result), "Gateway RPC result");
 }
 async function waitForDispatchEnd() {
-  await getSessionWorkAdmissionRelease({ scope: storePath, identities: [canonicalKey, sessionId] });
-  // Admission release does not join the producer's remaining terminal writes.
+  await captureSessionControllerSettlement({
+    scope: storePath,
+    identities: [canonicalKey, sessionId],
+  });
+  // Controller settlement does not join the producer's remaining terminal writes.
   // Settle them before the next parity cell revokes its source or replaces its row.
   await requestExecution.waitForCompletion();
   await lifecycleWrites.drain();
-  expect(context.chatAbortControllers.size).toBe(0);
+  expect(rpcSourceTesting.size).toBe(0);
 }
 async function drainPublications() {
   await Promise.all(publications);
@@ -355,22 +352,17 @@ function expectNoGeneratedInput(messages: unknown[], surface: string) {
   }
 }
 function expectVisibleSpeechOnly(messages: unknown[], surface: string, hasAnswer: boolean) {
+  const check = (value: unknown, label: string) => expect.soft(value, `${surface} ${label}`);
   const users = messages.filter((message) => asOptionalRecord(message)?.role === "user");
   expect.soft(users.map(extractText), surface).toEqual([spoken]);
   const markdown = buildChatMarkdown(messages, "Voice test assistant");
-  expect.soft(markdown, `${surface} Markdown`).toContain(spoken);
-  expect
-    .soft(markdown?.match(/^## Message(?: \(|$)/gm), `${surface} input headings`)
-    .toHaveLength(1);
+  check(markdown, "Markdown").toContain(spoken);
+  check(markdown?.match(/^## Message(?: \(|$)/gm), "input headings").toHaveLength(1);
   expectNoGeneratedInput(messages, surface);
-  expect
-    .soft(matchingTexts(messages, answer), `${surface} spoken answer`)
-    .toHaveLength(hasAnswer ? 1 : 0);
-  expect
-    .soft(markdown?.split(answer).length, `${surface} spoken answer in Markdown`)
-    .toBe(hasAnswer ? 2 : 1);
-  expect.soft(JSON.stringify(messages), `${surface} internal final`).not.toContain(consultAnswer);
-  expect.soft(markdown, `${surface} internal final in Markdown`).not.toContain(consultAnswer);
+  check(matchingTexts(messages, answer), "spoken answer").toHaveLength(hasAnswer ? 1 : 0);
+  check(markdown?.split(answer).length, "spoken answer in Markdown").toBe(hasAnswer ? 2 : 1);
+  check(JSON.stringify(messages), "internal final").not.toContain(consultAnswer);
+  check(markdown, "internal final in Markdown").not.toContain(consultAnswer);
 }
 async function historyMessages() {
   const result = await rpc("chat.history", { sessionKey: canonicalKey, agentId });
@@ -392,7 +384,7 @@ async function startHeldConsult() {
   const ack = await consult("Keep this task running until released.", "held-task");
   await Promise.race([
     modelStarted.promise,
-    getSessionWorkAdmissionRelease({ scope: storePath, identities: [canonicalKey, sessionId] }),
+    captureSessionControllerSettlement({ scope: storePath, identities: [canonicalKey, sessionId] }),
   ]);
   const run = expectDefined(runEmbeddedAgent.mock.calls[0]?.[0], "held model invocation");
   const abortSignal = expectDefined(run.abortSignal, "admitted model cancellation signal");
@@ -477,32 +469,28 @@ it.each([
   }
 });
 
-describe("Browser Talk literal consult commands", () => {
-  it("does not turn a generated stop question into cancellation of the active consult", async () => {
-    const first = await startHeldConsult();
-    const ack = await consult("/stop", "literal-stop-during-task");
-    expect(ack.runId).not.toBe(first.ack.runId);
-    expect
-      .soft(first.abortSignal.aborted, "generated input cancelled the existing task")
-      .toBe(false);
-    releaseModel.resolve();
-    await waitForDispatchEnd();
-    expect(runEmbeddedAgent.mock.calls.map(([run]) => run.prompt)).toEqual(
-      expect.arrayContaining([expect.stringContaining("/stop")]),
-    );
-  });
+it("does not turn a generated stop question into cancellation of the active consult", async () => {
+  const first = await startHeldConsult();
+  const ack = await consult("/stop", "literal-stop-during-task");
+  expect(ack.runId).not.toBe(first.ack.runId);
+  expect.soft(first.abortSignal.aborted, "generated input cancelled the existing task").toBe(false);
+  releaseModel.resolve();
+  await waitForDispatchEnd();
+  expect(runEmbeddedAgent.mock.calls.map(([run]) => run.prompt)).toEqual(
+    expect.arrayContaining([expect.stringContaining("/stop")]),
+  );
+});
 
-  it("preserves an actual human stop command", async () => {
-    const first = await startHeldConsult();
-    const stopped = await rpc("chat.send", {
-      sessionKey,
-      message: "/stop",
-      idempotencyKey: "human-stop",
-    });
-    expect(stopped).toMatchObject({ aborted: true, runIds: [first.ack.runId] });
-    expect(first.abortSignal.aborted).toBe(true);
-    expect(runEmbeddedAgent).toHaveBeenCalledOnce();
+it("preserves an actual human stop command", async () => {
+  const first = await startHeldConsult();
+  const stopped = await rpc("chat.send", {
+    sessionKey,
+    message: "/stop",
+    idempotencyKey: "human-stop",
   });
+  expect(stopped).toMatchObject({ aborted: true, runIds: [first.ack.runId] });
+  expect(first.abortSignal.aborted).toBe(true);
+  expect(runEmbeddedAgent).toHaveBeenCalledOnce();
 });
 
 it("keeps read-only Talk operator consult scaffolding out of chat and later context but in the raw archive", async () => {
@@ -537,6 +525,9 @@ it("keeps read-only Talk operator consult scaffolding out of chat and later cont
     assistantMessage(modelReply),
   ];
   runEmbeddedAgent.mockImplementation(async (params) => {
+    const recorder = expectDefined(params.userTurnTranscriptRecorder, "consult input recorder");
+    await recorder.persistApproved();
+    expect(recorder.hasPersisted()).toBe(true);
     await params.onAgentEvent?.({
       stream: "lifecycle",
       data: { phase: "start" },
@@ -560,7 +551,7 @@ it("keeps read-only Talk operator consult scaffolding out of chat and later cont
   expect(ack.idempotencyKey).toBe(ack.runId);
   await Promise.race([
     modelStarted.promise,
-    getSessionWorkAdmissionRelease({ scope: storePath, identities: [sessionKey, sessionId] }),
+    captureSessionControllerSettlement({ scope: storePath, identities: [sessionKey, sessionId] }),
   ]);
   expect(context.logGateway.error).not.toHaveBeenCalled();
   expect(runEmbeddedAgent).toHaveBeenCalledOnce();
@@ -589,9 +580,7 @@ it("keeps read-only Talk operator consult scaffolding out of chat and later cont
   expectVisibleSpeechOnly(await historyMessages(), "chat.history", true);
 
   const storedMessages = transcriptMessages();
-  const generated = storedMessages.filter((message) =>
-    extractText(message)?.includes(args.question),
-  );
+  const generated = generatedInputs(storedMessages);
   expect(matchingTexts(storedMessages, consultAnswer)).toHaveLength(1);
   const storedToolResult = storedMessages.find(
     (message) => extractText(message) === consultToolResult,
@@ -721,9 +710,7 @@ it.each(["before-final", "after-final"] as const)(
       expectNoGeneratedInput(liveMessages(), "direct live publication");
 
       const storedMessages = transcriptMessages();
-      const generated = storedMessages.filter((message) =>
-        extractText(message)?.includes(args.question),
-      );
+      const generated = generatedInputs(storedMessages);
       expect(generated).toHaveLength(1);
       expect(generated[0]).toMatchObject({
         role: "user",
@@ -808,7 +795,7 @@ it.runIf(process.platform === "linux").each([false, true])(
 it.runIf(process.platform === "linux")(
   "isolates registered Talk replay across authenticated callers",
   async () => {
-    const { runTalkCallerReplay } = await import("./server.talk-caller-replay.test-support.js");
+    const { runTalkCallerReplay } = await import("./server.talk-native-action.test-support.js");
     await runTalkCallerReplay({
       ...parityFixture(),
       voiceSessionId: expectDefined(voiceSessionId, "shared voice identity"),

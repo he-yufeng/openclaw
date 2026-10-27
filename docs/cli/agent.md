@@ -19,6 +19,8 @@ Pass at least one session selector: `--to`, `--session-key`, `--session-id`, or 
 
 When `--session-id` finds an existing session in an agent's storage partition, it retains that agent even if `session.store` uses one fixed JSON locator and the stored key is `global` or `unknown`.
 
+Configured idle and daily resets append a reset boundary while preserving the durable transcript ID, including through the Gateway `agent` method and `--local`. Earlier messages remain available for transcript recall and session-memory indexing. Local `--local --session-id` resume bypasses automatic expiry. The Gateway still applies its configured reset policy when an explicit matching ID is supplied.
+
 For Gateway-backed turns, the Gateway resolves `--session-id`, including when it runs on the same machine as the CLI. The CLI does not read session metadata before sending the request. If the ID does not exist, the Gateway creates a resumable session under the selected agent. This requires a Gateway advertising named-session creation support; update and restart an older Gateway before using this CLI's `--session-id`. The CLI checks support before sending the turn.
 
 A completed turn exits `0`. Error, timeout, and cancellation outcomes exit `1`, after any text or JSON result is written. A received `SIGINT` or `SIGTERM` instead preserves the signal-specific exit status described below.
@@ -49,7 +51,7 @@ When your tool policy enables `browser`, local browser control works without a G
 
 Use `--state-dir <dir>` to retain sessions and other run state. The directory must already exist and is never created or deleted by the command. A retained state directory requires exclusive ownership: exec refuses to start while a Gateway or another embedded writer owns it, then holds the state lock for the complete run. Omit `--state-dir` for isolated temporary state, or stop the Gateway first with `openclaw gateway stop`.
 
-When exec uses the ambient or a pinned config, installed plugins continue to resolve from the operator's ordinary plugin roots while sessions and other run state use the ephemeral directory. In those modes, `--state-dir` controls run state only; it is not required for configured providers, channels, or harnesses supplied by installed plugins.
+When exec uses the ambient or a pinned config, installed plugins continue to resolve from the operator's ordinary plugin roots while sessions and other run state use the ephemeral directory. Plugins that adopt the managed-resource root, including llama.cpp, also keep shared model caches and managed binaries on the operator root. In those modes, `--state-dir` controls run state only; it is not required for configured providers, channels, or harnesses supplied by installed plugins.
 
 For reproducible runs, pin the config instead of inheriting it. `--config <path>` runs against exactly that config file, read through the normal loader so JSON5 syntax and `$include` resolve relative to it; a missing or invalid file fails the run rather than falling back to defaults, as does an ambient config that exists but cannot be parsed. `--isolated` ignores the ambient config entirely and uses only the exec defaults above. Both are the right choice for CI, where inheriting operator state would make runs machine-dependent.
 
@@ -93,6 +95,8 @@ openclaw agent exec "Inspect this repository" \
 
 The timeout defaults to 600 seconds per model attempt for `agent exec`, with a fresh budget for each configured fallback; this does not change the existing embedded `agent --local` default. A successful run exits `0`, any model or result error exits `1`, and a timeout exits `2`. Failure includes `meta.error`, aborted runs, exhausted model fallbacks, an error stop reason, and any error payload.
 
+A tool-free recovery summary after a non-visible output-limit stop still exits `1`: the summary and warning remain visible, but `meta.error.kind` is `incomplete_turn` and the recorded stop reason remains `length`. Summary recovery after a normally completed turn remains successful.
+
 `SIGINT` and `SIGTERM` cancel the run and wait for owned cleanup before exiting with
 status `130` and `143`, respectively. Confirmed cleanup removes temporary state;
 an explicit `--state-dir` remains intact and its lock is released.
@@ -130,10 +134,10 @@ Run-stat fields are additive and may be absent:
 - `costUsd`: sum of recorded per-call USD costs, preserving request pricing tiers and retry-model prices, including cache reads/writes. When per-call costs are incomplete, only flat-price estimates are available; tiered estimates are omitted rather than pricing combined usage as one request. Omitted when cost is unavailable.
 - `codeModeEngaged`: `true` only when [code mode](/tools/code-mode) actually owned the model tool surface for the run. `tools.codeMode.enabled=true` alone does not guarantee engagement, and harnesses that own their native tool surface always read `false` because OpenClaw code mode never owns their tools.
 - `assistantTurns`: completed assistant/provider round trips in the run; omitted when none completed.
-- `bridgeCalls`: inner tool-search/code-mode bridge call counts (`search`/`describe`/`call`). These are invisible to the provider; outer tool calls stay in `meta.toolSummary.calls` of the full run metadata.
-- `toolSummary`: outer model-visible tool-call count, tool names, failures, and total tool time from the embedded run.
+- `bridgeCalls`: inner tool-search/code-mode bridge call counts (`search`/`describe`/`call`). These are not provider requests and can overlap the nested activity in `toolSummary`; do not add the counters together.
+- `toolSummary`: observed tool-terminal count, tool names, failures, and any reported tool time. The embedded runtime includes both outer and nested tool terminals, not only model-visible calls; this is not a physical-work or provider-request total.
 
-The agent run-stat fields appear on `meta.agentMeta` in the `openclaw agent --json` response; the outer tool summary remains at `meta.toolSummary`.
+The agent run-stat fields appear on `meta.agentMeta` in the `openclaw agent --json` response; the tool summary remains at `meta.toolSummary`.
 
 ### Code Mode model matrix
 
@@ -170,7 +174,7 @@ Remove `--dry-run` only for an explicitly intended model run; provider charges m
 
 The output directory contains standard QA Lab `qa-evidence.json`. `summary.json` and `results.jsonl` are supporting aggregate and per-cell artifacts; `manifest.json` records the requested matrix and source identity.
 
-Each summary group retains pass rate, first-pass/eventual success, failure categories, and `p50WallMs`. Its additive `metrics` object summarizes assistant turns, outer tool calls, bridge search/describe/tool calls, and reported USD cost as `{ samples, total, p50 }`. Only present envelope values count as samples; missing telemetry is not zero (`total` and `p50` are null with no samples). Observed zeros remain zeros. Medians use the upper middle sample for even counts, matching the existing wall-time summary. All repetitions, including failed ones with telemetry, contribute.
+Each summary group retains pass rate, first-pass/eventual success, failure categories, and `p50WallMs`. Its additive `metrics` object summarizes assistant turns, aggregate tool terminals (`toolCalls`), Gateway-observed outer calls (`outerToolCalls`), bridge search/describe/tool calls, and reported USD cost as `{ samples, total, p50 }`. Aggregate and outer counts are separate observations, never substitutes; bridge activity can overlap aggregate tool terminals and must not be added to them. Only present values count as samples; missing telemetry is not zero (`total` and `p50` are null with no samples). Observed zeros remain zeros. Medians use the upper middle sample for even counts, matching the existing wall-time summary. All repetitions, including failed ones with telemetry, contribute. Older reports mislabeled aggregate tool terminals as `outerToolCalls`; inspect their per-cell source fields before comparing them with newer reports.
 
 For cells that return an agent envelope, `elapsedMs` measures the agent process and effect verification after fixture preparation. Harness-error cells instead time the attempted cell, including any setup before the exception. Neither includes the matrix build, and neither is guest-only execution time. The harness does not report unobservable phase timings, overlap, reduction ratios, or inferred speedups. Compare correctness before timing/counts, inspect missing-sample counts, and retain raw per-cell `usage`/`costUsd`/`bridgeCalls` when supplied.
 
@@ -393,7 +397,7 @@ openclaw agent --agent ops --message "Run locally" --local
 
 ## Notes
 
-- Pass exactly one of `--message` or `--message-file`. `--message-file` strips a leading UTF-8 BOM and preserves multiline content; it rejects files that are not valid UTF-8. Files larger than 4 MiB are rejected before dispatch.
+- Pass exactly one of `--message` or `--message-file`. `--message-file` strips a leading UTF-8 BOM and preserves multiline content; it rejects files that are not valid UTF-8. Files larger than 4 MiB are rejected before dispatch. Nonblank file paths are used exactly as supplied, including leading or trailing spaces.
 - `--message` does not run the channel slash-command dispatcher. Recognized `$skill-name` references and leading `/skill-name [input]` are the scoped exception: OpenClaw expands them into model instructions to read the skill before acting. Other slash-prefixed messages keep normal agent-turn behavior; `/compact` is rejected with a pointer to `openclaw sessions compact <key>`.
 - `--local` runs are one-shot: cached provider connections, bundled MCP loopback resources, and warm Claude stdio sessions opened for the run are retired after the reply, so scripted invocations do not leave sockets or local child processes running. Gateway-backed runs keep Gateway-owned resources under the running Gateway process instead.
 - `--local` requires exclusive ownership of the configured state directory. It refuses to start while a Gateway or another `agent --local` run owns that directory, then holds the same state lock for the full embedded turn. Run without `--local` to use the active Gateway, or stop it first with `openclaw gateway stop`.

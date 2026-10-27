@@ -1,8 +1,8 @@
 import type { SessionPermissionMode } from "../../../../packages/gateway-protocol/src/schema/sessions-row.js";
-import { getReplyOperationSessionReader } from "../../../auto-reply/reply/reply-run-registry.state.js";
 import { messageToolOwnsVisibleReply } from "../../../auto-reply/source-reply-delivery-mode.js";
 import type { DiagnosticTraceContext } from "../../../infra/diagnostic-trace-context.js";
 import { isEmbeddedMode } from "../../../infra/embedded-mode.js";
+import { materializeErrorStack } from "../../../infra/error-graph-internal.js";
 import {
   isCodeModeDiagnosticEnabled,
   logCodeModeDiagnostic,
@@ -11,6 +11,7 @@ import { resolveStagedInputMediaPaths } from "../../../media/staged-inputs.js";
 import { extractModelCompat } from "../../../plugins/provider-model-compat.js";
 import { getPluginToolMeta } from "../../../plugins/tool-metadata.js";
 import { isSubagentSessionKey } from "../../../routing/session-key.js";
+import { getReplyOperationSessionReader } from "../../../sessions/session-controller.session-reader.js";
 import {
   readAdmittedRunOperatorAuthority,
   resolveAdmittedRunActiveAssertion,
@@ -51,6 +52,7 @@ import type {
   CronCreatorToolAllowlistEntry,
   CronToolsAllowCaptureRef,
 } from "../../tools/cron-tool.js";
+import { getGatewayToolCallerIdentity } from "../../tools/gateway-caller-context.js";
 import { captureAgentWorkspaceReadiness } from "../../workspace-readiness.js";
 import { log } from "../logger.js";
 import { createAttemptNestedToolActivityState } from "./attempt-nested-tool-activity.js";
@@ -116,8 +118,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   const requireExplicitMessageTarget =
     attempt.requireExplicitMessageTarget ?? isSubagentSessionKey(attempt.sessionKey);
   const forceDirectMessageTool = messageToolOwnsVisibleReply(attempt);
-  const toolRunContext = buildEmbeddedAttemptToolRunContext({
-    ...attempt,
+  const toolRunContext = buildEmbeddedAttemptToolRunContext(attempt, {
     forceMessageTool: forceDirectMessageTool,
     trace: params.runTrace,
   });
@@ -196,9 +197,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   const cronCreatorToolAllowlist: CronCreatorToolAllowlistEntry[] = [];
   const cronCreatorToolAllowlistCaptureRef: CronToolsAllowCaptureRef = {};
   const inheritedToolAllowlist: string[] = [];
-  const inheritedPublicationToolRef: NonNullable<
-    OpenClawCodingToolsOptions["inheritedPublicationToolRef"]
-  > = {};
+  const additionalInheritedToolNamesRef: string[] = [];
   const generationCleanups: Array<(reason: string) => Promise<void>> = [];
   const retiringGenerations = new Set<Promise<void>>();
   let retiredCleanupFailed = false;
@@ -235,6 +234,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
     modelId: attempt.modelId,
     modelApi: attempt.model.api,
     modelBaseUrl: attempt.model.baseUrl,
+    modelParams: attempt.model.params,
     modelContextWindowTokens: attempt.contextTokenBudget ?? attempt.model.contextWindow,
     modelHasVision: attempt.model.input?.includes("image") ?? false,
     workspaceDir: params.setup.effectiveWorkspace,
@@ -307,7 +307,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
     abortSignal: AbortSignal,
   ) => {
     webSearchUnconfigured = false;
-    inheritedPublicationToolRef.current = undefined;
+    additionalInheritedToolNamesRef.length = 0;
     let constructedToolsRaw: Awaited<ReturnType<typeof createOpenClawCodingToolsInternalAsync>> =
       [];
     if (shouldConstructTools) {
@@ -322,6 +322,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
         assertInvocationCurrent: assertActive,
         agentId: params.setup.sessionAgentId,
         ...buildConversationContext(),
+        forceRestartSafeTools: attempt.forceRestartSafeTools,
         exec: {
           ...attempt.execOverrides,
           ...(sessionPermissionPolicy
@@ -391,10 +392,8 @@ export async function prepareEmbeddedAttemptToolBase(params: {
         inputProvenance: attempt.inputProvenance,
         disableMessageTool: attempt.disableMessageTool,
         forceMessageTool: attempt.forceMessageTool,
-        enableHeartbeatTool: attempt.enableHeartbeatTool,
-        forceHeartbeatTool: attempt.forceHeartbeatTool,
         inheritedToolAllowlistRef: inheritedToolAllowlist,
-        inheritedPublicationToolRef,
+        additionalInheritedToolNamesRef,
         cronCreatorToolAllowlistRef: cronCreatorToolAllowlist,
         cronCreatorToolAllowlistCaptureRef,
         authProfileStore: attempt.authProfileStore,
@@ -462,6 +461,8 @@ export async function prepareEmbeddedAttemptToolBase(params: {
   };
   const releaseTools = async (reason: string) => {
     toolAbortController.abort();
+    // Retained cancellation signals must not keep this run's lazy stack frames alive.
+    materializeErrorStack(toolAbortController.signal.reason);
     retireToolGeneration(reason);
     await Promise.all(retiringGenerations);
     if (retiredCleanupFailed) {
@@ -475,6 +476,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
     return {
       toolHookContext: {
         awaitSessionDiffBaseline,
+        watchdogAttempt: getGatewayToolCallerIdentity()?.watchdogAttempt,
         agentId: params.setup.sessionAgentId,
         config: attempt.config,
         cwd: params.setup.effectiveCwd,
@@ -501,6 +503,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
         // Revoke prepared calls before resolving approval waiters; their old
         // signal must already be closed when an allowed decision wakes them.
         toolAbortController.abort(createCodeModePermissionChangeReason());
+        materializeErrorStack(toolAbortController.signal.reason);
         revokeApprovals();
         retireToolGeneration("cancel");
         params.runAbortController.signal.throwIfAborted();
@@ -528,7 +531,7 @@ export async function prepareEmbeddedAttemptToolBase(params: {
       forceDirectMessageTool,
       requireExplicitMessageTarget,
       inheritedToolAllowlist,
-      inheritedPublicationToolRef,
+      additionalInheritedToolNamesRef,
       localModelLeanEnabled,
       localModelLeanPreserveToolNames,
       replaySafetyOptions,

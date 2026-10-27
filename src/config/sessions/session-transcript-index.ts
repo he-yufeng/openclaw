@@ -29,12 +29,15 @@ import {
   deleteSessionTranscriptFtsRowsInTransaction,
 } from "./session-transcript-fts.js";
 import {
+  createPostgresProjectionFlusher,
+  type TranscriptWindowUpdate,
+} from "./session-transcript-index-postgres.js";
+import {
   prepareSessionTranscriptProjectionAppend,
   type SessionTranscriptProjectionState,
   type TranscriptIndexEntry,
 } from "./session-transcript-projection-append.js";
 import {
-  hasUnclassifiedSessionTranscriptEvents,
   visitSessionTranscriptProjection,
   type PreparedSessionTranscriptProjection,
 } from "./session-transcript-projection-rebuild.js";
@@ -121,7 +124,7 @@ export function shouldRebuildSessionTranscriptIndexSynchronously(
   return true;
 }
 
-function selectSessionTranscriptProjectionState(
+export function selectSessionTranscriptProjectionState(
   db: EngineConnection,
   sessionId: string | Expression<string>,
 ) {
@@ -301,15 +304,16 @@ function deleteActiveEventRows(db: EngineConnection, sessionId: string): void {
 export function createTranscriptIndexAppenderInTransaction(
   db: EngineConnection,
   sessionId: string,
+  prepared?: { state: ReturnType<typeof readSessionTranscriptProjectionState> },
 ): {
   append: (params: TranscriptIndexAppend) => boolean;
   flushRows: () => void;
-  flush: () => void;
+  flush: (windowUpdate?: TranscriptWindowUpdate) => void;
 } {
   const actor = readSessionActorTransactionState({ db }, { sessionId });
-  const initial = readSessionTranscriptProjectionState(db, sessionId);
+  const initial = prepared ? prepared.state : readSessionTranscriptProjectionState(db, sessionId);
   let watermark: SessionTranscriptProjectionState | undefined = initial;
-  let hasUnclassifiedEvents = initial?.hasUnclassifiedEvents;
+  const hasUnclassifiedEvents = initial?.hasUnclassifiedEvents ?? false;
   let insertActiveEvent: ReturnType<typeof createActiveEventInserter> | undefined;
   let insertFts: ReturnType<typeof createSessionTranscriptFtsInserter> | undefined;
   let updateWatermark: ReturnType<typeof createWatermarkWriter> | undefined;
@@ -317,7 +321,16 @@ export function createTranscriptIndexAppenderInTransaction(
   let pendingUpdatedAt: number | undefined;
   const pendingActiveRows: PreparedSessionTranscriptProjection["activeRows"] = [];
   const pendingFtsRows: TranscriptIndexEntry[] = [];
+  const flushPostgres = isPostgresSqlConnection(db)
+    ? createPostgresProjectionFlusher(db, sessionId)
+    : undefined;
   const flushRows = () => {
+    if (flushPostgres) {
+      flushPostgres({ activeRows: pendingActiveRows, ftsRows: pendingFtsRows }, persisted);
+      pendingActiveRows.length = 0;
+      pendingFtsRows.length = 0;
+      return;
+    }
     if (pendingActiveRows.length > 0) {
       insertActiveEvent ??= createActiveEventInserter(db, sessionId);
       insertActiveEvent(pendingActiveRows);
@@ -336,7 +349,7 @@ export function createTranscriptIndexAppenderInTransaction(
       actor.transcript.contextStats = undefined;
       actor.transcript.projection = {
         ...watermark,
-        hasUnclassifiedEvents: hasUnclassifiedEvents ?? false,
+        hasUnclassifiedEvents,
       };
     }
   };
@@ -345,12 +358,8 @@ export function createTranscriptIndexAppenderInTransaction(
     if ((!watermark && params.seq !== 0) || watermark?.needsRebuild) {
       return true;
     }
-    if (
-      watermark &&
-      (hasUnclassifiedEvents ??= hasUnclassifiedSessionTranscriptEvents(db, sessionId))
-    ) {
-      // Out-of-band or older writers left incomplete projection facts. Once checked,
-      // this batch's own forward rows all carry an explicit context classification.
+    if (watermark && hasUnclassifiedEvents) {
+      // Older projections need rebuilding; this batch's new rows are explicitly classified.
       markDirty(watermark);
       return true;
     }
@@ -402,7 +411,25 @@ export function createTranscriptIndexAppenderInTransaction(
   return {
     append: appendEvent,
     flushRows,
-    flush() {
+    flush(windowUpdate) {
+      if (flushPostgres) {
+        const next =
+          pendingUpdatedAt !== undefined && watermark
+            ? { ...watermark, updatedAt: pendingUpdatedAt }
+            : undefined;
+        flushPostgres(
+          { activeRows: pendingActiveRows, ftsRows: pendingFtsRows, watermark: next },
+          persisted,
+          windowUpdate,
+        );
+        pendingActiveRows.length = 0;
+        pendingFtsRows.length = 0;
+        if (next) {
+          persisted = true;
+          pendingUpdatedAt = undefined;
+        }
+        return;
+      }
       flushRows();
       if (pendingUpdatedAt === undefined || !watermark) {
         return;

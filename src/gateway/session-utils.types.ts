@@ -1,5 +1,3 @@
-// Shared Gateway session projection types.
-// Keeps server methods and Control UI payloads aligned.
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
 import type {
   SessionPlacement,
@@ -69,6 +67,7 @@ export type GatewaySessionRow = Omit<SessionRow, "archivedBy" | "updatedAt" | "w
   thinkingLevels?: GatewayThinkingLevelOption[];
   thinkingOptions?: string[];
   thinkingDefault?: string;
+  cyberAccessProgram?: SessionEntry["cyberAccessProgram"];
   fastMode?: FastMode;
   effectiveFastMode?: FastMode;
   effectiveFastModeSource?: FastModeSource;

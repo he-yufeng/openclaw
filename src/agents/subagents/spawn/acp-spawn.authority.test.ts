@@ -8,10 +8,10 @@ import * as acpManager from "../../../acp/control-plane/manager.js";
 import { disposeAcpSessionManagerInstance } from "../../../acp/control-plane/manager.lifecycle.js";
 import { SessionActorQueue } from "../../../acp/control-plane/session-actor-queue.js";
 import * as runtimeRegistry from "../../../acp/runtime/registry.js";
-import * as acpSessionEntry from "../../../acp/runtime/session-meta-entry.js";
 import type { CliDeps } from "../../../cli/deps.types.js";
 import * as configRuntime from "../../../config/config.js";
 import * as sessionAccessor from "../../../config/sessions/session-accessor.js";
+import * as sessionEntryWorker from "../../../config/sessions/session-accessor.sqlite-replacement-worker.js";
 import * as gatewayCall from "../../../gateway/call.js";
 import { registerChatAbortController } from "../../../gateway/chat-abort.js";
 import { withLocalGatewayRequestScope } from "../../../gateway/local-request-context.js";
@@ -23,6 +23,7 @@ import { flushLogger, resetLogger } from "../../../logging/logger.js";
 import { loadActivatedBundledPluginPublicSurfaceModule } from "../../../plugin-sdk/facade-runtime.js";
 import { getActivePluginRegistry } from "../../../plugins/runtime.js";
 import * as gatewayScope from "../../../plugins/runtime/gateway-request-scope.js";
+import { captureSessionTarget } from "../../../sessions/session-controller.lifecycle.js";
 import { listSessionStateEventsSince } from "../../../sessions/session-state-events.js";
 import { AsyncWorkScope } from "../../../shared/async-work-scope.js";
 import { openOpenClawStateDatabase } from "../../../state/openclaw-state-db.js";
@@ -43,9 +44,14 @@ import { createAcpSpawnSessionBinding } from "./acp-spawn-store.test-support.js"
 import { testing as spawnTesting } from "./subagent-spawn.test-support.js";
 
 // mock-isolation: Authority tests supply their own registry without loading installed plugins.
-vi.mock("../../runtime-plugins.js", () => ({
-  loadAgentRuntimePluginRegistryHandle: vi.fn<typeof loadAgentRuntimePluginRegistryHandle>(),
-}));
+vi.mock("../../runtime-plugins.js", () => {
+  const loadRegistry = vi.fn<typeof loadAgentRuntimePluginRegistryHandle>();
+  return {
+    loadAgentRuntimePluginRegistryHandle: loadRegistry,
+    loadAgentRuntimePluginRegistryHandleAsync: async (...args: Parameters<typeof loadRegistry>) =>
+      loadRegistry(...args),
+  };
+});
 
 const parentSessionKey = "agent:main:main";
 const parentScope = { agentId: "main", sessionKey: parentSessionKey };
@@ -134,12 +140,19 @@ it.each([
   "pending ACP spawn transfers work only from its live parent: %s / %s",
   async (stage, closure) => {
     const cfg = configRuntime.getRuntimeConfig();
-    await registryPersistence.writeChildSession(stateDir, parentSessionKey, "parent-session");
+    const storePath = await registryPersistence.writeSubagentSessionEntry({
+      stateDir,
+      ...parentScope,
+      defaultSessionId: "parent-session",
+    });
     const live = closure === "live";
     const thread = stage === "thread";
     const readChild = (sessionKey: string) =>
       sessionAccessor.loadSessionEntry({ sessionKey, agentId: "fixture" });
     if (live) {
+      await sessionAccessor.upsertSessionEntryCore(parentScope, {
+        inheritedGitContributorProfileIds: ["unrelated-a", "unrelated-b"],
+      });
       await sessionAccessor.recordSessionParticipant(parentScope, {
         identity: { type: "profile", id: "human-contributor" },
         promptedAt: 1,
@@ -149,6 +162,11 @@ it.each([
       { deps: {} as CliDeps, getRuntimeConfig: () => cfg },
       () => gatewayScope.getPluginRuntimeGatewayRequestScope()!.context!,
     );
+    const requestScope = {
+      context,
+      resolveGatewayContext: context.resolveGatewayContext,
+      isWebchatConnect: () => false,
+    };
     const work = new AsyncWorkScope();
     const trackExecution = context.trackExecution;
     context.trackExecution = (run) => work.track(() => trackExecution(run));
@@ -158,17 +176,24 @@ it.each([
       "main",
       "acp-authority-test",
     );
-    const parent = registerChatAbortController({
-      chatAbortControllers: context.chatAbortControllers,
-      runId: parentRunId,
-      ...parentScope,
-      sessionId: "parent-session",
-      ownerConnId: "owner-connection",
-      timeoutMs: 60_000,
-      operationalRunInstance: admission.operationalRunInstance,
-    });
+    const parent = gatewayScope.withPluginRuntimeGatewayRequestScope(requestScope, () =>
+      registerChatAbortController({
+        target: captureSessionTarget({
+          storeScope: storePath,
+          sessionKey: parentSessionKey,
+          incarnation: "parent-session",
+          agentId: "main",
+        }),
+        runId: parentRunId,
+        ...parentScope,
+        sessionId: "parent-session",
+        ownerConnId: "owner-connection",
+        timeoutMs: 60_000,
+        operationalRunInstance: admission.operationalRunInstance,
+      }),
+    );
     const admitted = await admission.admit("embedded");
-    gatewayScope.bindGatewayContextResolver(admitted, () => context);
+    gatewayScope.bindGatewayContextResolver(admitted, context.resolveGatewayContext);
     parent.bindAgentRunDelegatedAuthority(
       admissionContext.getAdmittedRunDelegatedAuthority(admitted)!,
     );
@@ -217,14 +242,14 @@ it.each([
     }
     const lateMetadata = vi.fn();
     if (stage === "metadata") {
-      const update = acpSessionEntry.updateAcpSessionStoreEntry;
+      const update = sessionEntryWorker.withSessionEntryWorker;
       let held = false;
-      vi.spyOn(acpSessionEntry, "updateAcpSessionStoreEntry").mockImplementation(async (params) => {
-        const updated = await update(params);
+      vi.spyOn(sessionEntryWorker, "withSessionEntryWorker").mockImplementation(async (...args) => {
+        const updated = await update(...args);
         if (
           !held &&
-          params.mutation.kind === "touch" &&
-          params.scope.sessionKey === childKey &&
+          args[0].agentId === "fixture" &&
+          childKey &&
           ensuredSessions.includes(childKey)
         ) {
           held = true;
@@ -313,6 +338,7 @@ it.each([
       agentSessionKey: parentSessionKey,
       // Trusted tool construction facts the ACP child records in its lineage receipt.
       senderIsOwner: true,
+      gitContributorProfileId: "human-contributor",
       expectedParentSessionId: "parent-session",
       requesterRunId: parentRunId,
       requesterTurnRunId: parentRunId,
@@ -338,24 +364,27 @@ it.each([
       hookContext: { ...parentScope, config: cfg, runId: parentRunId },
       abortSignal: parent.controller.signal,
     });
-    const wrapped = gatewayScope.withPluginRuntimeGatewayRequestScope(
-      { context, isWebchatConnect: () => false },
-      () =>
-        gatewayCaller.withGatewayToolCallerIdentity(
-          gatewayCaller.createAdmittedGatewayToolCallerIdentity({
-            ...parentScope,
-            admittedRunContext: admitted,
+    const wrapped = gatewayScope.withPluginRuntimeGatewayRequestScope(requestScope, () =>
+      gatewayCaller.withGatewayToolCallerIdentity(
+        gatewayCaller.createAdmittedGatewayToolCallerIdentity({
+          ...parentScope,
+          admittedRunContext: admitted,
+          requesterOrigin: {
+            sessionKey: parentSessionKey,
+            operatorProfileId: "selected-user",
+            delegatedCreatorProfileId: "causal-human",
+          },
+        }),
+        () =>
+          tool!.execute!("pending-acp", {
+            task: "bounded child",
+            runtime: "acp",
+            agentId: "fixture",
+            mode: "run",
+            expectsCompletionMessage: false,
+            ...(thread ? { thread: true } : {}),
           }),
-          () =>
-            tool!.execute!("pending-acp", {
-              task: "bounded child",
-              runtime: "acp",
-              agentId: "fixture",
-              mode: "run",
-              expectsCompletionMessage: false,
-              ...(thread ? { thread: true } : {}),
-            }),
-        ),
+      ),
     );
     const wrappedOutcome = wrapped.catch((error: unknown) => error);
     try {
@@ -365,7 +394,11 @@ it.each([
         "ACP spawn settled before runtime initialization",
       );
       expect(subagentRuns.size).toBe(0);
-      expect(readChild(childSessionKey)).toBeDefined();
+      expect(readChild(childSessionKey)?.createdActor).toMatchObject({
+        type: "agent",
+        id: "main",
+        delegatedBy: { type: "human", source: "profile", id: "causal-human" },
+      });
       if (closure === "abort") {
         const reply = vi.fn();
         const request = { sessionKey: parentSessionKey, runId: parentRunId };

@@ -41,7 +41,7 @@ import {
   executeExistingOpenClawStateRead,
 } from "./openclaw-state-db-readonly.js";
 import { resolveDatabasePath } from "./openclaw-state-db.paths.js";
-import { captureOpenClawStateWorkerContext } from "./openclaw-state-worker-context.js";
+import { captureOpenClawStateReadContext } from "./openclaw-state-worker-context.js";
 // Registry metadata is process-stable: registry writes invalidate after each commit;
 // other-process changes take effect on restart. Polling here puts schema probes back on hot reads.
 type AgentDatabaseRegistrySource = {
@@ -76,7 +76,6 @@ export function hasRegisteredOpenClawAgentDatabasePath(
 ): boolean {
   const { identity } = readOpenClawAgentDatabaseIdentity(database);
   return (
-    typeof identity === "string" &&
     getOrLoadSqliteDatabaseAdmissionForPath(
       resolveDatabasePath(options),
       registeredPathKey({ ...database, identity: `file:${identity}` }),
@@ -461,6 +460,10 @@ class AgentDatabaseRegistryChangedError extends Error {
   }
 }
 
+export function isAgentDatabaseRegistryChangedError(error: unknown): boolean {
+  return error instanceof AgentDatabaseRegistryChangedError;
+}
+
 export function readRegisteredAgentDatabases(
   options: AgentDatabaseRegistryListOptions,
   artifactPreserving: false,
@@ -562,7 +565,7 @@ export function prepareOpenClawAgentDatabaseRegistrySnapshotRead(
       env,
       path: resolveDatabasePath({ ...inputOptions, env }),
     };
-    const context = captureOpenClawStateWorkerContext(options);
+    const context = captureOpenClawStateReadContext(options.path);
     const assertAdmissionCurrent = () => context.admission.assertCurrent();
     const inCapturedScope = AsyncLocalStorage.snapshot();
     const captureWitness = () => {
@@ -658,7 +661,6 @@ export function prepareOpenClawAgentDatabaseRegistrySnapshotRead(
       async read(signal) {
         for (;;) {
           signal?.throwIfAborted();
-          assertAdmissionCurrent();
           const witness = scopedWitness ?? captureWitness();
           const { memo, assertCurrent, followRegistration } = witness;
           const assertReadCurrent = scopedWitness ? assertCurrent : assertAdmissionCurrent;
@@ -674,11 +676,7 @@ export function prepareOpenClawAgentDatabaseRegistrySnapshotRead(
                 { signal, current: options.fresh },
               ),
             );
-            if (reply && (!reply.ok || reply.type !== "agentDatabaseRegistry.read")) {
-              throw new Error("Unexpected agent database registry read result");
-            }
             const result = reply?.result;
-            assertAdmissionCurrent();
             // Only a newer owner publication warrants another read; scoped witnesses keep their fence.
             if (!scopedWitness && memo.next) {
               continue;
@@ -695,7 +693,6 @@ export function prepareOpenClawAgentDatabaseRegistrySnapshotRead(
               ? (result?.entries ?? [])
               : (memo.entries ??= result?.entries ?? []);
           }
-          assertReadCurrent();
           return {
             result: {
               status: "available",

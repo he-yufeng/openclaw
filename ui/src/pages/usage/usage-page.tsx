@@ -1,6 +1,5 @@
-import { createEffect, createMemo } from "solid-js";
+import { createEffect, createMemo, createProjection } from "solid-js";
 import type { SessionsUsageResult } from "../../api/types.ts";
-import type { ApplicationContext } from "../../app/context-types.ts";
 import { useApplication } from "../../lib/reactive/context.ts";
 import { UsagePageShell } from "./page-shell.tsx";
 import type { UsageProps, UsageRouteData } from "./types.ts";
@@ -15,19 +14,20 @@ export function UsagePage(props: { routeData?: UsageRouteData }) {
   createEffect(routeData, (data) => page.setRouteData(data));
   return (
     <openclaw-usage-page>
-      <UsagePageContent state={page.read()} context={context} result={page.result()} />
+      <UsagePageContent state={page.read()} result={page.result()} />
     </openclaw-usage-page>
   );
 }
 
-export function UsagePageContent(props: {
-  state: UsageProps;
-  context: ApplicationContext;
-  result: SessionsUsageResult | null;
-}) {
+export function UsagePageContent(props: { state: UsageProps; result: SessionsUsageResult | null }) {
+  // Session keys keep hydrated details from retargeting a shared roster row;
+  // other entities retain their existing id-based reconciliation.
+  const state = createProjection(() => props.state, null, {
+    key: (entry: { key?: unknown; id?: unknown }) => entry.key ?? entry.id,
+  });
   return (
-    <UsagePageShell context={props.context} result={props.result}>
-      <UsageView {...props.state} />
+    <UsagePageShell result={props.result}>
+      <UsageView {...state} />
     </UsagePageShell>
   );
 }

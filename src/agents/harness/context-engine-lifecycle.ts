@@ -90,6 +90,8 @@ function runWithHarnessSourceFence<T>(
 
 function buildHarnessContextEngineRuntimeSettings(
   params: HarnessRuntimeSettingsParams,
+  tokenBudget = params.tokenBudget,
+  maxOutputTokens = params.maxOutputTokens,
 ): ContextEngineRuntimeSettings {
   if (params.runtimeSettings !== undefined && params.runtimeSettings !== null) {
     return params.runtimeSettings;
@@ -107,8 +109,8 @@ function buildHarnessContextEngineRuntimeSettings(
     selectedContextEngineId: selectedId,
     contextEngineSelectionSource:
       selectedId === "legacy" ? "default" : selectedId ? "configured" : "unknown",
-    promptTokenBudget: params.tokenBudget,
-    maxOutputTokens: params.maxOutputTokens,
+    promptTokenBudget: tokenBudget,
+    maxOutputTokens,
     fallbackReason: params.fallbackReason,
     degradedReason: params.degradedReason,
   });
@@ -205,7 +207,11 @@ export async function assembleHarnessContextEngine(params: HarnessContextEngineA
     const assembly = await assembleHarnessContextEngineWithinSourceScope(params, contextEngine);
     const bounded = boundContextEngineAssembly(
       assembly.result,
-      resolveContextEngineTranscriptByteLimit(contextEngine),
+      params.contextEngineHostSupport?.id === "codex-app-server" &&
+        params.runtimeId === "codex" &&
+        !contextEngine.info.ownsCompaction
+        ? undefined
+        : resolveContextEngineTranscriptByteLimit(contextEngine),
       resolveAssemblyHistoryTokenBudget(params),
     );
     return { result: bounded, snapshot: assembly.snapshot };
@@ -245,6 +251,7 @@ function resolveAssemblyHistoryTokenBudget(params: HarnessContextEngineAssemblyP
 async function assembleHarnessContextEngineWithinSourceScope(
   params: HarnessContextEngineAssemblyParams,
   contextEngine: ContextEngine,
+  inputMessages = params.messages,
 ) {
   const tokenBudget = resolveAssemblyHistoryTokenBudget(params);
   const maxOutputTokens = params.promptBudget
@@ -252,16 +259,16 @@ async function assembleHarnessContextEngineWithinSourceScope(
     : params.maxOutputTokens;
   // Append-only replay policies keep persisted carriers in the assembled window;
   // dropping one here would change the prefix bound to later thinking signatures.
-  const messages = (
-    params.appendOnlyRuntimeContext
-      ? params.messages
-      : stripRuntimeContextCustomMessages(params.messages)
-  ).slice();
-  const runtimeSettings = buildHarnessContextEngineRuntimeSettings({
-    ...params,
-    maxOutputTokens,
+  const projectedMessages = params.appendOnlyRuntimeContext
+    ? inputMessages
+    : stripRuntimeContextCustomMessages(inputMessages);
+  // Filtering already isolates the plugin's working array from authoritative history.
+  const messages = projectedMessages === inputMessages ? inputMessages.slice() : projectedMessages;
+  const runtimeSettings = buildHarnessContextEngineRuntimeSettings(
+    params,
     tokenBudget,
-  });
+    maxOutputTokens,
+  );
   const snapshot: ContextEngineAssemblySnapshot = {
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
@@ -356,8 +363,9 @@ export async function prepareHarnessContextEnginePrompt(
     let bounded: AssembleResult;
     try {
       const assembled = await assembleHarnessContextEngineWithinSourceScope(
-        { ...params, messages: pipelineMessages },
+        params,
         contextEngine,
+        pipelineMessages,
       );
       bounded = prepareAssembly(assembled.result);
       snapshot = assembled.snapshot;
@@ -429,9 +437,8 @@ export async function finalizeHarnessContextEngineTurn(
     sessionManager?: unknown;
     config?: OpenClawConfig;
     warn: (message: string) => void;
-    /** True when this turn belongs to a heartbeat run. */
-    isHeartbeat?: boolean;
     modelContextWindow?: number;
+    abortSignal?: AbortSignal;
     turnCandidate?: {
       admission?: UserTurnTranscriptAdmissionReceipt;
       terminalEntryId?: string | null;
@@ -447,10 +454,21 @@ export async function finalizeHarnessContextEngineTurn(
     const { admission, terminalEntryId, record } = params.turnCandidate;
     if (admission && terminalEntryId) {
       const committed = params.turnCandidate[completedTurnMessageAnchor];
+      if (!committed) {
+        // Recovery can rewrite away the append receipt before its projection is ready.
+        const { waitForSessionTranscriptProjection } =
+          await import("../../config/sessions/session-transcript-reconcile.js");
+        await waitForSessionTranscriptProjection(admission, params.abortSignal);
+        params.abortSignal?.throwIfAborted();
+      }
       // Reconstructed managers need one anchor snapshot, not a version that a later append can stale.
       const terminal = committed
         ? committed.anchor
-        : await readActiveTranscriptEntryAnchorAsync({ ...admission, entryId: terminalEntryId });
+        : await readActiveTranscriptEntryAnchorAsync(
+            { ...admission, entryId: terminalEntryId },
+            params.abortSignal,
+          );
+      params.abortSignal?.throwIfAborted();
       committed?.assertCurrent();
       if (terminal) {
         record({
@@ -461,7 +479,6 @@ export async function finalizeHarnessContextEngineTurn(
           promptError: params.promptError,
           aborted: params.aborted,
           yieldAborted: params.yieldAborted,
-          isHeartbeat: params.isHeartbeat,
           runtimeContext: {
             provider: params.providerId ?? undefined,
             modelId: params.modelId ?? undefined,
@@ -500,7 +517,6 @@ export async function finalizeHarnessContextEngineTurn(
         tokenBudget: params.tokenBudget,
         runtimeSettings,
         runtimeContext,
-        isHeartbeat: params.isHeartbeat,
       });
     } catch (afterTurnErr) {
       postTurnFinalizationSucceeded = false;
@@ -517,7 +533,6 @@ export async function finalizeHarnessContextEngineTurn(
             sessionId: params.sessionIdUsed,
             sessionKey: params.sessionKey,
             messages: newMessages,
-            isHeartbeat: params.isHeartbeat,
           });
         } catch (ingestErr) {
           postTurnFinalizationSucceeded = false;
@@ -530,7 +545,6 @@ export async function finalizeHarnessContextEngineTurn(
               sessionId: params.sessionIdUsed,
               sessionKey: params.sessionKey,
               message: msg,
-              isHeartbeat: params.isHeartbeat,
             });
           } catch (ingestErr) {
             postTurnFinalizationSucceeded = false;
