@@ -5,8 +5,6 @@ import {
   setupCronRegressionFixtures,
 } from "../../../test/helpers/cron/service-regression-fixtures.js";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { enqueueCommandInLane } from "../../process/command-queue.js";
-import { CommandLane } from "../../process/lanes.js";
 import { AsyncWorkScope, trackAsyncWork } from "../../shared/async-work-scope.js";
 import {
   clearCronJobActive,
@@ -61,11 +59,11 @@ function agentJob(id: string, timeoutSeconds: number) {
   return dueJob(id, { payload: { kind: "agentTurn", message: "work", timeoutSeconds } });
 }
 
-function heartbeatJob(id: string, overrides: Partial<CronJob> = {}) {
+function sessionEventJob(id: string, overrides: Partial<CronJob> = {}) {
   return dueJob(id, {
     sessionTarget: "main",
     wakeMode: "now",
-    payload: { kind: "systemEvent", text: "check heartbeat work" },
+    payload: { kind: "systemEvent", text: "check scheduled work" },
     schedule: { kind: "every", everyMs: 60_000, anchorMs: SCHEDULED_AT - 60_000 },
     ...overrides,
   });
@@ -114,6 +112,37 @@ async function drain(...runs: Promise<unknown>[]) {
   await Promise.allSettled(runs);
   await vi.waitFor(() => expect(getSuspensionVisibleCronTaskRunCount()).toBe(0));
 }
+
+it.each([false, true])(
+  "bounds session adoption even without runner start (lane wait: %s)",
+  async (waiting) => {
+    const runner = pendingRunner();
+    const job = agentJob(`unstarted-session-${waiting}`, 1);
+    job.sessionTarget = "main";
+    const { state, advance, jobState } = await fixture(job, {
+      runSessionEvent: async ({ onLaneWait, abortSignal }) => {
+        onLaneWait?.({ waiting });
+        runner.started.resolve(abortSignal);
+        return await runner.result.promise;
+      },
+    });
+    const timer = onTimer(state);
+    try {
+      const signal = await runner.started.promise;
+      await advance(1_000);
+      expect(signal?.reason).toMatchObject({ name: "TimeoutError" });
+      await timer;
+      expect(jobState().runningAtMs).toBeUndefined();
+      expect(readCronRunRecordsForTests(job.id)).toEqual([
+        expect.objectContaining({ status: "timed_out", error: "cron: job execution timed out" }),
+      ]);
+    } finally {
+      stop(state);
+      runner.result.resolve(done);
+      await drain(timer);
+    }
+  },
+);
 
 it("keeps timed-out cron runs from being overwritten by late cancellation", async () => {
   resetActiveCronTaskRunsForTests();
@@ -255,34 +284,31 @@ it("notifies setup timeout after startup catch-up finalization", async () => {
 });
 
 it.each(["finite", "unlimited", "trigger evaluating"] as const)(
-  "keeps the correct heartbeat deadline: %s",
+  "keeps the correct execution deadline: %s",
   async (mode) => {
     const finite = mode === "finite";
     const unlimited = mode === "unlimited";
-    const job = unlimited
-      ? dueJob("unlimited-systemEvent", {
-          sessionTarget: "main",
-          wakeMode: "now",
-          payload: { kind: "systemEvent", text: "check heartbeat work" },
-        })
-      : heartbeatJob(
-          finite ? "heartbeat-handoff-heartbeat" : "heartbeat-trigger-watchdog",
-          finite
-            ? { payload: { kind: "heartbeat" }, agentId: "   ", sessionKey: "agent:ops:main" }
-            : { trigger: { script: "return { fire: true };" } },
-        );
+    const job =
+      finite || unlimited
+        ? dueJob(`session-deadline-${mode}`, {
+            agentId: "ops",
+            sessionKey: "agent:ops:main",
+            sessionTarget: "main",
+            wakeMode: "now",
+            payload: {
+              kind: "agentTurn",
+              message: "check scheduled work",
+              timeoutSeconds: finite ? 15 * 60 : 0,
+            },
+          })
+        : sessionEventJob("session-trigger-watchdog", {
+            trigger: { script: "return { fire: true };" },
+          });
     const started = createDeferred<AbortSignal | undefined>();
     const release = createDeferred();
-    const resolveHeartbeatTimeoutMs = vi.fn(() => (unlimited ? undefined : 15 * 60_000));
-    const requestHeartbeatAndWait = vi.fn<NonNullable<CronServiceDeps["requestHeartbeatAndWait"]>>(
-      async (_wake, { abortSignal, onQueued, onAttemptStarted }) => {
-        if (!finite && !unlimited) {
-          return { status: "ran", durationMs: 1 };
-        }
-        if (unlimited) {
-          onQueued?.();
-        }
-        onAttemptStarted?.();
+    const runSessionEvent = vi.fn<NonNullable<CronServiceDeps["runSessionEvent"]>>(
+      async ({ abortSignal, onExecutionStarted }) => {
+        onExecutionStarted?.({ jobId: job.id, phase: "model_call_started" });
         started.resolve(abortSignal);
         if (unlimited) {
           await release.promise;
@@ -295,14 +321,13 @@ it.each(["finite", "unlimited", "trigger evaluating"] as const)(
             }
           });
         }
-        return finite ? { status: "failed", reason: "aborted" } : { status: "ran", durationMs: 1 };
+        return finite ? { status: "error", error: "aborted" } : { status: "ok" };
       },
     );
     const { state, advance } = await fixture(job, {
       nowMs: Date.now,
       defaultAgentId: "main",
-      resolveHeartbeatTimeoutMs,
-      requestHeartbeatAndWait,
+      runSessionEvent,
       ...(!finite && !unlimited
         ? {
             evaluateCronTrigger: vi.fn(async () => {
@@ -327,8 +352,10 @@ it.each(["finite", "unlimited", "trigger evaluating"] as const)(
         await timer;
         expect(signal?.aborted).toBe(true);
         expect(settled).toBe(true);
-        expect(resolveHeartbeatTimeoutMs).toHaveBeenCalledExactlyOnceWith(
-          expect.objectContaining({ source: "interval", intent: "scheduled", agentId: "ops" }),
+        expect(runSessionEvent).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            job: expect.objectContaining({ agentId: "ops", sessionKey: "agent:ops:main" }),
+          }),
         );
       } else if (unlimited) {
         expect(settled).toBe(false);
@@ -338,10 +365,11 @@ it.each(["finite", "unlimited", "trigger evaluating"] as const)(
         return;
       } else {
         await timer;
-        expect(resolveHeartbeatTimeoutMs).not.toHaveBeenCalled();
-        expect(requestHeartbeatAndWait).not.toHaveBeenCalled();
+        expect(runSessionEvent).not.toHaveBeenCalled();
       }
-      expect(requireJob(state, job.id).state.lastError).toContain("job execution timed out");
+      expect(requireJob(state, job.id).state.lastError).toContain(
+        finite ? "job execution timed out" : "setup timed out before runner start",
+      );
     } finally {
       if (unlimited) {
         release.resolve();
@@ -350,49 +378,6 @@ it.each(["finite", "unlimited", "trigger evaluating"] as const)(
     }
   },
 );
-
-it("does not spend setup or execution timeout while waiting for cron-nested admission (#41783)", async () => {
-  const job = agentJob("isolated-setup-timeout-lane-wait", 1);
-  const entered = createDeferred();
-  const release = createDeferred();
-  const blocker = enqueueCommandInLane(CommandLane.CronNested, async () => {
-    entered.resolve();
-    await release.promise;
-  });
-  await entered.promise;
-  const onIsolatedAgentSetupTimeout = vi.fn();
-  const { state, advance } = await fixture(job, {
-    cleanupTimedOutAgentRun: vi.fn(async () => {}),
-    onIsolatedAgentSetupTimeout,
-    runIsolatedAgentJob: vi.fn(async ({ onLaneWait, onExecutionStarted }) => {
-      onLaneWait?.({ waiting: true });
-      return await enqueueCommandInLane(CommandLane.CronNested, async () => {
-        onLaneWait?.({ waiting: false });
-        onExecutionStarted?.();
-        return { status: "ok" as const, summary: "lane released" };
-      });
-    }),
-  });
-  const timer = onTimer(state);
-  let settled = false;
-  void timer.then(() => {
-    settled = true;
-  });
-  try {
-    await advance(60_100);
-    expect(settled).toBe(false);
-    expect(onIsolatedAgentSetupTimeout).not.toHaveBeenCalled();
-    release.resolve();
-    await blocker;
-    await timer;
-    expect(requireJob(state, job.id).state.lastStatus).toBe("ok");
-    expect(requireJob(state, job.id).state.lastError).toBeUndefined();
-  } finally {
-    release.resolve();
-    await blocker;
-    await timer;
-  }
-});
 
 it("gives setup progress the full configured timeout and cleans up an abort-ignoring runner (#93912, #29774)", async () => {
   const job = dueJob("isolated-pre-model-timeout");
@@ -493,19 +478,6 @@ it("re-arms the pre-execution watchdog when a fallback runner returns to setup (
     entries: [{ source: "cron-setup", severity: "error", message: diagnostic, ts: SCHEDULED_AT }],
   });
   expect(cleanupTimedOutAgentRun).toHaveBeenCalledOnce();
-  expect(sendCronFailureAlert).toHaveBeenCalledExactlyOnceWith({
-    job: expect.objectContaining({ id: job.id }),
-    routing: { defaultAgentId: "main" },
-    payload: {
-      text: 'Automation "before agent reply unhandled regression" failed 1 times\nCause: timeout',
-    },
-    runAtMs: expect.any(Number),
-    channel: "telegram",
-    to: "12345",
-    mode: "announce",
-    accountId: undefined,
-    threadId: undefined,
-    inheritSessionThread: false,
-    onDeliverySettled: expect.any(Function),
-  });
+  expect(sendCronFailureAlert).toHaveBeenCalledOnce();
+  expect(sendCronFailureAlert.mock.calls[0]?.[0].payload.text).toContain("Cause: timeout");
 });

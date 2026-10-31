@@ -16,6 +16,7 @@ import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot
 import type { PluginOrigin } from "../plugins/plugin-origin.types.js";
 import { collectPluginProviderRequestOwners } from "../plugins/plugin-provider-request-policy.js";
 import { resolveWebSearchInstallCatalogEntries } from "../plugins/web-search-install-catalog.js";
+import { collectUtilityModelWarnings } from "../status/utility-model-warnings.js";
 import { isRecord } from "../utils.js";
 import { INTERNAL_MESSAGE_CHANNEL } from "../utils/message-channel-constants.js";
 import { GENERATED_BUNDLED_CHANNEL_CONFIG_METADATA } from "./bundled-channel-config-metadata.generated.js";
@@ -26,14 +27,14 @@ import {
 import { resolveChannelSchemaSelection } from "./channel-schema-selection.js";
 import { resolveConfigWidePluginManifestRegistry } from "./io.plugin-metadata.js";
 import { materializeRuntimeConfig } from "./materialize.js";
+import { collectMcpTransportIssues } from "./mcp-config-normalize.js";
 import type { ConfigValidationIssue, OpenClawConfig } from "./types.js";
 import {
   bundledChannelIds,
   collectChannelDmPolicyDependencyWarnings,
   hasChannelDmPolicyDependencyWarningCandidates,
-  normalizeBundledChannelId,
 } from "./validation-channel-rules.js";
-import { collectHeartbeatOwnerWarnings, collectRedactPatternWarnings } from "./validation-core.js";
+import { collectRedactPatternWarnings } from "./validation-core.js";
 import {
   formatChannelConfigIssueMessage,
   resolveDeferredChannelConfigWarning,
@@ -56,6 +57,8 @@ export type ValidateConfigWithPluginsParams = {
   pluginValidation?: "full" | "skip" | "core-only";
   /** Runtime preserves inactive-owner startup; strict mode checks all declared targets for explicit validation and writes. */
   semanticValidation?: "runtime" | "strict";
+  /** Captured source, even during legacy repair; the candidate is validated separately. */
+  mcpTransportBaseline?: OpenClawConfig;
   pluginMetadataSnapshot?: Pick<PluginMetadataSnapshot, "manifestRegistry">;
   loadPluginMetadataSnapshot?: (
     config: OpenClawConfig,
@@ -77,7 +80,7 @@ type RegistryInfo = {
 };
 
 export function validatePreparedConfigWithPlugins(
-  raw: unknown,
+  raw: OpenClawConfig,
   parsedConfig: OpenClawConfig,
   opts: ValidateConfigWithPluginsParams & {
     applyDefaults: boolean;
@@ -103,6 +106,10 @@ export function validatePreparedConfigWithPlugins(
   const ensureSchemaValidations = () =>
     (schemaValidations ??= preparePluginSchemaValidations(ensureLoadedRegistryInfo().registry));
 
+  const warnings = collectMcpTransportIssues(raw, opts.mcpTransportBaseline);
+  if (opts.semanticValidation === "strict" && warnings.length > 0) {
+    return { ok: false, issues: warnings, warnings: [] };
+  }
   const config = opts.applyDefaults
     ? materializeRuntimeConfig(parsedConfig, {
         env: opts.env,
@@ -119,11 +126,10 @@ export function validatePreparedConfigWithPlugins(
       })
     : parsedConfig;
   if (opts.pluginValidation === "skip" || opts.pluginValidation === "core-only") {
-    return { ok: true, config, warnings: [] };
+    return { ok: true, config, warnings };
   }
 
   const issues: ConfigValidationIssue[] = [];
-  const warnings: ConfigValidationIssue[] = [];
   const preserveUnavailableConfig = (path: string): boolean => {
     const diagnostic = findUninspectedPluginDiagnostic(
       ensureLoadedRegistryInfo().registry.diagnostics,
@@ -136,7 +142,12 @@ export function validatePreparedConfigWithPlugins(
   const deferredPluginIds = new Set(
     opts.deferredPluginMigrations?.map(({ pluginId }) => normalizePluginId(pluginId)),
   );
-  warnings.push(...collectHeartbeatOwnerWarnings(config), ...collectRedactPatternWarnings(config));
+  warnings.push(
+    ...collectRedactPatternWarnings(config),
+    ...collectUtilityModelWarnings(config, () => ({
+      plugins: ensureLoadedRegistryInfo().registry.plugins,
+    })),
+  );
   const hasExplicitPluginsConfig = isRecord(raw) && Object.hasOwn(raw, "plugins");
 
   let compatPluginIds: ReadonlySet<string> | null = null;
@@ -322,15 +333,17 @@ export function validatePreparedConfigWithPlugins(
       issues.push({ path: issuePath, message: "web_search provider must not be empty" });
       return;
     }
+    // Match the runtime's case-insensitive provider lookup.
+    const normalizedProviderId = trimmed.toLowerCase();
     const activeProviderIds = collectActiveWebSearchProviderIds();
-    if (activeProviderIds.includes(trimmed)) {
+    if (activeProviderIds.includes(normalizedProviderId)) {
       return;
     }
     if (preserveUnavailableConfig(issuePath)) {
       return;
     }
     const installCatalogEntry = resolveWebSearchInstallCatalogEntries().find(
-      (entry) => entry.provider.id === trimmed,
+      (entry) => entry.provider.id === normalizedProviderId,
     );
     if (installCatalogEntry) {
       const issue = {
@@ -578,52 +591,6 @@ export function validatePreparedConfigWithPlugins(
     }
   }
 
-  const heartbeatChannelIds = new Set(bundledChannelIds);
-  const validateHeartbeatTarget = (target: string | undefined, issuePath: string): void => {
-    if (typeof target !== "string") {
-      return;
-    }
-    const trimmed = target.trim();
-    if (!trimmed) {
-      issues.push({ path: issuePath, message: "heartbeat target must not be empty" });
-      return;
-    }
-    const normalized = normalizeLowercaseStringOrEmpty(trimmed);
-    if (
-      normalized === "owner" ||
-      normalized === "last" ||
-      normalized === "none" ||
-      normalizeBundledChannelId(trimmed)
-    ) {
-      return;
-    }
-    if (!heartbeatChannelIds.has(normalized)) {
-      for (const record of ensureRegistry().registry.plugins) {
-        for (const channelId of record.channels) {
-          const pluginChannel = channelId.trim();
-          if (pluginChannel) {
-            heartbeatChannelIds.add(normalizeLowercaseStringOrEmpty(pluginChannel));
-          }
-        }
-      }
-    }
-    if (!heartbeatChannelIds.has(normalized)) {
-      if (preserveUnavailableConfig(issuePath)) {
-        return;
-      }
-      issues.push({ path: issuePath, message: `unknown heartbeat target: ${target}` });
-    }
-  };
-
-  validateHeartbeatTarget(
-    config.agents?.defaults?.heartbeat?.target,
-    "agents.defaults.heartbeat.target",
-  );
-  for (const { entry, source } of listAgentEntriesWithSource(config)) {
-    const pathPrefix =
-      source.kind === "entries" ? `agents.entries.${source.key}` : `agents.list.${source.index}`;
-    validateHeartbeatTarget(entry?.heartbeat?.target, `${pathPrefix}.heartbeat.target`);
-  }
   validateWebSearchProvider();
   validateConfiguredModelRefs();
 

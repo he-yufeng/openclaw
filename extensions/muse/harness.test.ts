@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Session } from "@muse-code/sdk";
 import type {
   AgentHarnessAttemptParamsV2,
   AgentHarnessAttemptResult,
@@ -20,7 +21,6 @@ import {
   createMuseAgentHarness as createMuseAgentHarnessImpl,
   type MuseSessionBinding,
 } from "./harness.js";
-import { createApprovalHandler } from "./src/approvals.js";
 
 const writes = vi.hoisted(() => ({
   append: vi.fn(async (params: { messages: unknown[] }) => params.messages),
@@ -523,6 +523,42 @@ describe("Muse native MSP harness", () => {
     expect(result.assistantTexts).toEqual(["started: hello"]);
   });
 
+  it("reports SDK-rejected approval feedback and settles without granting the command", async () => {
+    const { harness, run, log } = setup(true);
+    // Inject an invalid decision at the SDK boundary to exercise its real rejection;
+    // the harness itself never attaches feedback to an approval choice.
+    const registration = vi.spyOn(Session.prototype, "onApproval").mockImplementation(function (
+      this: Session,
+      handler,
+    ) {
+      registration.mockRestore();
+      this.onApproval(async (request) => ({
+        ...(await handler(request)),
+        feedback: "Do not run this command",
+      }));
+    });
+    try {
+      const result = await run({ prompt: "approval-settle" });
+      expectFailure(
+        result,
+        "Muse approval failed (feedbackNotAccepted): choice server-allow-id does not accept feedback",
+      );
+      expect(result.assistantTexts).toEqual([]);
+      expect(result.replayMetadata?.replaySafe).toBe(false);
+      const requests = await readRequests(log);
+      expect(
+        requests
+          .filter((request) => request.method === "approval/decide")
+          .map((request) => request.params.choiceId),
+      ).toEqual(["server-deny-id"]);
+      expect(requests).toContainEqual(expect.objectContaining({ method: "turn/interrupt" }));
+      expect(requests).toContainEqual({ event: "terminal", terminal: "failed" });
+    } finally {
+      registration.mockRestore();
+      await harness.dispose?.();
+    }
+  });
+
   it("interrupts the real MSP transport when the caller aborts", async () => {
     const { run } = setup();
     const controller = new AbortController();
@@ -732,40 +768,33 @@ describe("Muse native MSP harness", () => {
     expect(requests.filter((request) => request.method === "session/resume")).toHaveLength(0);
   });
 
-  it("fails closed rather than minting approval choices", async () => {
-    const { params } = setup();
-    const requestApproval = vi
-      .fn<typeof params.hostCapabilities.requestApproval>()
-      .mockResolvedValueOnce(undefined)
-      .mockResolvedValueOnce({ decision: "allow-once" });
-    const handler = createApprovalHandler({
-      ...params,
-      hostCapabilities: { ...params.hostCapabilities, requestApproval },
-    });
-    const request: Parameters<typeof handler>[0] = {
-      approvalId: "approval-1",
-      availableChoices: [
-        { choiceId: "server-only", decision: "denied", scope: "once", label: "Deny" },
-      ],
-      currentRequirementId: { approvalId: "approval-1", sourceIndex: 0 },
-      itemId: "item-1",
-      judgeEscalated: false,
-      protectedWrite: false,
-      rawArgs: '{"command":"pwd"}',
-      sessionId: "session-1",
-      sourceRange: {
-        first: { id: "event-1", sequence: 1 },
-        last: { id: "event-1", sequence: 1 },
-        stream: { id: "session-1", kind: "session" },
-      },
-      subject: { kind: "shell", command: "pwd" },
-      taskId: "task-1",
-      toolCallId: "call-1",
-      toolName: "shell",
-      turnId: "turn-1",
-      viewCursor: "1",
-    };
-    await expect(handler(request)).resolves.toEqual({ choiceId: "server-only" });
-    await expect(handler(request)).rejects.toThrow("no safe approved approval choice");
-  });
+  it.each([undefined, "allow-once"] as const)(
+    "fails closed rather than minting approval choices for %s",
+    async (decision) => {
+      const { params, run, log } = setup(true);
+      const requestApproval = vi.fn<typeof params.hostCapabilities.requestApproval>(async () =>
+        decision ? { decision } : undefined,
+      );
+      params.hostCapabilities = { ...params.hostCapabilities, requestApproval };
+      const result = await run({ prompt: "approval-deny-only" });
+
+      expect(requestApproval).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ toolName: "shell", allowedDecisions: ["allow-once", "deny"] }),
+      );
+      expect(result.assistantTexts).toEqual([]);
+      const requests = await readRequests(log);
+      const choices = requests
+        .filter((request) => request.method === "approval/decide")
+        .map((request) => request.params.choiceId);
+      if (decision) {
+        expectFailure(result, "no safe approved approval choice");
+        expect(choices).toEqual([]);
+        expect(requests).toContainEqual(expect.objectContaining({ method: "turn/interrupt" }));
+        expect(requests).toContainEqual({ event: "terminal", terminal: "cancelled" });
+      } else {
+        expectFailure(result, "denied");
+        expect(choices).toEqual(["server-only"]);
+      }
+    },
+  );
 });
