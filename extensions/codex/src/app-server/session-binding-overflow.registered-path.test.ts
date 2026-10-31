@@ -12,7 +12,11 @@ import { fileURLToPath } from "node:url";
 // maxEntries so the 50,000-row production cap becomes fillable; the lazy
 // adapter, the recovery sweep, and authority-bound deletes are the shipped
 // code paths.
-import { createNativeSessionBindingScope } from "openclaw/plugin-sdk/agent-harness-session-runtime";
+import { replaceSessionEntrySync } from "../../../../src/config/sessions/session-accessor.sqlite-entry.js";
+import { upsertSessionEntryCore } from "../../../../src/config/sessions/session-accessor.js";
+import { closeOpenClawAgentDatabaseByPathAsync } from "../../../../src/state/openclaw-agent-db-lifecycle.js";
+import { resolveOpenClawAgentSqlitePath } from "../../../../src/state/openclaw-agent-db.paths.js";
+import { withOpenClawTestState } from "../../../../src/test-utils/openclaw-test-state.js";
 import type {
   OpenAsyncKeyedStoreOptions,
   PluginStateActionAuthority,
@@ -33,6 +37,7 @@ import codexPlugin from "../../index.js";
 import { CODEX_APP_SERVER_BINDING_NAMESPACE } from "./session-binding-meta.js";
 import {
   bindingStoreKey,
+  resolveCodexSessionBinding,
   type CodexAppServerBindingStore,
   type StoredCodexAppServerBinding,
 } from "./session-binding.js";
@@ -72,7 +77,10 @@ async function withRegisteredCodexBindingStore(
     revokedError?: Error;
     deleteAttempts: { count: number };
   }) => Promise<void>,
-  options?: { revokeAtWorkerAdmission?: boolean },
+  options?: {
+    revokeAtWorkerAdmission?: boolean;
+    mutateLineageAtDelete?: () => void | Promise<void>;
+  },
 ) {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-binding-entry-"));
   // Revocation rig: the sweep is the only pager on this namespace, so a page
@@ -119,15 +127,19 @@ async function withRegisteredCodexBindingStore(
               sessionEntryCurrent: authority?.sessionEntryCurrent,
             },
           );
-          if (storeOptions?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE && revokedError) {
+          if (
+            storeOptions?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE &&
+            (revokedError || options?.mutateLineageAtDelete)
+          ) {
             if (authority) {
               const compareAndApply = store.compareAndApply?.bind(store);
               if (compareAndApply) {
-                store.compareAndApply = (key, comparison, intent, compareOptions) => {
+                store.compareAndApply = async (key, comparison, intent, compareOptions) => {
                   if (intent.operation === "delete") {
                     deleteAttempts.count += 1;
+                    await options?.mutateLineageAtDelete?.();
                   }
-                  return compareAndApply(key, comparison, intent, compareOptions);
+                  return await compareAndApply(key, comparison, intent, compareOptions);
                 };
               }
             }
@@ -142,7 +154,7 @@ async function withRegisteredCodexBindingStore(
             if (observe) {
               store.observe = async (key) => {
                 const observation = await observe(key);
-                if (paged) {
+                if (paged && options?.revokeAtWorkerAdmission) {
                   revoked = true;
                 }
                 return observation;
@@ -223,65 +235,128 @@ afterEach(() => {
 describe("Codex binding overflow recovery through the registered plugin path", () => {
   it("recovers a fresh session's lease admission at capacity", async () => {
     await withRegisteredCodexBindingStore(async ({ bindingStore, syncBindingStore }) => {
-      fillToCapacity(syncBindingStore);
+      await withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
+        fillToCapacity(syncBindingStore);
 
-      let runCalls = 0;
-      let rowDuringLease: unknown;
-      const fresh = { kind: "conversation" as const, bindingId: "fresh" };
-      // A real prepared authority rides the whole path: lease admission, the
-      // sweep's prepareMutation, and the delete's worker-bound write.
-      const authority = createNativeSessionBindingScope(() => {});
-      const result = await bindingStore.withLease(
-        fresh,
-        async () => {
-          runCalls += 1;
-          // The lease record exists while held; it is released on completion,
-          // so it can only be observed from inside the callback.
-          rowDuringLease = syncBindingStore.lookup(bindingStoreKey(fresh));
-          return "started";
-        },
-        { authority },
-      );
+        const sessionKey = "agent:main:codex-overflow-real-lineage";
+        const read = {
+          agentId: "main",
+          sessionKey,
+          env,
+          storePath: resolveOpenClawAgentSqlitePath({ agentId: "main", env }),
+        };
+        await upsertSessionEntryCore(read, {
+          sessionId: "real-session",
+          previousSessionId: "predecessor",
+          updatedAt: 1,
+        });
+        await closeOpenClawAgentDatabaseByPathAsync(read.storePath, "main");
+        const resolved = await resolveCodexSessionBinding({
+          bindingStore,
+          identity: {
+            kind: "session",
+            agentId: "main",
+            sessionId: "real-session",
+            sessionKey,
+          },
+          storePath: read.storePath,
+          reclaimStale: false,
+        });
 
-      expect(result).toBe("started");
-      expect(runCalls).toBe(1);
-      expect(rowDuringLease).toBeDefined();
-      // The sweep shed exactly the disposable row through the registered
-      // adapter; both kept rows survive.
-      expect(syncBindingStore.lookup("session:main:abandoned")).toBeUndefined();
-      expect(syncBindingStore.lookup("session:main:occupied")).toBeDefined();
-      expect(bindingStore.read({ kind: "conversation", bindingId: "live" })).toMatchObject({
-        threadId: "thread-live",
+        let runCalls = 0;
+        let rowDuringLease: unknown;
+        const fresh = { kind: "conversation" as const, bindingId: "fresh" };
+        try {
+          const result = await bindingStore.withLease(
+            fresh,
+            async () => {
+              runCalls += 1;
+              rowDuringLease = syncBindingStore.lookup(bindingStoreKey(fresh));
+              return "started";
+            },
+            { authority: resolved.authority },
+          );
+
+          expect(result).toBe("started");
+          expect(runCalls).toBe(1);
+          expect(rowDuringLease).toBeDefined();
+          expect(syncBindingStore.lookup("session:main:abandoned")).toBeUndefined();
+          expect(syncBindingStore.lookup("session:main:occupied")).toBeDefined();
+          expect(bindingStore.read({ kind: "conversation", bindingId: "live" })).toMatchObject({
+            threadId: "thread-live",
+          });
+        } finally {
+          resolved.release();
+        }
       });
     });
   });
 
-  it("rejects a queued delete at final worker admission when authority lapses mid-recovery", async () => {
-    await withRegisteredCodexBindingStore(
-      async ({ bindingStore, syncBindingStore, revokedError, deleteAttempts }) => {
-        fillToCapacity(syncBindingStore);
+  it("rejects a queued delete at final worker admission when the real session lineage changes", async () => {
+    await withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
+      const sessionKey = "agent:main:codex-overflow-lineage-fence";
+      const read = {
+        agentId: "main",
+        sessionKey,
+        env,
+        storePath: resolveOpenClawAgentSqlitePath({ agentId: "main", env }),
+      };
+      await upsertSessionEntryCore(read, {
+        sessionId: "real-session",
+        previousSessionId: "predecessor",
+        updatedAt: 1,
+      });
+      await closeOpenClawAgentDatabaseByPathAsync(read.storePath, "main");
 
-        // The caller's authority is current at lease admission; the lapse
-        // starts after the sweep's observation completes, so recovery reaches
-        // compareAndApply before the final admission gate refuses the delete.
-        const authority = createNativeSessionBindingScope(() => {});
-        let runCalls = 0;
-        await expect(
-          bindingStore.withLease(
-            { kind: "conversation", bindingId: "fresh" },
-            async () => {
-              runCalls += 1;
+      await withRegisteredCodexBindingStore(
+        async ({ bindingStore, syncBindingStore, deleteAttempts }) => {
+          fillToCapacity(syncBindingStore);
+
+          const resolved = await resolveCodexSessionBinding({
+            bindingStore,
+            identity: {
+              kind: "session",
+              agentId: "main",
+              sessionId: "real-session",
+              sessionKey,
             },
-            { authority },
-          ),
-        ).rejects.toBe(revokedError);
+            storePath: read.storePath,
+            reclaimStale: false,
+          });
 
-        expect(runCalls).toBe(0);
-        expect(deleteAttempts.count).toBe(1);
-        // Zero deletes: the disposable row survives the refused admission.
-        expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
-      },
-      { revokeAtWorkerAdmission: true },
-    );
+          let runCalls = 0;
+          const prepared = await resolved.authority.prepareMutation();
+          expect(prepared.sessionEntryCurrent).toBeDefined();
+          try {
+            await expect(
+              bindingStore.withLease(
+                { kind: "conversation", bindingId: "fresh" },
+                async () => {
+                  runCalls += 1;
+                },
+                {
+                  authority: resolved.authority,
+                },
+              ),
+            ).rejects.toThrow("Codex session generation is no longer current");
+          } finally {
+            resolved.release();
+          }
+
+          expect(runCalls).toBe(0);
+          expect(deleteAttempts.count).toBe(1);
+          expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
+        },
+        {
+          mutateLineageAtDelete: () => {
+            replaceSessionEntrySync(read, {
+              sessionId: "real-session",
+              previousSessionId: "changed-predecessor",
+              updatedAt: 2,
+            });
+          },
+        },
+      );
+    });
   });
 });
