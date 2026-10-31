@@ -17,8 +17,12 @@ import {
   createPluginRuntimeMock,
   resetPluginRuntimeStateForTest,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
+import {
+  applySessionEntryPatch,
+  type SessionEntry,
+} from "openclaw/plugin-sdk/session-store-runtime";
+import { resolveOpenClawAgentSqlitePath } from "openclaw/plugin-sdk/sqlite-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { upsertSessionEntryCore } from "../../../../src/config/sessions/session-accessor.js";
 // Integration proof for the Codex binding overflow recovery through the
 // registered plugin path (#125913): the extension entry builds the binding
 // store and its recovery adapter itself from api.runtime.state. The openers
@@ -29,10 +33,6 @@ import { upsertSessionEntryCore } from "../../../../src/config/sessions/session-
 // maxEntries so the 50,000-row production cap becomes fillable; the lazy
 // adapter, the recovery sweep, and authority-bound deletes are the shipped
 // code paths.
-import { replaceSessionEntrySync } from "../../../../src/config/sessions/session-accessor.sqlite-entry.js";
-import { closeOpenClawAgentDatabaseByPathAsync } from "../../../../src/state/openclaw-agent-db-lifecycle.js";
-import { resolveOpenClawAgentSqlitePath } from "../../../../src/state/openclaw-agent-db.paths.js";
-import { withOpenClawTestState } from "../../../../src/test-utils/openclaw-test-state.js";
 import codexPlugin from "../../index.js";
 import { CODEX_APP_SERVER_BINDING_NAMESPACE } from "./session-binding-meta.js";
 import {
@@ -68,6 +68,20 @@ function clampBindingCapacity<T extends { namespace?: string; maxEntries?: numbe
   return options?.namespace === CODEX_APP_SERVER_BINDING_NAMESPACE
     ? { ...options, maxEntries: TEST_CAPACITY }
     : options;
+}
+
+// Minimal agent-sqlite fixture: an isolated OPENCLAW_STATE_DIR is all the
+// "minimal" scenario needs for the session-entry reads and writes below. The
+// plugin state handle is released before the directory is removed so teardown
+// does not hit EBUSY on Windows.
+async function withAgentEnv<T>(run: (env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-session-entry-"));
+  try {
+    return await run({ ...process.env, OPENCLAW_STATE_DIR: stateDir });
+  } finally {
+    resetPluginStateStoreForTests();
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 }
 
 async function withRegisteredCodexBindingStore(
@@ -235,7 +249,7 @@ afterEach(() => {
 describe("Codex binding overflow recovery through the registered plugin path", () => {
   it("recovers a fresh session's lease admission at capacity", async () => {
     await withRegisteredCodexBindingStore(async ({ bindingStore, syncBindingStore }) => {
-      await withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
+      await withAgentEnv(async (env) => {
         fillToCapacity(syncBindingStore);
 
         const sessionKey = "agent:main:codex-overflow-real-lineage";
@@ -245,12 +259,12 @@ describe("Codex binding overflow recovery through the registered plugin path", (
           env,
           storePath: resolveOpenClawAgentSqlitePath({ agentId: "main", env }),
         };
-        await upsertSessionEntryCore(read, {
+        const seed = {
           sessionId: "real-session",
           previousSessionId: "predecessor",
           updatedAt: 1,
-        });
-        await closeOpenClawAgentDatabaseByPathAsync(read.storePath, "main");
+        };
+        await applySessionEntryPatch({ ...read, patch: seed, fallbackEntry: seed as SessionEntry });
         const resolved = await resolveCodexSessionBinding({
           bindingStore,
           identity: {
@@ -293,7 +307,7 @@ describe("Codex binding overflow recovery through the registered plugin path", (
   });
 
   it("rejects a queued delete at final worker admission when the real session lineage changes", async () => {
-    await withOpenClawTestState({ scenario: "minimal" }, async ({ env }) => {
+    await withAgentEnv(async (env) => {
       const sessionKey = "agent:main:codex-overflow-lineage-fence";
       const read = {
         agentId: "main",
@@ -301,12 +315,12 @@ describe("Codex binding overflow recovery through the registered plugin path", (
         env,
         storePath: resolveOpenClawAgentSqlitePath({ agentId: "main", env }),
       };
-      await upsertSessionEntryCore(read, {
+      const seed = {
         sessionId: "real-session",
         previousSessionId: "predecessor",
         updatedAt: 1,
-      });
-      await closeOpenClawAgentDatabaseByPathAsync(read.storePath, "main");
+      };
+      await applySessionEntryPatch({ ...read, patch: seed, fallbackEntry: seed as SessionEntry });
 
       await withRegisteredCodexBindingStore(
         async ({ bindingStore, syncBindingStore, deleteAttempts }) => {
@@ -348,11 +362,14 @@ describe("Codex binding overflow recovery through the registered plugin path", (
           expect(syncBindingStore.lookup("session:main:abandoned")).toBeDefined();
         },
         {
-          mutateLineageAtDelete: () => {
-            replaceSessionEntrySync(read, {
-              sessionId: "real-session",
-              previousSessionId: "changed-predecessor",
-              updatedAt: 2,
+          mutateLineageAtDelete: async () => {
+            await applySessionEntryPatch({
+              ...read,
+              patch: {
+                sessionId: "real-session",
+                previousSessionId: "changed-predecessor",
+                updatedAt: 2,
+              },
             });
           },
         },
