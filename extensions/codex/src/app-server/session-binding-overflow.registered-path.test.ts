@@ -2,21 +2,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-// Integration proof for the Codex binding overflow recovery through the
-// registered plugin path (#125913): the extension entry builds the binding
-// store and its recovery adapter itself from api.runtime.state. The openers
-// delegate to the plugin-state test factories, which run the same
-// worker-backed SQLite stores with fixture module resolution (the production
-// wiring additionally requires the Gateway host broker, which no in-process
-// test has). The only behavioral knob is clamping the binding namespace's
-// maxEntries so the 50,000-row production cap becomes fillable; the lazy
-// adapter, the recovery sweep, and authority-bound deletes are the shipped
-// code paths.
-import { replaceSessionEntrySync } from "../../../../src/config/sessions/session-accessor.sqlite-entry.js";
-import { upsertSessionEntryCore } from "../../../../src/config/sessions/session-accessor.js";
-import { closeOpenClawAgentDatabaseByPathAsync } from "../../../../src/state/openclaw-agent-db-lifecycle.js";
-import { resolveOpenClawAgentSqlitePath } from "../../../../src/state/openclaw-agent-db.paths.js";
-import { withOpenClawTestState } from "../../../../src/test-utils/openclaw-test-state.js";
 import type {
   OpenAsyncKeyedStoreOptions,
   PluginStateActionAuthority,
@@ -33,6 +18,21 @@ import {
   resetPluginRuntimeStateForTest,
 } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { upsertSessionEntryCore } from "../../../../src/config/sessions/session-accessor.js";
+// Integration proof for the Codex binding overflow recovery through the
+// registered plugin path (#125913): the extension entry builds the binding
+// store and its recovery adapter itself from api.runtime.state. The openers
+// delegate to the plugin-state test factories, which run the same
+// worker-backed SQLite stores with fixture module resolution (the production
+// wiring additionally requires the Gateway host broker, which no in-process
+// test has). The only behavioral knob is clamping the binding namespace's
+// maxEntries so the 50,000-row production cap becomes fillable; the lazy
+// adapter, the recovery sweep, and authority-bound deletes are the shipped
+// code paths.
+import { replaceSessionEntrySync } from "../../../../src/config/sessions/session-accessor.sqlite-entry.js";
+import { closeOpenClawAgentDatabaseByPathAsync } from "../../../../src/state/openclaw-agent-db-lifecycle.js";
+import { resolveOpenClawAgentSqlitePath } from "../../../../src/state/openclaw-agent-db.paths.js";
+import { withOpenClawTestState } from "../../../../src/test-utils/openclaw-test-state.js";
 import codexPlugin from "../../index.js";
 import { CODEX_APP_SERVER_BINDING_NAMESPACE } from "./session-binding-meta.js";
 import {
